@@ -127,7 +127,7 @@ static int startup_expired(void) { return startup_deadline && now_ns() >= startu
 uint64_t ngb_elapsed_ns(void) { return now_ns() - start_ns; }
 
 #ifdef __SWITCH__
-int ngb_mmio_trace_enabled(void) { return log_lines < 2048; }
+int ngb_mmio_trace_enabled(void) { return boot_log && log_lines < 2048; }
 #endif
 
 static void note(const char *format, ...)
@@ -803,6 +803,12 @@ static void kernel_call(void)
         g_eax = 0; g_esp += 12;
         return;
     }
+    if (ordinal==340) {
+        uint32_t a[7];
+        for (unsigned i=0;i<7;++i) a[i]=arg(i);
+        ngb_xc_hmac(a); g_eax=0; g_esp+=32;
+        return;
+    }
     if (ordinal>=335 && ordinal<=337) {
         uint32_t data=ordinal==335 ? 0 : arg(1);
         ngb_xc_sha(ordinal,arg(0),data,ordinal==336 ? arg(2) : 0);
@@ -1231,7 +1237,7 @@ int ngb_boot(const char *path, FILE *log)
     if (!setjmp(stop_context)) {
         if (!load_image(path)) {
             stopped_status = NGB_BOOT_ERROR;
-            snprintf(stopped_reason, sizeof(stopped_reason), "image load failed; see log");
+            snprintf(stopped_reason, sizeof(stopped_reason), "Unable to load default.xbe. Check that the disc matches Ninja Gaiden Black.");
         } else {
             ngb_vm_init(ram);
             initialize_thread();
@@ -1277,6 +1283,7 @@ static void flush_scene_report(void)
 void ngb_scene_log_begin(void) { scene_report.active=1; }
 void ngb_scene_log_end(void) { flush_scene_report(); scene_report.active=0; }
 void ngb_kernel_log(const char *message) {
+    if (!boot_log) return;
     if (boot_log && log_lines>=2048 && (!strncmp(message,"DirectSound stop ",17) || !strncmp(message,"Disc read unavailable ",22) || !strncmp(message,"3D scene ",9) || !strncmp(message,"Main menu ",10) || !strncmp(message,"Opening movie ",14) || !strncmp(message,"Movie content changes=",21) || !strncmp(message,"Warning fade steps=",19) || !strncmp(message,"Buffered warning Start",22) || !strncmp(message,"scanout captured",16) || !strcmp(message,"First decoded movie frame drawn") || !strcmp(message,"First Start report delivered"))) {
         if (scene_report.active && !strncmp(message,"3D scene ",9)) {
             const size_t len=strlen(message),need=10+len+1;

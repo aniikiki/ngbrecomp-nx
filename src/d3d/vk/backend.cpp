@@ -1,3 +1,6 @@
+#ifndef NGB_DIAG
+#define NGB_DIAG 1
+#endif
 // The renderer on Vulkan (docs/renderer.md): the state the title handed Direct3D (gpu/state.h)
 // drawn with shaders gpu/shaders.cpp writes. Modelled on SCDA-XBERecomp's gpu/d3d12.cpp (see
 // NOTICE), without its Splinter Cell specifics (HDR, ambient occlusion, SMAA).
@@ -1009,9 +1012,9 @@ void VulkanBackend::QueueSubmit(const VkSubmitInfo& si, VkFence fence) {
     if (shared_) nv2a_vk_queue_lock();
 #ifdef NGB_DIRECT3D
     FlushGeometry();
-    uint64_t start = ngb_elapsed_ns();
+    uint64_t start = NGB_DIAG ? ngb_elapsed_ns() : 0;
     VkResult result = d_.vkQueueSubmit(queue_, 1, &si, fence);
-    ngb_direct_queue_time(ngb_elapsed_ns() - start);
+    if (NGB_DIAG) ngb_direct_queue_time(ngb_elapsed_ns() - start);
     if (result != VK_SUCCESS) {
         ReportVulkanError("vkQueueSubmit", result);
         ngb_renderer_fatal("Vulkan command submission failed");
@@ -1024,9 +1027,9 @@ void VulkanBackend::QueueSubmit(const VkSubmitInfo& si, VkFence fence) {
 
 void VulkanBackend::WaitForFence(VkFence fence) {
 #ifdef NGB_DIRECT3D
-    uint64_t start = ngb_elapsed_ns();
+    uint64_t start = NGB_DIAG ? ngb_elapsed_ns() : 0;
     VkResult result = d_.vkWaitForFences(dev_, 1, &fence, VK_TRUE, UINT64_MAX);
-    ngb_direct_fence_time(ngb_elapsed_ns() - start);
+    if (NGB_DIAG) ngb_direct_fence_time(ngb_elapsed_ns() - start);
     if (result != VK_SUCCESS) {
         ReportVulkanError("vkWaitForFences", result);
         ngb_renderer_fatal("Vulkan fence wait failed");
@@ -1162,7 +1165,7 @@ bool VulkanBackend::Init(uint32_t, uint32_t) {
     for (auto& p : vis_pool_)
         if (d_.vkCreateQueryPool(dev_, &qci, nullptr, &p) != VK_SUCCESS) p = VK_NULL_HANDLE;
 #ifdef NGB_DIRECT3D
-    const bool collect_timestamps = true;
+    const bool collect_timestamps = NGB_DIAG;
 #else
     const bool collect_timestamps = stats_;
 #endif
@@ -2532,10 +2535,11 @@ VkImageView VulkanBackend::BindTexture(const State& s, int stage, TexInfo& info,
         if(it!=prepared_.end()){
             if(tx.img.image)Retire(tx.img);
             tx=std::move(it->second.tex);tx.used=frame_;prep_bytes_-=it->second.bytes;
-            prepared_.erase(it);++prep_hits_;if(frame_<120)++tex_detail_[frame_].hits;return tx.img.view;
+            prepared_.erase(it);++prep_hits_;if(NGB_DIAG && frame_<120)++tex_detail_[frame_].hits;return tx.img.view;
         }
         ++prep_misses_;
     }
+    if (!NGB_DIAG) return MakeStatic(tx,d,guest,palette,sig,key,bc,mip_candidate,bump_src,info,false);
     auto begin=std::chrono::steady_clock::now();
     auto view=MakeStatic(tx,d,guest,palette,sig,key,bc,mip_candidate,bump_src,info,false);
     auto us=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-begin).count();
@@ -4625,7 +4629,7 @@ void VulkanBackend::QueueScanout(const Surface& front) {
 
 void VulkanBackend::Present(const Surface& front) {
 #ifdef NGB_DIRECT3D
-    uint64_t present_start = ngb_elapsed_ns();
+    uint64_t present_start = NGB_DIAG ? ngb_elapsed_ns() : 0;
     const unsigned direct_draws = st_.draws, direct_drawn = st_.drawn;
 #endif
     if (!pk_given_) {
@@ -4828,18 +4832,18 @@ void VulkanBackend::Present(const Surface& front) {
     auto& out = scanout_[slot_];
     const bool published = out.queued;
     if (out.queued) {
-        uint64_t copy_start = ngb_elapsed_ns();
+        uint64_t copy_start = NGB_DIAG ? ngb_elapsed_ns() : 0;
         if (vmaInvalidateAllocation(vma_, out.allocation, 0, VK_WHOLE_SIZE) != VK_SUCCESS)
             ngb_renderer_fatal("Vulkan scanout invalidate failed");
         ngb_scanout_direct(out.mapped);
-        ngb_direct_publish_time(ngb_elapsed_ns() - copy_start);
+        if (NGB_DIAG) ngb_direct_publish_time(ngb_elapsed_ns() - copy_start);
         out.queued = false;
     }
     ngb_direct_binding_counts(descriptor_requests_, descriptor_writes_);
     ngb_direct_geometry_bytes(geometry_requested_, geometry_reused_);
     geometry_requested_ = geometry_reused_ = 0;
     descriptor_requests_ = descriptor_writes_ = 0;
-    ngb_direct_present_time(ngb_elapsed_ns() - present_start, direct_draws, direct_drawn, published);
+    if (NGB_DIAG) ngb_direct_present_time(ngb_elapsed_ns() - present_start, direct_draws, direct_drawn, published);
 #endif
     // after the frame is on the queue: the presenter's blit, later on the same queue, waits for it
     // (its barrier on the picture)
@@ -4850,17 +4854,17 @@ void VulkanBackend::Present(const Surface& front) {
     PumpTextures(false);
 #endif
 #ifdef NGB_TEXTURE_PRELOAD
-    if(frame_==119){
+    if(NGB_DIAG && frame_==119){
         // Dump only after the measured 120th present; no file IO in the opening's upload path.
         for(unsigned i=0;i<120;++i){
             auto& v=tex_detail_[i];if(!v.uploads && !v.hits)continue;
             char row[170];std::snprintf(row,sizeof row,"3D scene [TEX_FRAME] present=%u hits=%u uploads=%u upload_us=%llu max_us=%llu format=%02x size=%ux%u",i+1,v.hits,v.uploads,(unsigned long long)v.us,(unsigned long long)v.max_us,v.fmt,v.w,v.h);ngb_kernel_log(row);
         }
     }
-    if(frame_==0 || (frame_+1)%60==0){
+    if(NGB_DIAG && (frame_==0 || (frame_+1)%60==0)){
         char line[180];std::snprintf(line,sizeof line,"3D scene [TEX_FIRST_USE] frame=%u upload_us_total=%llu worst_frame=%u worst_upload_us=%llu",frame_+1,(unsigned long long)live_us_,worst_live_frame_,(unsigned long long)worst_live_us_);ngb_kernel_log(line);
     }
-    if(frame_==0 || (frame_+1)%60==0){char msg[200];std::snprintf(msg,sizeof msg,"3D scene [TEX_PRELOAD] frame=%u enabled=%d made=%llu title=%llu hits=%llu misses=%llu gpu_bytes=%llu work_us=%llu",frame_+1,int(tex_enabled()),(unsigned long long)prep_made_,(unsigned long long)prep_title_,(unsigned long long)prep_hits_,(unsigned long long)prep_misses_,(unsigned long long)prep_bytes_,(unsigned long long)prep_us_);ngb_kernel_log(msg);}
+    if(NGB_DIAG && (frame_==0 || (frame_+1)%60==0)){char msg[200];std::snprintf(msg,sizeof msg,"3D scene [TEX_PRELOAD] frame=%u enabled=%d made=%llu title=%llu hits=%llu misses=%llu gpu_bytes=%llu work_us=%llu",frame_+1,int(tex_enabled()),(unsigned long long)prep_made_,(unsigned long long)prep_title_,(unsigned long long)prep_hits_,(unsigned long long)prep_misses_,(unsigned long long)prep_bytes_,(unsigned long long)prep_us_);ngb_kernel_log(msg);}
 #endif
     frame_++;
 }

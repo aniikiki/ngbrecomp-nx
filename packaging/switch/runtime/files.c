@@ -197,13 +197,13 @@ void ngb_files_close_all(void)
     memset(handles, 0, sizeof(handles));
     memset(links, 0, sizeof(links));
 }
-FILE *ngb_open_disc_intro(int kind)
+FILE *ngb_open_disc_movie(const char *leaf)
 {
+    if (!leaf || !*leaf || strpbrk(leaf,"/:\\")) return NULL;
     char path[1200];
-    int n = snprintf(path, sizeof(path), "%s%smovie/%s", disc,
-                     disc[0] && disc[strlen(disc)-1]=='/' ? "" : "/",
-                     kind==2 ? "ninja_gaiden.sfd" : kind ? "2_VI_WIDE_B.sfd" : "4_VI_STD_B.sfd");
-    return n > 0 && (size_t)n < sizeof(path) ? fopen(path, "rb") : NULL;
+    int n=snprintf(path,sizeof(path),"%s%smovie/%s",disc,
+                   disc[0] && disc[strlen(disc)-1]=='/' ? "" : "/",leaf);
+    return n>0 && (size_t)n<sizeof(path) ? fopen(path,"rb") : NULL;
 }
 
 int ngb_files_init(const char *disc_root, const char *data_root)
@@ -553,6 +553,16 @@ uint32_t ngb_file_open(const char *path, uint32_t root, uint32_t access,
     handles[slot].readonly = readonly; handles[slot].access = access; handles[slot].share = share;
     copy_path(handles[slot].path, sizeof(handles[slot].path), native);
     *handle = handles[slot].token; *information = created ? 2 : overwrite ? 3 : 1;
+    return 0;
+}
+uint32_t ngb_file_flush(uint32_t handle)
+{
+    int i = index_for(handle);
+    if (i < 0) return NGB_FS_INVALID_HANDLE;
+    if (handles[i].dismounted) return 0xc00000a3u;
+    if (!handles[i].file) return INVALID;
+    if (handles[i].readonly) return 0;
+    if (fflush(handles[i].file) || fsync(fileno(handles[i].file))) return error_status();
     return 0;
 }
 uint32_t ngb_file_close(uint32_t handle)

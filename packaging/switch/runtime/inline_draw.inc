@@ -470,7 +470,13 @@ static void draw_movie_strip(void)
     int left=fmaxf(0,ceilf(fminf(a[0],b[0]))), right=fminf(width,ceilf(fmaxf(a[0],b[0])));
     int top=fmaxf(0,ceilf(fminf(a[1],c[1]))), bottom=fminf(height,ceilf(fmaxf(a[1],c[1])));
     if (right<=left || bottom<=top) return;
-    const uint32_t *src=draw_surface(NV097_SET_CONTEXT_DMA_A,m[0x1b00/4],(height-1)*src_pitch+width*4,TEXTURE_SOURCE);
+    const uint32_t *src=ngb_prologue_pixels();
+    if(src && width==720 && height==480) {
+        src_pitch=720*4;
+        for(unsigned j=0;j<4;j++){
+            vertices[j][4]=(j&1)?720:0; vertices[j][5]=(j&2)?480:0;
+        }
+    } else src=draw_surface(NV097_SET_CONTEXT_DMA_A,m[0x1b00/4],(height-1)*src_pitch+width*4,TEXTURE_SOURCE);
     uint32_t *dst=draw_surface(NV097_SET_CONTEXT_DMA_COLOR,m[0x210/4],(height-1)*dst_pitch+width*4,CPU_TARGET);
     if (a[4]==0 && b[4]==0 && a[5]==0 && c[5]==0) {
         unsigned address=m[NV097_SET_TEXTURE_ADDRESS/4], mag=(m[NV097_SET_TEXTURE_FILTER/4]>>24)&15;
@@ -483,6 +489,24 @@ static void draw_movie_strip(void)
        a[4]==0 && b[4]==width && a[5]==0 && c[5]==height) {
         for(unsigned y=0;y<height;y++)for(unsigned x=0;x<width;x++)
             dst[y*(dst_pitch/4)+x]=0xff000000u|src[y*(src_pitch/4)+x];
+    } else if (width==720 && height==480 && a[0]==-0.5f && b[0]==719.5f &&
+               a[1]==-80.5f && c[1]==559.5f && a[4]==0 && b[4]==720 &&
+               a[5]==0 && c[5]==480 && ((m[NV097_SET_TEXTURE_FILTER/4]>>24)&15)==2) {
+        /* Original widescreen prologue: horizontal texels already align,
+         * and the vertical centres have exact eighth-texel coordinates.
+         * Blend contiguous rows without four sampler lookups per pixel. */
+        for (unsigned y=0;y<480;y++) {
+            unsigned v=479+6*y, w=v&7;
+            const uint32_t *lo=src+(v>>3)*(src_pitch/4), *hi=lo+src_pitch/4;
+            uint32_t *out=dst+y*(dst_pitch/4);
+            for (unsigned x=0;x<720;x++) {
+                const uint32_t mask=0xff00ffu;
+                uint32_t a0=lo[x],a1=hi[x];
+                uint32_t rb=(((a0&mask)*(8-w)+(a1&mask)*w+0x40004u)>>3)&mask;
+                uint32_t g=(((a0&0xff00u)*(8-w)+(a1&0xff00u)*w+0x400u)>>3)&0xff00u;
+                out[x]=0xff000000u|rb|g;
+            }
+        }
     } else {
         float du=(b[4]-a[4])/(b[0]-a[0]), dv=(c[5]-a[5])/(c[1]-a[1]);
         unsigned filter=m[NV097_SET_TEXTURE_FILTER/4];

@@ -12,6 +12,7 @@ uint32_t ngb_file_open(const char *path, uint32_t root, uint32_t access,
                        uint32_t share, uint32_t disposition, uint32_t options,
                        uint32_t *handle, uint32_t *information);
 uint32_t ngb_file_disposition(uint32_t handle, int pending);
+uint32_t ngb_file_flush(uint32_t handle);
 uint32_t ngb_file_close(uint32_t handle);
 const char *ngb_file_basename(uint32_t handle);
 uint32_t ngb_file_read(uint32_t handle, void *buffer, uint32_t length,
@@ -33,4 +34,4 @@ uint32_t ngb_link_open(const char *name, int ignore_case, uint32_t *handle);
 uint32_t ngb_link_target(uint32_t handle, char target[1024]);
 
 uint32_t ngb_file_directory(uint32_t handle, const char *pattern, int restart, void *buffer, uint32_t length, uint32_t *done);
-FILE *ngb_open_disc_intro(int wide);
+FILE *ngb_open_disc_movie(const char *leaf);

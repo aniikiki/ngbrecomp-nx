@@ -1,3 +1,6 @@
+#ifndef NGB_DIAG
+#define NGB_DIAG 1
+#endif
 #include "gpu/backend.h"
 #include "nv2a_vk_share.h"
 
@@ -95,6 +98,7 @@ extern "C" void ngb_direct_render_core(void) {
 // Elapsed render work outside an explicit guest wait. Includes driver waits
 // and scheduling on both cores, so this is wall-time overlap, not CPU time.
 extern "C" void ngb_direct_render_event(int renderer, int active) {
+    if (!NGB_DIAG) return;
     std::lock_guard lock(timing_mutex);
     uint64_t now = ngb_elapsed_ns(), dt = now - edge_ns;
     edge_ns = now;

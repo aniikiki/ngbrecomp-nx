@@ -96,6 +96,22 @@ uint32_t ngb_av_pack(void)
            AV_REFRESH_60Hz | (xbox_XcVideoFlags & ~0x00c0ffffu);
 }
 
+/* libnx does not link the desktop Win32 compatibility layer. */
+void SecureZeroMemory(PVOID memory, SIZE_T count)
+{
+    volatile unsigned char *p=memory;
+    while (count--) *p++=0;
+}
+
+void ngb_xc_hmac(const uint32_t a[7])
+{
+    const unsigned char *key = a[0] ? (void *)ngb_guest_pointer(a[0],a[1]) : NULL;
+    const unsigned char *first = a[2] && a[3] ? (void *)ngb_guest_pointer(a[2],a[3]) : NULL;
+    const unsigned char *second = a[4] && a[5] ? (void *)ngb_guest_pointer(a[4],a[5]) : NULL;
+    unsigned char *digest = a[6] ? (void *)ngb_guest_pointer(a[6],20) : NULL;
+    xbox_XcHMAC(key,a[1],first,a[3],second,a[5],digest);
+}
+
 void ngb_xc_sha(unsigned ordinal,uint32_t ctx,uint32_t data,uint32_t bytes)
 {
     PXBOX_SHA_CONTEXT context=(void *)ngb_guest_pointer(ctx,sizeof(*context));

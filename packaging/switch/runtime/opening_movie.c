@@ -16,7 +16,22 @@
 #include <libavutil/mathematics.h>
 #include <libswscale/swscale.h>
 
-static bool selected, selected_wide, chapter_intro;
+static const char *selected;
+static bool guest_prologue;
+static void seq_close(void);
+static unsigned selection_edge;
+static atomic_bool owns_input;
+int ngb_movie_owns_input(void) { return atomic_load(&owns_input); }
+
+/* Only known retail assets; never pass a guest path to the host filesystem. */
+static const char *const titles[] = {
+    "2_VI_WIDE_B.sfd","4_VI_STD_B.sfd","ninja_gaiden.sfd",
+    "pre_movie1.sfd","pre_movie2.sfd","pre_movie3.sfd","pre_movie4.sfd",
+    "pre_movie5.sfd","pre_movie5_j.sfd","pre_movie6.sfd","pre_movie8.sfd",
+    "pre_movie8_j.sfd","pre_movie9.sfd","pre_movie10.sfd","pre_movie10_j.sfd",
+    "pre_movie11.sfd","pre_movie11_j.sfd","pre_movie12.sfd","pre_movie13.sfd",
+    "pre_movie13_j.sfd","pre_movie14.sfd",
+};
 static uint64_t selected_ns;
 static atomic_bool playing;
 static atomic_uint displayed;
@@ -28,7 +43,10 @@ void ngb_movie_displayed(void)
 
 void ngb_select_movie(uint32_t address)
 {
-    selected = false;
+    seq_close();
+    selected = NULL;
+    guest_prologue=false;
+    atomic_store(&owns_input,false);
     if (!address) return;
     char path[256];
     for (unsigned i=0; i<sizeof(path); ++i) {
@@ -37,10 +55,15 @@ void ngb_select_movie(uint32_t address)
         if (!c) {
             const char *name = strrchr(path, '/');
             name = name ? name+1 : path;
-            selected_wide = !strcasecmp(name,"2_VI_WIDE_B.sfd");
-            chapter_intro = !strcasecmp(name,"ninja_gaiden.sfd");
-            selected = chapter_intro || selected_wide || !strcasecmp(name,"4_VI_STD_B.sfd");
-            if (selected) selected_ns=ngb_elapsed_ns();
+            for (unsigned j=0;j<sizeof titles/sizeof titles[0];++j) {
+                if (strcasecmp(name,titles[j])) continue;
+                selected=titles[j];
+                guest_prologue=!strcmp(selected,"ninja_gaiden.sfd");
+                selected_ns=ngb_elapsed_ns();
+                selection_edge=ngb_movie_skip_edges();
+                atomic_store(&owns_input,true);
+                break;
+            }
             return;
         }
     }
@@ -73,6 +96,8 @@ static int next_packet(FILE *file, uint8_t sector[2048+AV_INPUT_BUFFER_PADDING_S
     }
     return -1;
 }
+
+#include "prologue_stream.inc"
 
 static void wait_frame(uint64_t deadline)
 {
@@ -111,24 +136,28 @@ static int present_frames(Movie *movie, AVPacket *packet)
             if (rate.num<=0 || rate.den<=0 || av_q2d(rate)<29 || av_q2d(rate)>31)
                 return AVERROR_INVALIDDATA;
             movie->period=av_rescale(1000000000,rate.den,rate.num);
-            movie->colors=sws_getContext(frame->width,chapter_intro ? 360 : frame->height,frame->format,
-                frame->width,frame->height,AV_PIX_FMT_BGRA,chapter_intro ? SWS_BILINEAR : SWS_POINT,NULL,NULL,NULL);
+            movie->colors=sws_getContext(frame->width,frame->height,frame->format,
+                frame->width,frame->height,AV_PIX_FMT_BGRA,SWS_POINT,NULL,NULL,NULL);
             if (!movie->colors) return AVERROR(ENOMEM);
             movie->start=ngb_elapsed_ns();
             atomic_store(&playing,true);
         }
+        if (ngb_stop_requested()) return AVERROR_EXIT;
+        if (movie->start_edge!=ngb_movie_skip_edges()) { movie->skipped=true; return AVERROR_EXIT; }
+        uint64_t deadline=movie->start+movie->count*movie->period;
+        /* Decode reference pictures, but don't present a burst of expired frames
+         * after an SD stall. Keep the original movie timeline. */
+        if (movie->count && ngb_elapsed_ns()>deadline+movie->period) {
+            ++movie->late; ++movie->count; continue;
+        }
         uint8_t *dest[4]={(uint8_t *)ngb_scanout_movie_buffer()};
         int strides[4]={4*NGB_SCAN_W};
-        /* Retail wide quad spans y=-80.5..559.5: its visible 480 rows
-         * correspond to the central 360 of this 720x480 movie. */
         const uint8_t *src[4]={frame->data[0],frame->data[1],frame->data[2],NULL};
-        if(chapter_intro)for(unsigned i=0;i<3;i++)src[i]+=(i?30:60)*frame->linesize[i];
         if (sws_scale(movie->colors,src,frame->linesize,
-                      0,chapter_intro ? 360 : frame->height,dest,strides)!=frame->height) return AVERROR_INVALIDDATA;
-        uint64_t deadline=movie->start+movie->count*movie->period;
+                      0,frame->height,dest,strides)!=frame->height) return AVERROR_INVALIDDATA;
         wait_frame(deadline);
         if (ngb_stop_requested()) return AVERROR_EXIT;
-        if(chapter_intro && movie->start_edge!=ngb_start_press_count()){movie->skipped=true;return AVERROR_EXIT;}
+        if(movie->start_edge!=ngb_movie_skip_edges()){movie->skipped=true;return AVERROR_EXIT;}
         if (ngb_elapsed_ns()>deadline+movie->period) ++movie->late;
         ngb_scanout_publish_movie();
         ++movie->count;
@@ -192,21 +221,37 @@ uint32_t ngb_movie_status(uint32_t status)
 {
     /* PREP and PLAYING both identify an initialized game movie session.
      * Native playback can start at PREP without priming the Xbox decoder. */
+    /* The New Game narration and subtitles are timed and composited by the
+     * title between polls. A blocking native playback here starves that loop. */
+    if (guest_prologue) {
+        if (seq.file) {
+            if (selection_edge==ngb_movie_skip_edges() && seq_playing()) return 2;
+            seq_close(); status=3;
+        } else if (status==1 || status==2) {
+            if (selection_edge==ngb_movie_skip_edges()) return status;
+            status=3;
+        } else if (status==0) return status;
+        guest_prologue=false;
+        selected=NULL;
+        atomic_store(&owns_input,false);
+        return status;
+    }
     if (!selected || (status!=1 && status!=2)) return status;
-    selected=false;
+    const char *name=selected;
+    selected=NULL;
 #ifndef __SWITCH__
-    if (getenv("NGB_TEST_ORIGINAL_MOVIE")) return status;
+    if (getenv("NGB_TEST_ORIGINAL_MOVIE")) { atomic_store(&owns_input,false); return status; }
 #endif
-    FILE *file=ngb_open_disc_intro(chapter_intro ? 2 : selected_wide);
-    if (!file) return status;
-    if (chapter_intro) ngb_kernel_log("Opening movie native chapter CG ninja_gaiden.sfd");
+    FILE *file=ngb_open_disc_movie(name);
+    if (!file) { atomic_store(&owns_input,false); return status; }
     if (status==1) ngb_kernel_log("Opening movie native playback during guest prep");
     setvbuf(file,NULL,_IOFBF,128*1024);
-    Movie movie={.start=ngb_elapsed_ns(),.start_edge=ngb_start_press_count()};
+    Movie movie={.start=ngb_elapsed_ns(),.start_edge=selection_edge};
     atomic_store(&displayed,0);
     bool complete=decode_intro(file,&movie);
     if (complete) wait_frame(movie.start+movie.count*movie.period);
     atomic_store(&playing,false);
+    atomic_store(&owns_input,false);
     sws_freeContext(movie.colors);
     av_frame_free(&movie.frame);
     avcodec_free_context(&movie.codec);

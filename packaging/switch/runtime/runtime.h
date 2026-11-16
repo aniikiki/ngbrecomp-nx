@@ -25,4 +25,6 @@ void *ngb_dma_pointer(uint32_t address, size_t size);
 void ngb_select_movie(uint32_t path_address);
 uint32_t ngb_movie_status(uint32_t guest_status);
 int ngb_stop_requested(void);
+const uint32_t *ngb_prologue_pixels(void);
+int ngb_movie_owns_input(void);
 void ngb_movie_displayed(void);

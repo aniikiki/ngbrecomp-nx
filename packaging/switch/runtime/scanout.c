@@ -1,3 +1,6 @@
+#ifndef NGB_DIAG
+#define NGB_DIAG 1
+#endif
 #include "scanout.h"
 #ifdef __aarch64__
 #include "wide_blit.h"
@@ -18,7 +21,7 @@ static uint32_t frames[3][NGB_SCAN_H][NGB_SCAN_W];
 static NgbExchange snapshots = NGB_EXCHANGE_INIT;
 static atomic_uint generation, display_count;
 static atomic_int last_snapshot = -1;
-static atomic_int ready, blank;
+static atomic_int ready, blank, visible;
 static uint32_t display_pitch;
 static unsigned peak_brightness, fade_steps;
 static uint64_t fade_start;
@@ -29,6 +32,7 @@ void ngb_scanout_reset(void)
     display_pitch=0;
     peak_brightness=fade_steps=0;
     fade_start=0;
+    atomic_store(&visible, 0);
     atomic_store(&ready, 0);
     atomic_store(&blank, 0);
 }
@@ -41,6 +45,8 @@ unsigned ngb_scanout_display_count(void) { return atomic_load(&display_count); }
 unsigned ngb_scanout_generation(void) { return atomic_load(&generation); }
 int ngb_scanout_ready(void) { return atomic_load(&ready); }
 
+int ngb_scanout_visible(void) { return atomic_load(&visible) && !atomic_load(&blank); }
+
 void ngb_scanout_mode(uint32_t mode, uint32_t fmt, uint32_t pitch, uint32_t phys)
 {
     if ((mode != 0x0802020e && mode != 0x1802020e) || fmt != 0x12 || pitch < NGB_SCAN_W*4 || pitch%4 || (phys&3))
@@ -51,8 +57,16 @@ void ngb_scanout_mode(uint32_t mode, uint32_t fmt, uint32_t pitch, uint32_t phys
 
 static void publish_snapshot(void)
 {
+    /* Ignore the guest's initial cleared surfaces when handing off the loading UI. */
+    int first_picture = 0;
+    if (!atomic_load(&visible)) {
+        for (unsigned y=0; !first_picture && y<NGB_SCAN_H; y+=4)
+            for (unsigned x=0; x<NGB_SCAN_W; x+=4)
+                if (frames[snapshots.writer][y][x] & 0x00f0f0f0u) { first_picture=1; break; }
+    }
     last_snapshot = snapshots.writer;
     ngb_publish(&snapshots);
+    if (first_picture) atomic_store(&visible,1);
     atomic_fetch_add(&generation, 1);
 }
 
@@ -106,7 +120,7 @@ void ngb_scanout_refresh(uint32_t phys)
     unsigned lit=0, peak=0;
     for (unsigned y=0; y<NGB_SCAN_H; ++y) {
         memcpy(pixels[y],src+y*pitch,NGB_SCAN_W*4);
-        if (peak_brightness<255) for (unsigned x=0; x<NGB_SCAN_W; ++x) {
+        if (NGB_DIAG && peak_brightness<255) for (unsigned x=0; x<NGB_SCAN_W; ++x) {
             uint32_t c=pixels[y][x]&0xffffffu;
             lit+=c!=0;
             if ((c&255)>peak) peak=c&255;
@@ -131,6 +145,7 @@ void ngb_scanout_refresh(uint32_t phys)
     }
 #endif
     publish_snapshot();
+    if (!NGB_DIAG) { atomic_store(&ready,1); return; }
     unsigned last=peak_brightness;
     if (peak>last) {
         peak_brightness=peak;

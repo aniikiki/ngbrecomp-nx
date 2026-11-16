@@ -12,6 +12,9 @@
 
 #ifdef __SWITCH__
 #include <switch.h>
+#include "player_diagnostics.h"
+int ngb_diagnostics_enabled;
+#include "loading.inc"
 static atomic_bool finished;
 static int boot_status;
 static FILE *boot_log;
@@ -62,6 +65,7 @@ static Result thread_ticks(Handle handle, u64 *value)
 void ngb_profile_next_frame(unsigned frame, unsigned draws)
 {
     if (frame==1) atomic_store(&gameplay_controls,true);
+    if (!ngb_diagnostics_enabled) return;
     unsigned active = 0;
     FrameMark mark = {0};
     for (unsigned i = 0; i < PROFILE_WINDOWS; ++i) {
@@ -270,13 +274,13 @@ static void sample_pad(PadState *pad, bool game_input)
         HidNpadButton_A,HidNpadButton_B,HidNpadButton_X,HidNpadButton_Y,
         HidNpadButton_R,HidNpadButton_L,HidNpadButton_ZL,HidNpadButton_ZR
     };
-    /* B opens the port diagnostics. Passing it through can also tear down
+    /* Before gameplay starts, passing B through can tear down
      * the guest movie while its decoder thread is running. */
     uint64_t held=padGetButtons(pad);
     if (!game_input || !atomic_load(&gameplay_controls)) held &= ~HidNpadButton_B;
     else if ((held & (HidNpadButton_Minus|HidNpadButton_B))==(HidNpadButton_Minus|HidNpadButton_B))
         held &= ~(HidNpadButton_Minus|HidNpadButton_B);
-    if (!game_input) held &= ~HidNpadButton_Plus;
+    if (!game_input && !ngb_movie_owns_input()) held &= ~HidNpadButton_Plus;
     uint16_t buttons=0;
     for (unsigned i=0;i<16;i++) if (held&mapped[i]) buttons|=1u<<i;
     HidAnalogStickState l=padGetStickPos(pad,0), r=padGetStickPos(pad,1);
@@ -295,15 +299,13 @@ static void poll_input(PadState *pad)
     u64 down = padGetButtonsDown(pad);
     bool stopped = atomic_load(&finished);
     sample_pad(pad, game && !stopped);
-    unsigned action = ngb_view_action(game,stopped,down & HidNpadButton_A,
-                                     (down & HidNpadButton_B) && (!atomic_load(&gameplay_controls) || stopped ||
-                                     (padGetButtons(pad)&HidNpadButton_Minus)),down & HidNpadButton_Plus);
+    unsigned action = (stopped || (!game && !ngb_movie_owns_input())) && (down & HidNpadButton_Plus) ? EXIT_GAME : 0;
     if (action) atomic_fetch_or(&commands, action);
     if (boot_log && (down & (HidNpadButton_B | HidNpadButton_Plus))) {
         fprintf(boot_log,"[INPUT] Plus=%d B=%d game_view=%d connected=%d stopped=%d uptime_ms=%llu\n",
                 !!(down & HidNpadButton_Plus), !!(down & HidNpadButton_B), game, padIsConnected(pad), stopped,
                 (unsigned long long)(armTicksToNs(armGetSystemTick()-launch_tick)/1000000));
-        fflush(boot_log);
+        if (boot_log) fflush(boot_log);
     }
 }
 static void guest_worker(void *arg)
@@ -315,25 +317,25 @@ static void guest_worker(void *arg)
     static const char external[]="sdmc:/switch/ngb-runtime/disc";
     struct stat st;
     const char *image="sdmc:/switch/ngb-runtime/disc/default.xbe";
-    fprintf(boot_log,"[DISC] source=%s\n",external);
+    if (boot_log) fprintf(boot_log,"[DISC] source=%s\n",external);
     if (stat(image,&st) || !S_ISREG(st.st_mode)) {
         startup_error = "Copy the extracted game to /switch/ngb-runtime/disc (default.xbe missing)";
-        fprintf(boot_log,"[ERROR] %s\n",startup_error);
+
         boot_status=NGB_BOOT_ERROR;
-        fflush(boot_log);
+        if (boot_log) fflush(boot_log);
     } else if (ngb_files_init(external, "sdmc:/switch/ngb-runtime/data")) {
-        fprintf(boot_log, "[ERROR] virtual disk initialization failed\n");
+
         boot_status = NGB_BOOT_ERROR;
         startup_error = "virtual disk initialization failed";
-        fflush(boot_log);
+        if (boot_log) fflush(boot_log);
     } else boot_status = ngb_boot(image, boot_log);
     atomic_store(&finished, true);
 }
 
+/* Retained build version: 0.51.0-rc1 */
 int main(void)
 {
     launch_tick=armGetSystemTick();
-    consoleInit(NULL);
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
     PadState pad;
     padInitializeDefault(&pad);
@@ -341,23 +343,41 @@ int main(void)
     sample_pad(&pad, false);
     mkdir("sdmc:/switch", 0777);
     mkdir("sdmc:/switch/ngb-runtime", 0777);
-    mkdir("sdmc:/switch/ngb-runtime/logs", 0777);
-    const char *current_log = "sdmc:/switch/ngb-runtime/logs/boot.log";
-    const char *previous_log = "sdmc:/switch/ngb-runtime/logs/boot.previous.log";
-    struct stat last;
-    if (!stat(current_log,&last) && last.st_size > 0) {
-        remove(previous_log);
-        rename(current_log,previous_log);
+    struct stat flag;
+    ngb_diagnostics_enabled = stat("sdmc:/switch/ngb-runtime/diagnostics.flag",&flag)==0 && S_ISREG(flag.st_mode);
+    if (ngb_diagnostics_enabled) {
+        mkdir("sdmc:/switch/ngb-runtime/logs", 0777);
+        const char *current_log = "sdmc:/switch/ngb-runtime/logs/boot.log";
+        const char *previous_log = "sdmc:/switch/ngb-runtime/logs/boot.previous.log";
+        struct stat last;
+        if (!stat(current_log,&last) && last.st_size > 0) {
+            remove(previous_log);
+            rename(current_log,previous_log);
+        }
+        boot_log = fopen(current_log, "w");
+        if (!boot_log) ngb_diagnostics_enabled=0;
     }
-    boot_log = fopen(current_log, "w");
 #ifdef NGB_DIRECT3D
     if (boot_log) { fprintf(boot_log, "[CONFIG] kickoff_kib=%u\n", NGB_DIRECT_KICKOFF_KIB); fflush(boot_log); }
 #endif
     Result rc = romfsInit();
+    Framebuffer surface = {0};
+    bool surface_open = false, console_open = false;
+    if (R_SUCCEEDED(rc)) {
+        if (!load_splash()) { startup_error="Loading artwork missing. Replace the game application."; rc=1; }
+        else {
+            rc=framebufferCreate(&surface,nwindowGetDefault(),1280,720,PIXEL_FORMAT_RGBA_8888,2);
+            if (R_SUCCEEDED(rc)) {
+                rc=framebufferMakeLinear(&surface);
+                if (R_FAILED(rc)) framebufferClose(&surface);
+                else { surface_open=true; show_loading(&surface,0); }
+            }
+        }
+    }
     Thread worker, input;
     bool input_started = false;
     bool created = false, started = false;
-    if (boot_log && R_SUCCEEDED(rc)) {
+    if (R_SUCCEEDED(rc)) {
         u64 allowed = 0;
         u32 ui_core = svcGetCurrentProcessorNumber();
         s32 core = -2;
@@ -371,7 +391,7 @@ int main(void)
             core = -2;
             rc = threadCreate(&worker, guest_worker, NULL, NULL, 2*1024*1024, 0x2d, core);
         }
-        fprintf(boot_log,"[THREADS] ui_core=%u guest_core=%d allowed=%llx\n",
+        if (boot_log) fprintf(boot_log,"[THREADS] ui_core=%u guest_core=%d allowed=%llx\n",
                 ui_core, core, (unsigned long long)allowed);
         created = R_SUCCEEDED(rc);
         if (created) { rc = threadStart(&worker); started = R_SUCCEEDED(rc); }
@@ -381,99 +401,52 @@ int main(void)
         if (!input_started) threadClose(&input);
     }
     if (boot_log) { fprintf(boot_log,"[INPUT] dedicated_sampler=%d\n",input_started); fflush(boot_log); }
-    unsigned frame = 0, displayed = 0;
-    bool force_present = true;
-    Framebuffer surface = {0};
-    bool viewing = false, offered = false, exiting = false, stop_reported = false;
-    Result display_error = 0;
+    unsigned displayed = 0, pulse = 0;
+    u64 next_pulse = armGetSystemTick();
+    bool viewing = false, exiting = false, reported = false;
     while (appletMainLoop()) {
         if (!input_started) poll_input(&pad);
+        bool done=atomic_load(&finished);
+        bool failed=!started || (done && (boot_status==NGB_BOOT_ERROR || boot_status==NGB_BOOT_UNSUPPORTED));
+        if (failed && !reported) {
+            reported=true;
+            atomic_store(&game_view,false);
+            const char *why=startup_error ? startup_error : started ? ngb_boot_reason() : "Unable to start the game";
+            mkdir("sdmc:/switch/ngb-runtime/logs",0777);
+            FILE *err=fopen("sdmc:/switch/ngb-runtime/logs/error.log","a");
+            if (err) { fprintf(err,"[ERROR] %s (rc=%08x)\n",why,rc); fclose(err); }
+            if (surface_open) { framebufferClose(&surface); surface_open=false; }
+            consoleInit(NULL); console_open=true;
+            printf("Ninja Gaiden Black\n\n%s\n\nPress + to return.\n",why);
+            consoleUpdate(NULL);
+        }
+        if (atomic_exchange(&commands,0)&EXIT_GAME) { ngb_request_stop(); exiting=true; }
+        if (exiting && (!started || done)) break;
+        if (done && !failed) break;
+        if (!failed && ngb_scanout_ready() && (viewing || ngb_scanout_visible())) {
+            unsigned next=ngb_scanout_generation();
+            if (!viewing || displayed!=next) {
+                u32 stride; u32 *dst=framebufferBegin(&surface,&stride);
+                ngb_scanout_blit(dst,stride/4,1280,720);
+                framebufferEnd(&surface);
+                ngb_scanout_displayed(); ngb_movie_displayed();
+                displayed=next; viewing=true; atomic_store(&game_view,true);
+            }
 #ifdef NGB_DIRECT3D
-        if (started && !exiting && viewing) sample_guest_thread(&worker);
-        static bool profiles_saved;
-        if (!profiles_saved && atomic_load(&completed_windows) == PROFILE_WINDOWS) {
-            write_guest_samples(PROFILE_WINDOWS);
-            profiles_saved = true;
-        }
+            if (ngb_diagnostics_enabled && !exiting) {
+                sample_guest_thread(&worker);
+                static bool saved;
+                if (!saved && atomic_load(&completed_windows)==PROFILE_WINDOWS) {
+                    write_guest_samples(PROFILE_WINDOWS);
+                    saved=true;
+                }
+            }
 #endif
-        unsigned action = atomic_exchange(&commands, 0);
-        if (!stop_reported && atomic_load(&finished) &&
-            (boot_status == NGB_BOOT_UNSUPPORTED || boot_status == NGB_BOOT_ERROR)) {
-            stop_reported = true;
-            offered = true;
-            if (viewing) action |= SHOW_DETAILS;
+        } else if (!failed && !viewing && armGetSystemTick()>=next_pulse) {
+            show_loading(&surface,++pulse);
+            next_pulse=armGetSystemTick()+armGetSystemTickFreq()/4;
         }
-        if (viewing && (action & SHOW_DETAILS)) {
-            atomic_store(&game_view, false);
-            framebufferClose(&surface); consoleInit(NULL); viewing = false; frame = 0;
-            if (boot_log) { fputs("[DISPLAY] diagnostics opened\n",boot_log); fflush(boot_log); }
-        } else if (!viewing && ngb_scanout_ready() && (!offered || (action & SHOW_GAME))) {
-            offered = true;
-            consoleExit(NULL);
-            display_error = framebufferCreate(&surface,nwindowGetDefault(),1280,720,PIXEL_FORMAT_RGBA_8888,2);
-            if (R_SUCCEEDED(display_error)) {
-                display_error = framebufferMakeLinear(&surface);
-                if (R_FAILED(display_error)) framebufferClose(&surface);
-            }
-            viewing = R_SUCCEEDED(display_error);
-            atomic_store(&game_view, viewing);
-            force_present = true;
-            if (!viewing) {
-                fprintf(boot_log,"[DISPLAY] framebuffer setup failed rc=%08x\n",display_error);
-                fflush(boot_log);
-                consoleInit(NULL);
-                frame=0;
-            }
-        }
-        if (action & EXIT_GAME) {
-            ngb_request_stop();
-            exiting = true;
-        }
-        if (exiting && (!started || atomic_load(&finished))) break;
-        if (viewing) {
-            unsigned next = ngb_scanout_generation();
-            if (!force_present && displayed == next) {
-                svcSleepThread(4000000);
-                continue;
-            }
-            displayed = next;
-            force_present = false;
-            u32 stride=0;
-            u32 *dst=framebufferBegin(&surface,&stride);
-            ngb_scanout_blit(dst,stride/4,1280,720);
-            framebufferEnd(&surface);
-            ngb_scanout_displayed();
-            ngb_movie_displayed();
-            static bool logged=false;
-            if (!logged && dst && stride>=1280*4) {
-                fprintf(boot_log,"[DISPLAY] first guest scanout queued to Switch framebuffer\n");
-                fflush(boot_log); logged=true;
-            }
-            continue;
-        }
-        if (frame++ % 15 == 0) {
-            consoleClear();
-#ifdef NGB_RIGID_CLIP
-            printf("NGB SWITCH - GAME STARTUP 0.51.0-rc1\n\n");
-#elif defined(NGB_REGISTER_PACKAGE)
-            printf("NGB SWITCH - GAME STARTUP 0.50.0-rc1\n\n");
-#else
-            printf("NGB SWITCH - GAME STARTUP 0.49.0\n\n");
-#endif
-            printf("This build executes the recompiled XBE startup.\n");
-            printf("Story mode requires a complete extracted game disc.\n\n");
-            if (!started) printf("START FAILED: rc=%08x log=%s\n", rc, boot_log ? "open" : "failed");
-            else if (!atomic_load(&finished)) printf("Running game startup...\n");
-            else {
-                printf("STOPPED (status %d)\n%s\n", boot_status, startup_error ? startup_error : ngb_boot_reason());
-                printf("Unsupported services stop here instead of faking success.\n");
-            }
-            if (ngb_scanout_ready()) printf("Game screen: 720x480. A: view / hold MINUS + tap B: details / PLUS: Start\n");
-            if (R_FAILED(display_error)) printf("Display error: %08x\n", display_error);
-            printf("\nLog: /switch/ngb-runtime/logs/boot.log\n");
-            printf("PLUS: cancel / exit to hbmenu\n");
-        }
-        consoleUpdate(NULL);
+        svcSleepThread(4000000);
     }
     atomic_store(&input_stop, true);
     if (input_started) { threadWaitForExit(&input); threadClose(&input); }
@@ -485,7 +458,8 @@ int main(void)
 #endif
     if (boot_log) fclose(boot_log);
     romfsExit();
-    if (viewing) framebufferClose(&surface); else consoleExit(NULL);
+    if (surface_open) framebufferClose(&surface);
+    if (console_open) consoleExit(NULL);
     return 0;
 }
 #else

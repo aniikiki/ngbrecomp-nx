@@ -1,3 +1,6 @@
+#ifndef NGB_DIAG
+#define NGB_DIAG 1
+#endif
 #include <volk.h>
 #include <switch/arm/counter.h>
 #include <mutex>
@@ -15,13 +18,14 @@ VKAPI_ATTR VkResult VKAPI_CALL traced_create(VkDevice dev,VkPipelineCache cache,
 }
 extern "C" void __wrap_volkLoadDeviceTable(VolkDeviceTable* table,VkDevice dev){
     __real_volkLoadDeviceTable(table,dev);
+    if(!NGB_DIAG)return;
     std::lock_guard lock(pt_mutex);
     if(!table->vkCreateGraphicsPipelines || (real_create && real_create!=table->vkCreateGraphicsPipelines))std::abort();
     real_create=table->vkCreateGraphicsPipelines;table->vkCreateGraphicsPipelines=traced_create;++pt.tables;
 }
-extern "C" void pt_wait(bool enter){edge(false,enter);}
+extern "C" void pt_wait(bool enter){if(NGB_DIAG)edge(false,enter);}
 extern "C" void pt_flip(unsigned f){
-    if(f>121)return;
+    if(!NGB_DIAG || f>121)return;
     PipeTimeline snapshot;
     {std::lock_guard lock(pt_mutex);
      pt.flip(armGetSystemTick(),f);

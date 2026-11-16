@@ -9,6 +9,7 @@ unsigned ngb_scanout_generation(void);
 void ngb_scanout_displayed(void);
 unsigned ngb_scanout_display_count(void);
 int ngb_scanout_ready(void);
+int ngb_scanout_visible(void);
 void ngb_scanout_blit(uint32_t *dst, unsigned stride_pixels, unsigned width, unsigned height);
 void ngb_scanout_refresh(uint32_t phys);
 uint32_t *ngb_scanout_movie_buffer(void);

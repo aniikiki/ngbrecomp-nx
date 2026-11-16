@@ -52,7 +52,8 @@ static uint16_t previous_buttons;
 /* Owned by the guest USB consumer. A held physical button retains the
  * assignment it had at press, even during a temporary game-state change. */
 static uint8_t face_down, face_swapped;
-static atomic_uint start_presses;
+static atomic_uint start_presses, movie_skip_edges;
+unsigned ngb_movie_skip_edges(void) { return atomic_load(&movie_skip_edges); }
 unsigned ngb_start_press_count(void) { return atomic_load(&start_presses); }
 static atomic_bool menu_input;
 static atomic_uint menu_edges;
@@ -154,6 +155,8 @@ void ngb_pad_flip(void)
 void ngb_ohci_pad_sample(uint16_t buttons, int16_t lx, int16_t ly, int16_t rx, int16_t ry)
 {
     uint8_t *pad_report = reports[pad_samples.writer];
+    if ((buttons & ~previous_buttons) & (16u | 256u))
+        atomic_fetch_add(&movie_skip_edges,1);
     if ((buttons & 16) && !(previous_buttons & 16)) {
         atomic_fetch_add(&start_presses,1);
         if (ngb_scanout_ready() && !atomic_load(&warning_press_ns))

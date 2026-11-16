@@ -1,3 +1,6 @@
+#ifndef NGB_DIAG
+#define NGB_DIAG 1
+#endif
 #define RECOMP_GENERATED_CODE
 #include "recomp_funcs.h"
 #include "d3d_funcs.h"
@@ -104,7 +107,7 @@ void ngb_direct_index_reset(void)
     const char *mode = getenv("NGB_RENDER_FULL_TIMING");
     full_timing = mode && !strcmp(mode, "1");
     measured_frames = 0;
-    ngb_direct_detail_frame = 1;
+    ngb_direct_detail_frame = NGB_DIAG;
     index_time.edge = ngb_elapsed_ns();
 }
 

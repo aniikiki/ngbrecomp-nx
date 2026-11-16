@@ -14,3 +14,5 @@ uint32_t ngb_bus_read32(uint32_t va);
 void ngb_bus_write32(uint32_t va, uint32_t value);
 
 unsigned ngb_start_press_count(void);
+
+unsigned ngb_movie_skip_edges(void);

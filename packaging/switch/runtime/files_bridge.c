@@ -93,6 +93,7 @@ unsigned ngb_files_arg_count(uint32_t ordinal)
     case 65: return 6;
     case 67: case 203: return 2;
     case 215: return 3;
+    case 198: return 2;
     case 187: return 1;
     case 190: return 9;
     case 196: case 200: case 207: return 10;
@@ -107,6 +108,13 @@ uint32_t ngb_files_dispatch(uint32_t ordinal, const uint32_t *a)
     uint32_t status = NGB_FS_UNSUPPORTED, done = 0, ios = 0;
     char message[1200];
     if (ordinal == 65) return create_device(a);
+    if (ordinal == 198) {
+        if (!a[1]) return 0xc000000du;
+        (void)ngb_guest_pointer(a[1],8);
+        status=ngb_file_flush(a[0]);
+        store32(a[1],status); store32(a[1]+4,0);
+        return status;
+    }
     if (ordinal == 187) return ngb_file_close(a[0]);
     if (ordinal == 67) {
         char name[1024], target[1024];
@@ -181,7 +189,14 @@ uint32_t ngb_files_dispatch(uint32_t ordinal, const uint32_t *a)
         uint32_t options = a[ordinal == 190 ? 8 : 5];
         /* Like the upstream POSIX backend, hidden/system attributes do not
          * change the host mode; read-only attributes require a later mapping. */
-        if (ordinal == 190 && ((a[4] && i64(a[4]) != 0) || (a[5] & ~0xb6u)))
+        /* XCreateSaveGame opens SaveMeta.xbx with AllocationSize=1. This is a
+         * FATX allocation hint, not EndOfFile: keep new files empty and existing
+         * slots intact. Leave quotas and real allocation errors to file writes. */
+        int64_t allocation = ordinal == 190 && a[4] ? i64(a[4]) : 0;
+        int small_hint = allocation > 0 && allocation <= 16384 &&
+                         !(options & 1) && (a[1] & 0x50000002u) &&
+                         (disposition == 2 || disposition == 3 || disposition == 5);
+        if (ordinal == 190 && ((allocation && !small_hint) || (a[5] & ~0xb6u)))
             status = NGB_FS_UNSUPPORTED;
         if (!status) {
             status = ngb_file_open(path, root, a[1], share, disposition, options, &handle, &done);
@@ -234,7 +249,16 @@ uint32_t ngb_files_dispatch(uint32_t ordinal, const uint32_t *a)
             ngb_kernel_log(message);
         }
     }
-    if (status == NGB_FS_UNSUPPORTED) ngb_stop("unsupported file operation", ordinal);
+    if (status == NGB_FS_UNSUPPORTED) {
+        char reason[160];
+        if (ordinal == 190 || ordinal == 202)
+            snprintf(reason,sizeof(reason),"unsupported open: access=%08x disposition=%u options=%08x alloc=%lld",
+                a[1],ordinal==190?a[7]:1,ordinal==190?a[8]:a[5],(long long)(ordinal==190 && a[4]?i64(a[4]):0));
+        else if (ordinal==211 || ordinal==218 || ordinal==226)
+            snprintf(reason,sizeof(reason),"unsupported file information: class=%u length=%u",a[4],a[3]);
+        else snprintf(reason,sizeof(reason),"unsupported file operation");
+        ngb_stop(reason, ordinal);
+    }
     if (ios) { store32(ios, status); store32(ios + 4, done); }
     if ((ordinal==219 || ordinal==236) && a[1]) ngb_io_event(a[1],1);
     return status;

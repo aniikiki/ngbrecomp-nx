@@ -2,6 +2,7 @@
 #include <stdint.h>
 uint32_t ngb_status_to_error(uint32_t status);
 uint32_t ngb_equal_string(uint32_t first, uint32_t second, uint32_t nocase);
+void ngb_xc_hmac(const uint32_t args[7]);
 void ngb_xc_sha(unsigned ordinal,uint32_t ctx,uint32_t data,uint32_t bytes);
 void ngb_video_init(void);
 uint32_t ngb_av_pack(void);

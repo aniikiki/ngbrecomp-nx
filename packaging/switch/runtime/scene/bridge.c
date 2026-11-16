@@ -1,3 +1,6 @@
+#ifndef NGB_DIAG
+#define NGB_DIAG 1
+#endif
 #include "scene.h"
 #ifdef NGB_DIRECT3D
 #include "direct/output.h"
@@ -268,6 +271,7 @@ static void submit(uint32_t method, uint32_t value)
 
 static void record_flip(void)
 {
+    if (!NGB_DIAG) { scene_flips += 1; return; }
     uint64_t now = ngb_elapsed_ns();
     collect_draw_timers();
     intervals[scene_flips-window_flip] = now - previous_flip;

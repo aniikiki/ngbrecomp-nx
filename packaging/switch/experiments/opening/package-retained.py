@@ -100,5 +100,21 @@ if '--texture-preload' in sys.argv:
  def comp(name,s,flags=[]):
   if name in ('files.c','scanout.c','hle.cpp','vk/backend.cpp','threaded.cpp'):
    flags=[*flags,'-DNGB_TEXTURE_PRELOAD','-I'+str(d)]""")
+if '--player' in sys.argv:
+ assert '--texture-preload' in sys.argv
+ replace("version='0.56.2';out=", "version='0.56.8';out=")
+ replace(" def comp(name,s,flags=[]):",""" def comp(name,s,flags=[]):
+  if name=='opening_movie.c':
+   flags=[*flags,'-DNGB_PROLOGUE_START=ngb_reg_sub_003443D0','-DNGB_PROLOGUE_CAPTION=ngb_reg_sub_00344AD0']
+   link.insert(1,'-Wl,--wrap=ngb_reg_sub_003443D0,--wrap=ngb_reg_sub_00344AD0')
+  flags=[*flags,'-DNGB_PLAYER_BUILD','-include',str(root/'player_diagnostics.h')]""")
+ replace(" comp('threaded.cpp',renderer", " comp('files_bridge.c',(root/'files_bridge.c').read_text())\n comp('direct/platform.cpp',(root/'direct/platform.cpp').read_text())\n comp('threaded.cpp',renderer")
+ replace("bd_present_mark(); g_backend->Present", "if(NGB_DIAG) bd_present_mark(); g_backend->Present")
+ replace("pt_flip(f);", "if(!NGB_DIAG)return;pt_flip(f);")
+ replace("sdk/'libnx/default_icon.jpg'", "base/'branding/ngb-icon.jpg'")
+ replace("'NGB Startup',", "'Ninja Gaiden Black',")
+ replace("  seeds=base/", "  shutil.copyfile(base/'branding/loading.rgba',romfs/'loading.rgba')\n  seeds=base/")
+ replace("==['.ngb-recipes','.ngb-spirv']", "==['.ngb-recipes','.ngb-spirv','loading.rgba']")
+ replace(" assert digest(nro,1)", " assert digest(nro,0)==hashlib.sha256((base/'branding/ngb-icon.jpg').read_bytes()).digest()\n assert digest(nro,1)")
 sys.argv=['submit-bound-device.py','--wide','--pad','--movie','--save','--cg','--hold']
 exec(compile(s,'submit-bound-device.py','exec'),{'runpy':runpy,'p':p})
