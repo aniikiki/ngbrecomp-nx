@@ -6,6 +6,7 @@
 //
 // NGB_RENDERER=mirror: every call still goes to the recompiled Direct3D (xemu draws and shows the
 // game); this keeps a copy of the state and draws it with the renderer as well, for comparing.
+#include "gpu/sync_constants.h"
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -27,6 +28,9 @@ extern "C" uint32_t xbox_HeapAlloc(uint32_t size, uint32_t align);
 extern "C" int ngb_render_threaded;  // src/pc_menu.c reads it: the Multithreaded Renderer is drawing
 extern "C" { int ngb_render_threaded = 0; }
 
+#ifdef NGB_DIRECT3D
+#include "output.h"
+#endif
 using kernel::HostPtr;
 using kernel::R32;
 using kernel::W32;
@@ -50,10 +54,20 @@ constexpr uint32_t kVsConstants = 0x3D8678;      // the device's copy of c[0..19
 constexpr uint32_t kSimpleEncode = 0x3E9278;     // D3D__SimpleRenderStateEncode[92]: each simple state's method
 
 gpu::State g_state;
+#ifdef NGB_DIRECT3D
+// All guest fibers share one host thread. A nested draw can invalidate a
+// ticket; the interrupted call then emits its original packet in full.
+uint32_t captured_index_stack;
+uint64_t compact_draws, compact_indices;
+#endif
+// The Switch adapter runs every guest worker as a fiber on one host thread.
+#ifndef NGB_DIRECT3D
 std::recursive_mutex g_lock;
+#endif
 std::unique_ptr<gpu::Backend> g_backend;
 uint32_t g_vis_index;   // D3DDevice_EndVisibilityTest's index (in eax), for its report slot after the body ran
 bool g_mirror = true;
+uint32_t guest_header;
 
 std::unordered_map<uint32_t, std::shared_ptr<gpu::VertexShader>> g_vs;
 std::unordered_map<uint32_t, std::shared_ptr<gpu::PixelShader>> g_ps;
@@ -65,22 +79,65 @@ uint32_t g_new_decl, g_new_func, g_new_out;
 uint32_t g_program[136][4];
 std::shared_ptr<gpu::VertexShader> g_selected;   // SelectVertexShader's program and declaration
 
+void ViewportConstants(std::array<float, 4>& scale, std::array<float, 4>& offset) {
+    auto& v = g_state.viewport;
+    float hw = v.w * 0.5f, hh = v.h * 0.5f;
+    scale = {hw, -hh, (v.max_z - v.min_z) * g_state.zscale, 0};
+    offset = {v.x + g_state.ss_offset_x + hw, v.y + g_state.ss_offset_y + hh, v.min_z * g_state.zscale, 0};
+}
+
+#ifdef NGB_DIRECT3D
+// The title can write constants inline. Compare the live register file once
+// and carry the changed blocks through to the recorder. Registers 58 and 59
+// are produced by the viewport, even if guest memory contains other values.
+void SyncDrawConstants() {
+    constexpr unsigned block = gpu::State::constant_block_bytes;
+    constexpr unsigned n = sizeof(g_state.vsc) / block;
+    static_assert(block == 8 * sizeof(g_state.vsc[0]) && n < 32 && sizeof(g_state.vsc) % block == 0);
+    auto* dst = reinterpret_cast<uint8_t*>(g_state.vsc.data());
+    const auto* src = static_cast<const uint8_t*>(HostPtr(kVsConstants));
+    static_assert(n == 24);
+    // The viewport occupies two registers in block 7. Compare its effective
+    // values even when the underlying guest register bank has not changed.
+    std::array<std::array<float, 4>, 8> patched;
+    std::memcpy(patched.data(), src + 7 * block, block);
+    ViewportConstants(patched[58 % 8], patched[59 % 8]);
+    uint32_t changes = gpu::SyncConstantRange<0, 7, block>(dst, src);
+    if (std::memcmp(dst + 7 * block, patched.data(), block)) {
+        std::memcpy(dst + 7 * block, patched.data(), block);
+        changes |= 1u << 7;
+    }
+    changes |= gpu::SyncConstantRange<8, 8, block>(dst, src);
+    changes |= gpu::SyncConstantRange<16, 8, block>(dst, src);
+    g_state.changed_constant_blocks = changes;
+    ++g_state.constants_revision;
+}
+#endif
+
 void SyncDeferred() {
     // deferred states live in the title's memory, which the inline SetRenderState and
     // SetTextureStageState write; so do the vertex shader constants
     // deferred and complex alike: the XDK keeps every one in D3D__RenderState, and inlined code
     // writes there without any function of ours seeing it
-    for (uint32_t i = gpu::kRsDeferredFirst; i < gpu::kRsMax; i++) g_state.rs[i] = R32(kRenderState + i * 4);
+    std::memcpy(g_state.rs.data() + gpu::kRsDeferredFirst,
+                HostPtr(kRenderState + gpu::kRsDeferredFirst * 4),
+                (gpu::kRsMax - gpu::kRsDeferredFirst) * 4);
     // the simple states too, as SetRenderState keeps them (the device's defaults were set before
     // the hooks saw anything); not the pixel shader's, which SetPixelShader loads from its definition
+    const auto* methods = static_cast<const uint32_t*>(HostPtr(kSimpleEncode));
+    const auto* states = static_cast<const uint32_t*>(HostPtr(kRenderState));
     for (uint32_t i = 0; i < gpu::kRsDeferredFirst; i++) {
-        uint32_t method = R32(kSimpleEncode + i * 4) & 0x1FFC;
+        uint32_t method = methods[i] & 0x1FFC;
         if ((method >= 0x300 && method < 0x400) || method == 0x1D78)
-            g_state.simple[method >> 2] = R32(kRenderState + i * 4);
+            g_state.simple[method >> 2] = states[i];
     }
     for (int s = 0; s < 4; s++)
-        for (uint32_t i = 0; i < gpu::kTssBumpEnvMat00; i++) g_state.tss[s][i] = R32(kTextureState + (s * 32 + i) * 4);
+        std::memcpy(g_state.tss[s].data(), HostPtr(kTextureState + s * 32 * 4), gpu::kTssBumpEnvMat00 * 4);
+#ifdef NGB_DIRECT3D
+    SyncDrawConstants();
+#else
     std::memcpy(g_state.vsc.data(), HostPtr(kVsConstants), sizeof(g_state.vsc));
+#endif
     // fixed function: the transforms (view, projection, texture 0-3, world 0-3 at +0xC60) and the
     // material (+0xF00) are written into the device by inlined code
     uint32_t dev = R32(kDevicePtr);
@@ -91,13 +148,6 @@ void SyncDeferred() {
         }
         std::memcpy(g_state.material.data(), HostPtr(dev + 0xF00), 17 * 4);
     }
-}
-
-void UpdateViewportConstants() {
-    auto& v = g_state.viewport;
-    float hw = v.w * 0.5f, hh = v.h * 0.5f;
-    g_state.vsc[58] = {hw, -hh, (v.max_z - v.min_z) * g_state.zscale, 0};
-    g_state.vsc[59] = {v.x + g_state.ss_offset_x + hw, v.y + g_state.ss_offset_y + hh, v.min_z * g_state.zscale, 0};
 }
 
 gpu::Surface SurfaceOf(uint32_t header) {
@@ -134,6 +184,11 @@ std::shared_ptr<gpu::VertexShader> ReadVertexShader(uint32_t decl, uint32_t func
 }
 
 void Draw(uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) {
+#ifdef NGB_DIRECT3D
+    if (!g_backend) return;
+    bool measure = ngb_direct_detail_frame != 0;
+    uint64_t start_ns = measure ? ngb_elapsed_ns() : 0;
+#endif
     SyncDeferred();
     static bool nolight = std::getenv("NGB_D3D_NOLIGHT") != nullptr;   // debugging
     if (nolight) g_state.rs[gpu::kRsLighting] = 0;
@@ -153,8 +208,15 @@ void Draw(uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices)
                      g_state.rs[gpu::kRsFogTableMode], st, en, de, g_state.rs[gpu::kRsFogColor],
                      g_state.rs[gpu::kRsRangeFogEnable]);
     }
-    UpdateViewportConstants();
+#ifdef NGB_DIRECT3D
+    uint64_t record_start = measure ? ngb_elapsed_ns() : 0;
+#else
+    ViewportConstants(g_state.vsc[58], g_state.vsc[59]);
+#endif
     if (g_backend) g_backend->Draw(g_state, prim, start, count, indices);
+#ifdef NGB_DIRECT3D
+    if (measure) ngb_direct_draw_time(record_start - start_ns, ngb_elapsed_ns() - record_start);
+#endif
 }
 
 // A pushed index list (RunPushBuffer): BEGIN (0x17FC) with the primitive, then 16-bit index
@@ -176,10 +238,10 @@ void RunPushBuffer(uint32_t pb) {
                 prim = 0;
             }
         } else if (method == 0x1800) {
-            for (uint32_t i = 0; i < count; i++) {
-                idx.push_back(uint16_t(v[i]));
-                idx.push_back(uint16_t(v[i] >> 16));
-            }
+            // The Xbox and the supported hosts store both packed indices little-endian.
+            size_t first = idx.size();
+            idx.resize(first + size_t(count) * 2);
+            if (count) std::memcpy(idx.data() + first, v, size_t(count) * 4);
         } else if (method == 0x1808) {
             for (uint32_t i = 0; i < count; i++) idx.push_back(uint16_t(v[i]));
         } else {
@@ -205,16 +267,37 @@ std::atomic<bool> g_before_idle[D3DF_COUNT];
 // before the call: false to let the recompiled body run (always, mirroring)
 bool Before(int fn, Call c) {
     if (unsigned(fn) < D3DF_COUNT && g_before_idle[fn].load(std::memory_order_relaxed)) return false;
+#ifndef NGB_DIRECT3D
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+#endif
     // a draw's guest stack: the code addresses on it, innermost first, and the map piece object being drawn when
     // the render list walk (sub_00308D50, returning to 0x308D6F) called it (the vertex dump, the section pull)
-    if (fn == D3DF_D3DDevice_DrawIndexedVertices || fn == D3DF_D3DDevice_DrawVertices ||
-        fn == D3DF_D3DDevice_DrawVerticesUP) {
+    // Only the optional draw dumps, ID colours and traces consume the guest stack.
+#ifdef NGB_DIRECT3D
+    static const bool inspect_stack = std::getenv("NGB_D3D_DUMP") || std::getenv("NGB_D3D_IDVIEW") ||
+                                      std::getenv("NGB_TRACE_FILE") || std::getenv("NGB_D3D_STEP");
+#else
+    constexpr bool inspect_stack = true;
+#endif
+    if (inspect_stack && (fn == D3DF_D3DDevice_DrawIndexedVertices || fn == D3DF_D3DDevice_DrawVertices ||
+                          fn == D3DF_D3DDevice_DrawVerticesUP)) {
         int n = 0;
         gpu::g_draw_node = 0;
         for (uint32_t o = 0; o < 0x400; o += 4) {
+#ifdef NGB_DIRECT3D
+            // This optional stack walk finds the current map piece. A short
+            // committed stack can end before the desktop walk's 1 KiB limit.
+            const void* word = DirectPage(c.r[ESP] + o, 4);
+            if (!word) break;
+            uint32_t v;
+            std::memcpy(&v, word, 4);
+            if (v == 0x00308D6Fu && !gpu::g_draw_node)
+                if (const void* node = DirectPage(c.r[ESP] + o + 4, 4))
+                    std::memcpy(&gpu::g_draw_node, node, 4);
+#else
             uint32_t v = R32(c.r[ESP] + o);
             if (v == 0x00308D6Fu && !gpu::g_draw_node) gpu::g_draw_node = R32(c.r[ESP] + o + 4);
+#endif
             if (v >= 0x11000 && v < 0x37A480 && n < 8) gpu::g_draw_stack[n++] = v;
             if (gpu::g_draw_node && n >= 8) break;
         }
@@ -287,7 +370,15 @@ bool Before(int fn, Call c) {
         break;
     }
     case D3DF_D3DDevice_SetLight:
-        if (c.a(0) < 8 && c.a(1)) std::memcpy(g_state.lights[c.a(0)].data(), HostPtr(c.a(1)), 26 * 4);
+        if (c.a(0) < 8 && c.a(1)) {
+            auto& light = g_state.lights[c.a(0)];
+            const void* value = HostPtr(c.a(1));
+#ifdef NGB_DIRECT3D
+            if (!std::memcmp(light.data(), value, sizeof(light))) break;
+            ++g_state.lights_revision;
+#endif
+            std::memcpy(light.data(), value, sizeof(light));
+        }
         break;
     case D3DF_D3DDevice_LightEnable:
         if (c.r[EAX] < 8)
@@ -467,7 +558,6 @@ bool Before(int fn, Call c) {
         // stream 0 points at the vertices through a vertex buffer header of ours, its data
         // address a virtual one (Common bit 31, mem::ResourceData)
         auto saved = g_state.streams[0];
-        static uint32_t guest_header;
         if (!guest_header) guest_header = xbox_HeapAlloc(20, 16);
         W32(guest_header, 0x80000001u);
         W32(guest_header + 4, data);
@@ -478,6 +568,10 @@ bool Before(int fn, Call c) {
     }
     case D3DF_D3DDevice_DrawIndexedVertices:
         if (c.a(2)) Draw(c.a(0), 0, c.a(1), static_cast<const uint8_t*>(HostPtr(c.a(2))));
+#ifdef NGB_DIRECT3D
+        captured_index_stack = g_backend && !g_mirror && ngb_scene_active && c.a(2) && c.a(0) == 6 &&
+                               R32(c.r[ESP]) == 0x0030C0B2 ? c.r[ESP] : 0;
+#endif
         break;
     case D3DF_D3DDevice_DrawVertices:
         Draw(c.a(0), c.r[ECX], c.r[EAX], nullptr);
@@ -534,7 +628,9 @@ void After(int fn, Call c) {
     default:
         return;
     }
+#ifndef NGB_DIRECT3D
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+#endif
     switch (fn) {
     case D3DF_D3DDevice_CreateVertexShader: {
         uint32_t h = g_new_out ? R32(g_new_out) : 0;
@@ -584,7 +680,15 @@ void Start() {
     g_started = true;
     const char* e = std::getenv("NGB_RENDERER");
     g_mirror = !e || std::strcmp(e, "d3d") != 0;
+#ifndef NGB_DIRECT3D
     g_state = gpu::State{};
+#endif
+#ifdef NGB_DIRECT3D
+    // Preserve the title's startup and movie presenter. Hooks still collect
+    // the surfaces, shader handles and state needed for the first 3D draw.
+    g_mirror = false;
+    if (!ngb_scene_active) return;
+#endif
     g_backend = gpu::CreateBackend();
     if (g_backend && !g_backend->Init(640, 480)) {
         g_backend.reset();
@@ -646,13 +750,33 @@ void TakeInit() {
 
 }  // namespace
 
+#ifdef NGB_DIRECT3D
+extern "C" int ngb_direct_index_capture_ready(uint32_t stack) {
+    return stack && captured_index_stack == stack && g_take[D3DF_CDevice_SetStateVB];
+}
+extern "C" int ngb_direct_compact_indices(uint32_t stack, uint32_t count) {
+    if (!captured_index_stack || captured_index_stack != stack) return 0;
+    captured_index_stack = 0;
+    ++compact_draws;
+    compact_indices += count;
+    return 1;
+}
+extern "C" void ngb_direct_index_stats(uint64_t* draws, uint64_t* indices) {
+    *draws = compact_draws;
+    *indices = compact_indices;
+}
+#endif
+
 extern "C" int d3d_hle_call(int fn, uint32_t regs[8]) {
     if (!g_started) {
         Start();
         if (g_started) TakeInit();
     }
+#ifdef NGB_DIRECT3D
+    if (ngb_scene_active && !g_backend) Start();
+#endif
     bool took = Before(fn, Call{regs});
-    if (!took && unsigned(fn) < D3DF_COUNT && g_take[fn]) {
+    if (!took && g_backend && unsigned(fn) < D3DF_COUNT && g_take[fn]) {
         regs[EAX] = 0;
         regs[ESP] += 4 + g_take_ret[fn];   // its ret n
         took = true;
@@ -669,7 +793,9 @@ extern "C" void d3d_hle_frame_wait(void) {
 // D3DDevice_BeginVisibilityTest, inlined into the title (src/d3d/d3d_hooks.c)
 extern "C" void d3d_visibility_begin(void) {
     if (!g_started) Start();
+#ifndef NGB_DIRECT3D
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+#endif
     if (g_backend && !g_mirror) g_backend->VisibilityBegin();
 }
 
@@ -677,3 +803,21 @@ extern "C" void d3d_hle_after(int fn, const uint32_t regs[8]) {
     if (!g_started) Start();
     After(fn, Call{const_cast<uint32_t*>(regs)});
 }
+
+#ifdef NGB_DIRECT3D
+extern "C" void ngb_direct_close(void)
+{
+    captured_index_stack = 0;
+    compact_indices = compact_draws = 0;
+    ngb_direct_index_close();
+    g_backend.reset();
+    ngb_render_threaded = 0;
+    g_state = gpu::State{};
+    g_vs.clear();
+    g_ps.clear();
+    g_selected.reset();
+    std::memset(g_program, 0, sizeof(g_program));
+    guest_header = 0;
+    g_started = false;
+}
+#endif

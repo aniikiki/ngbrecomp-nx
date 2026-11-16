@@ -58,8 +58,45 @@ static uint32_t get_color_key_mask_for_texture(PGRAPHState *pg, int i)
     return get_colorkey_mask(color_format);
 }
 
+#ifdef NGB_SWITCH_PGRAPH
+/* The GL scissor and the window rectangles use the same AA and surface
+ * scaling. Any inclusive rectangle containing the scissor accepts every
+ * rasterized sample, so the fragment shader can omit the eight-way test. */
+bool pgraph_scissor_inside_window(PGRAPHState *pg)
+{
+    if (pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER) & NV_PGRAPH_SETUPRASTER_WINDOWCLIPTYPE)
+        return false;
+    uint32_t left = pg->surface_shape.clip_x, top = pg->surface_shape.clip_y;
+    uint32_t right = left + pg->surface_shape.clip_width, bottom = top + pg->surface_shape.clip_height;
+    for (unsigned i = 0; i < 8; ++i) {
+        uint32_t x = pgraph_reg_r(pg, NV_PGRAPH_WINDOWCLIPX0 + 4*i);
+        uint32_t y = pgraph_reg_r(pg, NV_PGRAPH_WINDOWCLIPY0 + 4*i);
+        if (GET_MASK(x, NV_PGRAPH_WINDOWCLIPX0_XMIN) <= left &&
+            GET_MASK(y, NV_PGRAPH_WINDOWCLIPY0_YMIN) <= top &&
+            GET_MASK(x, NV_PGRAPH_WINDOWCLIPX0_XMAX) + 1 >= right &&
+            GET_MASK(y, NV_PGRAPH_WINDOWCLIPY0_YMAX) + 1 >= bottom)
+            return true;
+    }
+    return false;
+}
+#endif
+
 void pgraph_glsl_set_psh_state(PGRAPHState *pg, PshState *state)
 {
+#ifdef NGB_SWITCH_PGRAPH
+    state->scissor_inside_window = pgraph_scissor_inside_window(pg);
+    uint32_t ctrl = pgraph_reg_r(pg, NV_PGRAPH_CONTROL_0);
+    uint32_t raster = pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER);
+    bool polygon_bias = raster & (NV_PGRAPH_SETUPRASTER_POFFSETFILLENABLE |
+                                  NV_PGRAPH_SETUPRASTER_POFFSETLINEENABLE |
+                                  NV_PGRAPH_SETUPRASTER_POFFSETPOINTENABLE);
+    bool layer_bias = (pgraph_reg_r(pg, NV_PGRAPH_BLEND) & NV_PGRAPH_BLEND_EN) &&
+                      (ctrl & NV_PGRAPH_CONTROL_0_ZENABLE) &&
+                      !(ctrl & NV_PGRAPH_CONTROL_0_Z_PERSPECTIVE_ENABLE) &&
+                      GET_MASK(ctrl, NV_PGRAPH_CONTROL_0_ZFUNC) == NV_PGRAPH_CONTROL_0_ZFUNC_LEQUAL;
+    state->unmodified_depth = pg->primitive_mode < PRIM_TYPE_TRIANGLES || !(polygon_bias || layer_bias);
+    state->no_depth_test = !(ctrl & NV_PGRAPH_CONTROL_0_ZENABLE);
+#endif
     state->window_clip_exclusive = pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER) &
                                    NV_PGRAPH_SETUPRASTER_WINDOWCLIPTYPE;
     state->combiner_control = pgraph_reg_r(pg, NV_PGRAPH_COMBINECTL);
@@ -867,12 +904,41 @@ static void define_colorkey_comparator(MString *preflight)
     // clang-format on
 }
 
+static void append_window_clip(MString *clip, const PshState *state)
+{
+    mstring_append_fmt(clip, "/*  Window-clip (%slusive) */\n",
+                       state->window_clip_exclusive ? "Exc" : "Inc");
+    if (!state->window_clip_exclusive) {
+        mstring_append(clip, "bool clipContained = false;\n");
+    }
+    mstring_append(clip, "vec2 coord = gl_FragCoord.xy - 0.5;\n"
+                         "for (int i = 0; i < 8; i++) {\n"
+                         "  bool outside = any(bvec4(\n"
+                         "      lessThan(coord, vec2(clipRegion[i].xy)),\n"
+                         "      greaterThanEqual(coord, vec2(clipRegion[i].zw))));\n"
+                         "  if (!outside) {\n");
+    if (state->window_clip_exclusive) {
+        mstring_append(clip, "    discard;\n");
+    } else {
+        mstring_append(clip, "    clipContained = true;\n"
+                             "    break;\n");
+    }
+    mstring_append(clip, "  }\n"
+                         "}\n");
+    if (!state->window_clip_exclusive) {
+        mstring_append(clip, "if (!clipContained) {\n"
+                             "  discard;\n"
+                             "}\n");
+    }
+}
+
 static MString* psh_convert(struct PixelShader *ps)
 {
     MString *preflight = mstring_new();
     pgraph_glsl_get_vtx_header(preflight, ps->opts.vulkan,
                              ps->state->smooth_shading, true, false, false);
 
+    if (ps->opts.interpolate_z) mstring_append(preflight, "noperspective in float guestWindowZ;\n");
     if (ps->opts.vulkan) {
         mstring_append_fmt(
             preflight,
@@ -1035,32 +1101,27 @@ static MString* psh_convert(struct PixelShader *ps)
         );
 
     MString *clip = mstring_new();
-    mstring_append_fmt(clip, "/*  Window-clip (%slusive) */\n",
-                       ps->state->window_clip_exclusive ? "Exc" : "Inc");
-    if (!ps->state->window_clip_exclusive) {
-        mstring_append(clip, "bool clipContained = false;\n");
+    if (ps->opts.interpolate_z) {
+        /* Derivatives must be evaluated before any window/discard branch.
+         * Convert slope per raster sample to slope per guest pixel. */
+#ifdef NGB_SWITCH_PGRAPH
+        if (ps->state->unmodified_depth)
+            mstring_append(clip, "precise float zvalue = guestWindowZ;\n");
+        else
+#endif
+        mstring_append(clip,
+            "vec2 dz = abs(vec2(dFdx(guestWindowZ), dFdy(guestWindowZ))) * vec2(surfaceScale);\n"
+            "float triSlope = max(dz.x, dz.y);\n"
+            "if (isnan(triSlope) || isinf(triSlope)) triSlope = 0.0;\n"
+            "precise float zvalue = guestWindowZ + depthOffset;\n"
+            "zvalue += depthFactor * triSlope;\n");
     }
-    mstring_append(clip, "vec2 coord = gl_FragCoord.xy - 0.5;\n"
-                         "for (int i = 0; i < 8; i++) {\n"
-                         "  bool outside = any(bvec4(\n"
-                         "      lessThan(coord, vec2(clipRegion[i].xy)),\n"
-                         "      greaterThanEqual(coord, vec2(clipRegion[i].zw))));\n"
-                         "  if (!outside) {\n");
-    if (ps->state->window_clip_exclusive) {
-        mstring_append(clip, "    discard;\n");
-    } else {
-        mstring_append(clip, "    clipContained = true;\n"
-                             "    break;\n");
-    }
-    mstring_append(clip, "  }\n"
-                         "}\n");
-    if (!ps->state->window_clip_exclusive) {
-        mstring_append(clip, "if (!clipContained) {\n"
-                             "  discard;\n"
-                             "}\n");
-    }
+#ifdef NGB_SWITCH_PGRAPH
+    if (!ps->state->scissor_inside_window)
+#endif
+        append_window_clip(clip, ps->state);
 
-    if (ps->state->z_perspective) {
+    if (!ps->opts.interpolate_z && ps->state->z_perspective) {
         mstring_append(
             clip,
             "vec2 unscaled_xy = gl_FragCoord.xy / surfaceScale;\n"
@@ -1094,7 +1155,7 @@ static MString* psh_convert(struct PixelShader *ps)
             "if (isnan(zvalue)) {\n"
             "  zvalue = uintBitsToFloat(0x7F7FFFFFu);\n"
             "}\n");
-    } else {
+    } else if (!ps->opts.interpolate_z) {
         mstring_append(
             clip,
             "vec2 unscaled_xy = gl_FragCoord.xy / surfaceScale;\n"
@@ -1557,6 +1618,11 @@ static MString* psh_convert(struct PixelShader *ps)
      * due to rounding.)
      */
 
+#ifdef NGB_SWITCH_PGRAPH
+    /* The raster state disables both comparison and depth writes. Guest
+     * depth clipping above still discards fragments when requested. */
+    if (!ps->state->no_depth_test)
+#endif
     switch (ps->state->depth_format) {
     case DEPTH_FORMAT_D16:
         // 16-bit unsigned int

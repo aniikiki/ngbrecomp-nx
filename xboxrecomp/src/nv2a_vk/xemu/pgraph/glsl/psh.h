@@ -65,6 +65,10 @@ typedef struct PshState {
     enum PshAlphaFunc alpha_func;
 
     bool window_clip_exclusive;
+#ifdef NGB_SWITCH_PGRAPH
+    bool scissor_inside_window;
+    bool unmodified_depth, no_depth_test;
+#endif
 
     bool smooth_shading;
     bool depth_clipping;
@@ -74,6 +78,9 @@ typedef struct PshState {
     enum PshDepthFormat depth_format;
 } PshState;
 
+#ifdef NGB_SWITCH_PGRAPH
+bool pgraph_scissor_inside_window(PGRAPHState *pg);
+#endif
 void pgraph_glsl_set_psh_state(PGRAPHState *pg, PshState *state);
 
 #define PSH_UNIFORM_DECL_X(S, DECL) \
@@ -96,6 +103,7 @@ DECL_UNIFORM_TYPES(PshUniform, PSH_UNIFORM_DECL_X)
 
 typedef struct GenPshGlslOptions {
     bool vulkan;
+    bool interpolate_z;
     int ubo_binding;
     int tex_binding;
 } GenPshGlslOptions;

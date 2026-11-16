@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <cstring>
+#if defined(NGB_DIRECT3D) && defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 #include <dxgiformat.h>
 
@@ -208,11 +211,6 @@ struct Inputs {
     int nregs;
 };
 
-struct IndexBounds {
-    uint32_t first = 0;
-    uint32_t last = 0;
-};
-
 // the declaration's register layout, or the one an FVF handle stands for, built into fvf_layout
 const VertexShader* PickLayout(const State& s, VertexShader& fvf_layout) {
     if (!(s.vs_handle & 1)) {
@@ -225,18 +223,6 @@ const VertexShader* PickLayout(const State& s, VertexShader& fvf_layout) {
 // D3DFVF: an FVF handle with position XYZRHW
 bool Pretransformed(const State& s) {
     return !(s.vs_handle & 1) && (s.vs_handle & 0xE) == 0x4;
-}
-
-IndexBounds IndexRange(const uint8_t* ip, uint32_t count) {
-    uint16_t lo16 = 0xFFFF;
-    uint16_t hi16 = 0;
-    for (uint32_t i = 0; i < count; i++) {
-        uint16_t v;
-        std::memcpy(&v, ip + i * 2, 2);
-        lo16 = std::min(lo16, v);
-        hi16 = std::max(hi16, v);
-    }
-    return {lo16, hi16};
 }
 
 // logical vertex numbers in draw order
@@ -440,7 +426,34 @@ void FvfInputs(uint32_t fvf, VertexShader& vs) {
     vs.stream_stride[0] = off;
 }
 
-bool Assemble(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* ip, Assembled& out) {
+IndexBounds IndexRange(const uint8_t* ip, uint32_t count) {
+    uint16_t lo16 = 0xFFFF;
+    uint16_t hi16 = 0;
+    uint32_t i = 0;
+#if defined(NGB_DIRECT3D) && defined(__aarch64__)
+    if (count >= 8) {
+        uint16x8_t low = vdupq_n_u16(UINT16_MAX), high = vdupq_n_u16(0);
+        do {
+            uint16x8_t v = vreinterpretq_u16_u8(vld1q_u8(ip + size_t(i) * 2));
+            low = vminq_u16(low, v);
+            high = vmaxq_u16(high, v);
+            i += 8;
+        } while (count - i >= 8);
+        lo16 = vminvq_u16(low);
+        hi16 = vmaxvq_u16(high);
+    }
+#endif
+    for (; i < count; i++) {
+        uint16_t v;
+        std::memcpy(&v, ip + size_t(i) * 2, 2);
+        lo16 = std::min(lo16, v);
+        hi16 = std::max(hi16, v);
+    }
+    return {lo16, hi16};
+}
+
+bool Assemble(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* ip, Assembled& out,
+              const IndexBounds* known_bounds) {
     ResetAssembled(out);
     if (!count || prim < 1 || prim > 10) return false;
 
@@ -451,7 +464,7 @@ bool Assemble(const State& s, uint32_t prim, uint32_t start, uint32_t count, con
 
     // the vertex range the draw reads
     IndexBounds bounds = {0, count - 1};
-    if (ip) bounds = IndexRange(ip, count);
+    if (ip) bounds = known_bounds ? *known_bounds : IndexRange(ip, count);
     DrawRange d;
     d.prim = prim;
     d.start = start;

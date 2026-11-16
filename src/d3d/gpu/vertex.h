@@ -7,6 +7,9 @@
 
 namespace gpu {
 
+struct IndexBounds { uint32_t first, last; };
+IndexBounds IndexRange(const uint8_t* indices, uint32_t count);
+
 enum class Topology : uint8_t { Points, Lines, Triangles };
 
 // how the vertex shader finishes an element the input assembler reads raw, 4 bits per register in Assembled::decode
@@ -57,6 +60,7 @@ void FvfInputs(uint32_t fvf, VertexShader& out);
 
 // false when there is nothing to draw
 // indices: the title's 16 bit indices, null for an unindexed draw
-bool Assemble(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices, Assembled& out);
+bool Assemble(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices, Assembled& out,
+              const IndexBounds* known_bounds = nullptr);
 
 }  // namespace gpu

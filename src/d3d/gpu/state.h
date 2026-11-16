@@ -185,6 +185,12 @@ struct State {
     std::array<std::array<uint32_t, 26>, 8> lights{};  // D3DLIGHT8
     uint32_t light_enable = 0;                         // bit per light
     float ss_offset_x = 0, ss_offset_y = 0;
+#ifdef NGB_DIRECT3D
+    static constexpr unsigned constant_block_bytes = 128;
+    uint32_t changed_constant_blocks = 0;
+    uint64_t constants_revision = 0;
+    uint64_t lights_revision = 0;  // zero until the HLE light setter starts tracking writes
+#endif
     float zscale = 16777215.0f;  // depth buffer units per 1.0
 };
 

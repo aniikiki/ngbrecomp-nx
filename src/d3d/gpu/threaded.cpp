@@ -10,8 +10,12 @@
 // NGB_D3D_THREAD=1: drawn on a thread of its own, the title recording one frame while the one before it draws.
 // NGB_D3D_THREAD=capture: each call drawn from its recording at once, on the title's thread (a test of the recording).
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
+#include <type_traits>
+#include <utility>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -20,12 +24,20 @@
 #include <mutex>
 #include <thread>
 
+#ifdef NGB_DIRECT3D
+#include "output.h"
+#ifdef __SWITCH__
+#include <pthread.h>
+#endif
+#else
 #include "platform/vcpu.h"   // the title's wait for a frame gives the virtual CPU away meanwhile
+#endif
 #include <unordered_map>
 #include <vector>
 
 #include "gpu/backend.h"
 #include "gpu/headers.h"
+#include "gpu/vertex.h"
 #include "kernel/kernel.h"
 
 extern "C" {
@@ -41,6 +53,9 @@ static void Gate(int on, uint32_t put) {
 }
 
 namespace gpu {
+#ifdef NGB_TEXTURE_PRELOAD
+extern "C" void ngb_texture_load_idle(Backend*);
+#endif
 
 namespace {
 
@@ -88,7 +103,22 @@ struct HeaderSend {
     int32_t data = -1;
 };
 
+#ifdef NGB_DIRECT3D
+struct IndexSnapshot {
+    std::vector<uint8_t> bytes;
+    IndexBounds bounds{};
+};
+struct IndexSlot {
+    const uint8_t* source = nullptr;
+    unsigned count = 0;
+    std::shared_ptr<const IndexSnapshot> snapshot;
+};
+#endif
+
 struct Batch {
+#ifdef NGB_DIRECT3D
+    std::vector<std::shared_ptr<const IndexSnapshot>> index_snapshots;
+#endif
     uint64_t id = 0;
     uint64_t handed_us = 0;   // (NV2A_PACE_LOG)
     uint32_t put = 0;   // the title's DMA_PUT as it was handed over: the push buffer may be read this far once drawn
@@ -109,27 +139,39 @@ struct Range {
 size_t At(const State& s, const void* p) {
     return size_t(static_cast<const uint8_t*>(p) - reinterpret_cast<const uint8_t*>(&s));
 }
-std::vector<Range> StateRanges() {
-    static const State s;
-    auto simple = [&](uint32_t first, uint32_t last) {   // methods first to last
-        return Range{At(s, &s.simple[first >> 2]), size_t(last - first) + 4};
+constexpr auto StateRanges() {
+    static_assert(std::is_standard_layout_v<State>);
+    auto simple = [](uint32_t first, uint32_t last) {   // methods first to last
+        return Range{offsetof(State, simple) + first, size_t(last - first) + 4};
     };
-    return {
+    return std::array{
         simple(kMPsAlphaInputs, kMPsFinalEfgh),
         simple(kMAlphaTestEnable, kMDepthOffset),
         simple(kMPsConstant0, kMPsRgbInputs + 0x1C),
         simple(kMPsCompareMode, kMPsCompareMode),
         simple(kMDepthClipControl, kMDepthClipControl),
         simple(kMPsFinalConstant0, kMPsInputTexture),
-        {At(s, &s.rs), At(s, &s.index_buffer) - At(s, &s.rs)},          // render states, textures, the streams
-        {At(s, &s.index_buffer), At(s, &s.vs) - At(s, &s.index_buffer)},
-        {At(s, &s.vsc), At(s, &s.transforms) - At(s, &s.vsc)},            // constants, viewport, surfaces, scissors
-        {At(s, &s.transforms[2]), 2 * sizeof(s.transforms[0])},
-        {At(s, &s.transforms[16]), 4 * sizeof(s.transforms[0])},
-        {At(s, &s.transforms[256]), 4 * sizeof(s.transforms[0])},
-        {At(s, &s.material), sizeof(State) - At(s, &s.material)},
+        Range{offsetof(State, rs), offsetof(State, index_buffer) - offsetof(State, rs)},          // render states, textures, the streams
+        Range{offsetof(State, index_buffer), offsetof(State, vs) - offsetof(State, index_buffer)},
+#ifdef NGB_DIRECT3D
+        Range{offsetof(State, psc), offsetof(State, transforms) - offsetof(State, psc)},
+#else
+        Range{offsetof(State, vsc), offsetof(State, transforms) - offsetof(State, vsc)},
+#endif            // constants, viewport, surfaces, scissors
+        Range{offsetof(State, transforms) + 2 * sizeof(State::transforms[0]), 2 * sizeof(State::transforms[0])},
+        Range{offsetof(State, transforms) + 16 * sizeof(State::transforms[0]), 4 * sizeof(State::transforms[0])},
+        Range{offsetof(State, transforms) + 256 * sizeof(State::transforms[0]), 4 * sizeof(State::transforms[0])},
+#ifdef NGB_DIRECT3D
+        Range{offsetof(State, material), sizeof(State::material)},
+        Range{offsetof(State, light_enable), offsetof(State, changed_constant_blocks) - offsetof(State, light_enable)},
+        Range{offsetof(State, zscale), sizeof(State::zscale)},
+#else
+        Range{offsetof(State, material), sizeof(State) - offsetof(State, material)},
+#endif
     };
 }
+
+constexpr auto kStateRanges = StateRanges();
 
 constexpr size_t kPiece = 64;
 
@@ -149,7 +191,7 @@ constexpr int kStallLogSeconds = 10;
 
 class Recorded final : public Backend {
 public:
-    Recorded(std::unique_ptr<Backend> inner, bool thread) : inner_(std::move(inner)), ranges_(StateRanges()), thread_(thread) {
+    Recorded(std::unique_ptr<Backend> inner, bool thread) : inner_(std::move(inner)), thread_(thread) {
         cur_ = NewBatch();
         if (thread_) {
             g_recorded.store(this);
@@ -163,15 +205,37 @@ public:
                 compat_host_leave();
                 g_hook_busy.fetch_sub(1);
             };
+#if defined(NGB_DIRECT3D) && defined(__SWITCH__)
+            // libnx normally gives a pthread 128 KiB. This worker now owns
+            // Vulkan pipeline creation, formerly on the guest's 2 MiB stack.
+            pthread_attr_t attrs;
+            int rc = pthread_attr_init(&attrs);
+            if (!rc) {
+                rc = pthread_attr_setstacksize(&attrs, 2 * 1024 * 1024);
+                if (!rc) rc = pthread_create(&native_thread_, &attrs, [](void* self) -> void* {
+                    static_cast<Recorded*>(self)->Run();
+                    return nullptr;
+                }, this);
+                pthread_attr_destroy(&attrs);
+            }
+            if (rc) {
+                nv2a_user_read_hook = nullptr;
+                g_recorded.store(nullptr);
+                nv2a_pfifo_gate(0, 0);
+                thread_ = false;
+                ngb_kernel_log("3D scene render thread unavailable, drawing synchronously");
+            }
+#else
             std::thread t([this] { Run(); });
             render_ = t.get_id();
             t.detach();
+#endif
         }
     }
     // Only exit() comes here (the game leaves by _exit): the thread is stopped and waited for, so nothing of this is
     // freed under it. A guest thread in the hook is let out first.
     ~Recorded() override {
-        if (!thread_) return;
+        if (!thread_) { FreeBatches(); return; }
         nv2a_user_read_hook = nullptr;
         g_recorded.store(nullptr);
         for (int i = 0; g_hook_busy.load(); i++) {   // (a thread held in the hook past 5 s: leaving, not freeing)
@@ -188,7 +252,11 @@ public:
         }
         cv_.notify_all();
         nv2a_pfifo_gate(0, 0);
+#if defined(NGB_DIRECT3D) && defined(__SWITCH__)
+        if (pthread_equal(pthread_self(), native_thread_)) {
+#else
         if (std::this_thread::get_id() == render_) {
+#endif
             // exit() on the render thread itself (a fatal renderer error, its message already shown): Run never
             // resumes, and the title's thread may be waiting on what this would free -- leaving now
             std::fflush(nullptr);
@@ -202,20 +270,53 @@ public:
             std::fflush(nullptr);
             std::_Exit(1);
         }
+        lock.unlock();
+#if defined(NGB_DIRECT3D) && defined(__SWITCH__)
+        pthread_join(native_thread_, nullptr);
+#endif
+        FreeBatches();
     }
 
     bool Init(uint32_t width, uint32_t height) override { return inner_->Init(width, height); }
 
-    void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) override {
+    void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices, const IndexBounds*) override {
         std::lock_guard lock(cap_);
+#ifdef NGB_DIRECT3D
+        const size_t before = cur_->cmds.size();
+#endif
         SendState(s, start + count);
+#ifdef NGB_DIRECT3D
+        if (before == cur_->cmds.size() && before && cur_->cmds.back().op == Op::Draw) {
+            ++same_state_pairs_;
+            Cmd& prev = cur_->cmds.back();
+            if (prim == 6 && prev.a == prim && indices && prev.d == 1 && prev.b == start &&
+                TryJoinStrips(s, prev, indices, count)) {
+                ++merged_strips_;
+                return;
+            }
+            unsigned width = prim == 5 ? 3 : prim == 2 ? 2 : prim == 1 ? 1 : 0;
+            if (width && prev.a == prim && prev.c && count && !(prev.c % width) && !(count % width) &&
+                (indices ? prev.d && start == prev.b : !prev.d && uint64_t(prev.b) + prev.c == start))
+                ++list_pairs_;
+        }
+#endif
         Cmd c{Op::Draw};
         c.a = prim;
         c.b = start;
         c.c = count;
         if (indices) {
-            c.d = 1;
-            c.data = Put(indices, size_t(count) * 2);
+#ifdef NGB_DIRECT3D
+            auto snapshot = CaptureIndices(indices, count);
+            if (snapshot) {
+                c.d = 2;
+                c.size = uint32_t(cur_->index_snapshots.size());
+                cur_->index_snapshots.push_back(std::move(snapshot));
+            } else
+#endif
+            {
+                c.d = 1;
+                c.data = Put(indices, size_t(count) * 2);
+            }
         }
         cur_->cmds.push_back(c);
         if (!thread_ || cur_->cmds.size() >= kBatchCommands) Submit();
@@ -260,6 +361,10 @@ public:
         uint64_t id;
         {
             std::lock_guard lock(cap_);
+#ifdef NGB_DIRECT3D
+            ngb_direct_draw_pairs(same_state_pairs_, list_pairs_, merged_strips_, index_hits_);
+            same_state_pairs_ = list_pairs_ = merged_strips_ = index_hits_ = 0;
+#endif
             SendHeader(front.header);
             FlushHeaders();
             SendPeek(sent_);
@@ -305,16 +410,36 @@ public:
     }
     void VisibilityBegin() override {
         std::lock_guard lock(cap_);
+#ifdef NGB_DIRECT3D
+        recording_visibility_ = true;
+#endif
         cur_->cmds.push_back(Cmd{Op::VisBegin});
         if (!thread_) Submit();
     }
     void VisibilityEnd(uint32_t report) override {
         std::lock_guard lock(cap_);
+#ifdef NGB_DIRECT3D
+        recording_visibility_ = false;
+#endif
         Cmd c{Op::VisEnd};
         c.a = report;
         cur_->cmds.push_back(c);
         if (!thread_) Submit();
     }
+
+#ifdef NGB_DIRECT3D
+    void CheckError() const {
+        if (failed_.load(std::memory_order_acquire)) ngb_stop(failure_.reason, failure_.detail);
+    }
+    void Drain() {
+        uint64_t id;
+        {
+            std::lock_guard lock(cap_);
+            id = Submit();
+        }
+        Wait(id, false);
+    }
+#endif
 
     // The title reads the push buffer's progress (it may be waiting on it): what it has recorded since the last
     // batch goes now (Release). Skipped while a call is being recorded.
@@ -330,6 +455,12 @@ public:
     }
 
 private:
+    void FreeBatches() {
+        delete cur_;
+        for (Batch* b : free_) delete b;
+        for (Batch* b : queue_) delete b;
+    }
+
     Batch* NewBatch() {
         Batch* b;
         {
@@ -344,6 +475,71 @@ private:
         b->id = ++next_id_;
         return b;
     }
+
+#ifdef NGB_DIRECT3D
+    // Promote a recurring source only on its second use. Pending batches own
+    // immutable snapshots; a guest overwrite or a cache collision can't change them.
+    std::shared_ptr<const IndexSnapshot> CaptureIndices(const uint8_t* src, unsigned count) {
+        if (count < 64 || count > 4096) return {};
+        uintptr_t key = reinterpret_cast<uintptr_t>(src);
+        auto& slot = index_slots_[((key >> 2) ^ (key >> 13) ^ count) & 2047];
+        if (slot.source != src || slot.count != count) {
+            slot = {src, count, {}};
+            return {};
+        }
+        size_t bytes = size_t(count)*2;
+        if (slot.snapshot && !std::memcmp(slot.snapshot->bytes.data(), src, bytes)) {
+            ++index_hits_;
+            return slot.snapshot;
+        }
+        auto copy = std::make_shared<IndexSnapshot>();
+        copy->bytes.assign(src, src + bytes);
+        copy->bounds = IndexRange(copy->bytes.data(), count);
+        slot.snapshot = copy;
+        return copy;
+    }
+
+    // A repeated last and first index separate the strips. The second strip
+    // starts at an even index so face culling sees its original winding.
+    bool TryJoinStrips(const State& s, Cmd& prev, const uint8_t* indices, uint32_t count) {
+        if (count < 3 || count > 32 || prev.c < 3 || prev.c > 64 || recording_visibility_ ||
+            !s.rs[kRsZEnable] || (s.vs_handle & 0xf) == 4 ||
+            s.rs[kRsFillMode] == 0x1B00 || s.rs[kRsFillMode] == 0x1B01) return false;
+        // Some game passes sample a render target. Keep their per-draw resolves.
+        for (uint32_t texture : s.textures) {
+            if (!texture) continue;
+            const uint32_t data = kernel::R32(texture + 4) & 0x7fffffff;
+            if (data == (s.rt.data & 0x7fffffff) || data == (s.zs.data & 0x7fffffff)) return false;
+        }
+        const size_t end = size_t(prev.data) + prev.c * sizeof(uint16_t);
+        if (end != cur_->bytes.size()) return false;
+        // Keep the same vertex fetch footprint: joining two sparse strips must
+        // not turn them into a dense upload spanning unrelated guest memory.
+        auto bounds = [](const uint8_t* src, uint32_t n) {
+            std::pair<unsigned, unsigned> range{UINT16_MAX, 0};
+            for (uint32_t i = 0; i < n; ++i) {
+                uint16_t v;
+                std::memcpy(&v, src + 2*i, 2);
+                range.first = std::min(range.first, unsigned(v));
+                range.second = std::max(range.second, unsigned(v));
+            }
+            return range;
+        };
+        auto a = bounds(cur_->bytes.data() + prev.data, prev.c);
+        auto b = bounds(indices, count);
+        if (a.first > b.second + 1 || b.first > a.second + 1 ||
+            a.second - a.first + 1 > 2*prev.c + 64 || b.second - b.first + 1 > 2*count + 64) return false;
+
+        unsigned padding = 2 + (prev.c & 1);
+        cur_->bytes.resize(end + 2*(padding + count));
+        auto* dest = cur_->bytes.data() + end;
+        std::memcpy(dest, dest - 2, 2);
+        for (unsigned i = 1; i < padding; ++i) std::memcpy(dest + 2*i, indices, 2);
+        std::memcpy(dest + 2*padding, indices, count * 2);
+        prev.c += padding + count;
+        return true;
+    }
+#endif
 
     uint32_t Put(const void* p, size_t n) {
         size_t at = (cur_->bytes.size() + 3) & ~size_t(3);
@@ -405,16 +601,53 @@ private:
     }
 
     // a field of the state as the renderer has it, when it differs from what was sent
-    void Delta(const void* field, const void* value, size_t n) {
-        uint8_t* sent = reinterpret_cast<uint8_t*>(&sent_) + At(sent_, field);
-        if (!std::memcmp(sent, value, n)) return;
-        std::memcpy(sent, value, n);
-        uint32_t head[2] = {uint32_t(At(sent_, field)), uint32_t(n)};
+    void WriteDelta(size_t off, const uint8_t* now, size_t bytes) {
+        std::memcpy(reinterpret_cast<uint8_t*>(&sent_) + off, now + off, bytes);
+        const uint32_t head[] = {uint32_t(off), uint32_t(bytes)};
         size_t at = cur_->bytes.size();
-        cur_->bytes.resize(at + 8 + n);
-        std::memcpy(cur_->bytes.data() + at, head, 8);
-        std::memcpy(cur_->bytes.data() + at + 8, value, n);
+        cur_->bytes.resize(at + sizeof(head) + bytes);
+        std::memcpy(cur_->bytes.data() + at, head, sizeof(head));
+        std::memcpy(cur_->bytes.data() + at + sizeof(head), now + off, bytes);
     }
+
+    void SendRange(const uint8_t* now, Range range) {
+        const auto* sent = reinterpret_cast<const uint8_t*>(&sent_);
+        size_t off = range.off, end = off + range.len;
+        while (off < end) {
+            size_t group = std::min(end - off, 4 * kPiece);
+            if (group > kPiece && !std::memcmp(sent + off, now + off, group)) {
+                off += group;
+                continue;
+            }
+            size_t limit = off + group, first = off;
+            while (off < limit) {
+                size_t n = std::min(limit - off, kPiece);
+                if (!std::memcmp(sent + off, now + off, n)) {
+                    if (first < off) WriteDelta(first, now, off - first);
+                    first = off + n;
+                }
+                off += n;
+            }
+            if (first < off) WriteDelta(first, now, off - first);
+        }
+    }
+
+#ifdef NGB_DIRECT3D
+    template<size_t I>
+    void SendFixedRange(const uint8_t* now) {
+        constexpr Range r = kStateRanges[I];
+        const auto* previous = reinterpret_cast<const uint8_t*>(&sent_) + r.off;
+        // These fixed-size comparisons fold to direct loads for small fields.
+        // Keep the original delta layout on changes, including its group boundaries.
+        if (!std::memcmp(previous, now + r.off, r.len)) return;
+        if constexpr (r.len <= kPiece) WriteDelta(r.off, now, r.len);
+        else SendRange(now, r);
+    }
+    template<size_t... I>
+    void SendFixedRanges(const uint8_t* now, std::index_sequence<I...>) {
+        (SendFixedRange<I>(now), ...);
+    }
+#endif
 
     // what changed since the last command, in 64 byte pieces; the headers the call names; the game's side.
     // vertices: how many a non-indexed draw reads (a DrawVerticesUP's to copy)
@@ -438,13 +671,35 @@ private:
         SendPeek(s);
         Cmd c{Op::State};
         size_t first = cur_->bytes.size();
-        const uint8_t* sent = reinterpret_cast<const uint8_t*>(&sent_);
-        for (const Range& r : ranges_) {
-            size_t off = r.off, end = r.off + r.len;
-            for (; off + kPiece <= end; off += kPiece)
-                if (std::memcmp(sent + off, now + off, kPiece)) Delta(sent + off, now + off, kPiece);
-            if (off < end) Delta(sent + off, now + off, end - off);
+#ifdef NGB_DIRECT3D
+        SendFixedRanges(now, std::make_index_sequence<kStateRanges.size()>{});
+#else
+        for (const Range& r : kStateRanges) SendRange(now, r);
+#endif
+#ifdef NGB_DIRECT3D
+        const size_t constant_offset = At(s, &s.vsc);
+        if (!s.constants_revision || &s != constants_source_ ||
+            (s.constants_revision != constants_revision_ && s.constants_revision - constants_revision_ != 1)) {
+            SendRange(now, {constant_offset, sizeof(s.vsc)});
+        } else if (s.constants_revision != constants_revision_) {
+            // SyncDeferred already compared these blocks against the previous draw.
+            uint32_t mask = s.changed_constant_blocks;
+            while (mask) {
+                unsigned first = __builtin_ctz(mask);
+                unsigned count = __builtin_ctz(~(mask >> first));
+                WriteDelta(constant_offset + first * State::constant_block_bytes, now,
+                           count * State::constant_block_bytes);
+                mask &= ~(((1u << count) - 1) << first);
+            }
         }
+        constants_source_ = &s;
+        constants_revision_ = s.constants_revision;
+        if (!s.lights_revision || &s != light_source_ || s.lights_revision != sent_.lights_revision) {
+            SendRange(now, {At(s, &s.lights), sizeof(s.lights)});
+            sent_.lights_revision = s.lights_revision;
+            light_source_ = &s;
+        }
+#endif
         if (s.vs.get() != sent_.vs.get()) {
             sent_.vs = s.vs;
             c.vs = int32_t(cur_->vs.size());
@@ -514,11 +769,14 @@ private:
         static const bool release = std::getenv("NGB_D3D_WAIT_RELEASE") && *std::getenv("NGB_D3D_WAIT_RELEASE") == '1';
         if (release) vcpu_block_begin();
 #endif
+#ifdef NGB_DIRECT3D
+        ngb_direct_render_event(false, true);
+#endif
         {
             std::unique_lock lock(m_);
             auto since = std::chrono::steady_clock::now();
             int logged = 0;
-            while (!done_cv_.wait_for(lock, std::chrono::seconds(1), [&] { return done_.load() >= id; })) {
+            while (!done_cv_.wait_for(lock, std::chrono::seconds(1), [&] { return done_.load() >= id || exited_; })) {
                 int s = int(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - since).count());
                 if (s >= kStallLogSeconds * (logged + 1)) {
                     logged++;
@@ -526,6 +784,11 @@ private:
                                  (unsigned long long)id, s, (unsigned long long)done_.load());
                 }
             }
+#ifdef NGB_DIRECT3D
+            lock.unlock();
+            ngb_direct_render_event(false, false);
+            CheckError();
+#endif
         }
 #if XBOX_HAS_VCPU
         if (release) vcpu_block_end();
@@ -533,6 +796,9 @@ private:
     }
 
     void Recycle(Batch* b) {
+#ifdef NGB_DIRECT3D
+        b->index_snapshots.clear();
+#endif
         b->cmds.clear();
         b->bytes.clear();
         b->vs.clear();
@@ -547,7 +813,13 @@ private:
     }
 
     void Run() {
+#ifdef NGB_TEXTURE_PRELOAD
+        unsigned empty_periods=0;
+#endif
         g_header_view = &headers_;
+#ifdef NGB_DIRECT3D
+        ngb_direct_render_core();
+#endif
         for (;;) {
             Batch* b = nullptr;
             {
@@ -558,19 +830,45 @@ private:
                     if (g_pace_on) g_pace.idle++;
                     if (cap_.try_lock()) {
                         if (g_pace_on && !cur_->cmds.empty()) g_pace.idle_submit++;
+#ifdef NGB_TEXTURE_PRELOAD
+                        bool empty=cur_->cmds.empty();
+#endif
                         Release();
                         cap_.unlock();
+#ifdef NGB_TEXTURE_PRELOAD
+                        // Give batched draws priority. Only prepare after sustained inactivity.
+                        if(empty && ++empty_periods>=8){empty_periods=0;ngb_texture_load_idle(inner_.get());}
+                        if(!empty)empty_periods=0;
+#endif
                     } else if (g_pace_on) {
                         g_pace.idle_busy++;
                     }
                     continue;
                 }
                 if (queue_.empty()) break;
+#ifdef NGB_TEXTURE_PRELOAD
+                empty_periods=0;
+#endif
                 b = queue_.front();
                 queue_.pop_front();
             }
             uint64_t t0 = g_pace_on ? PaceNowUs() : 0;
+#ifdef NGB_DIRECT3D
+            ngb_direct_render_event(true, true);
+            try {
+                ExecuteBatch(*b);
+            } catch (const DirectRenderError& error) {
+                ngb_direct_render_event(true, false);
+                Recycle(b);
+                std::lock_guard lock(m_);
+                failure_ = error;
+                failed_.store(true, std::memory_order_release);
+                break;
+            }
+            ngb_direct_render_event(true, false);
+#else
             ExecuteBatch(*b);
+#endif
             if (g_pace_on) {
                 uint64_t t1 = PaceNowUs(), lat = b->handed_us ? t1 - b->handed_us : 0;
                 g_pace.batches++;
@@ -600,6 +898,9 @@ private:
             }
             done_cv_.notify_all();
         }
+#if defined(NGB_DIRECT3D) && defined(__SWITCH__)
+        ngb_direct_forget_worker();
+#endif
         std::lock_guard lock(m_);
         exited_ = true;
         done_cv_.notify_all();
@@ -643,7 +944,16 @@ private:
                 inner_->UsePeek(p);
                 break;
             }
-            case Op::Draw: inner_->Draw(state_, c.a, c.b, c.c, c.d ? data : nullptr); break;
+            case Op::Draw:
+#ifdef NGB_DIRECT3D
+                if (c.d == 2) {
+                    const auto& snapshot = *b.index_snapshots[c.size];
+                    inner_->Draw(state_, c.a, c.b, c.c, snapshot.bytes.data(), &snapshot.bounds);
+                    break;
+                }
+#endif
+                inner_->Draw(state_, c.a, c.b, c.c, c.d ? data : nullptr);
+                break;
             case Op::Clear: inner_->Clear(state_, c.a, c.size ? data : nullptr, c.b, c.c, c.f, c.d); break;
             case Op::Copy:
                 inner_->Copy(c.s1, c.s2, c.a, c.b ? b.bytes.data() + c.b - 1 : nullptr,
@@ -660,14 +970,29 @@ private:
         }
     }
 
+#ifdef NGB_DIRECT3D
+    std::atomic<bool> failed_{};
+    DirectRenderError failure_{};
+#endif
     std::unique_ptr<Backend> inner_;
-    std::vector<Range> ranges_;
-    const bool thread_;
+#if defined(NGB_DIRECT3D) && defined(__SWITCH__)
+    pthread_t native_thread_{};
+#endif
+    bool thread_;
 
     // the title's side (cap_: a call being recorded; the render thread takes the batch under it too)
     std::recursive_mutex cap_;
     Batch* cur_ = nullptr;
     std::thread::id title_, render_;
+#ifdef NGB_DIRECT3D
+    const State* constants_source_ = nullptr;
+    uint64_t constants_revision_ = 0;
+    unsigned same_state_pairs_ = 0, list_pairs_ = 0, merged_strips_ = 0;
+    IndexSlot index_slots_[2048]{};
+    unsigned index_hits_ = 0;
+    bool recording_visibility_ = false;
+    const State* light_source_ = nullptr;
+#endif
     State sent_;   // the state as the renderer will have it
     std::unordered_map<uint32_t, HeaderCopy> sent_headers_;
     std::vector<HeaderSend> pending_headers_;
@@ -690,6 +1015,15 @@ private:
 };
 
 }  // namespace
+
+#ifdef NGB_DIRECT3D
+extern "C" void ngb_direct_check_render_error(void) {
+    if (Recorded* r = g_recorded.load()) r->CheckError();
+}
+extern "C" void ngb_direct_finish_put(void) {
+    if (Recorded* r = g_recorded.load()) r->Drain();
+}
+#endif
 
 std::unique_ptr<Backend> CreateThreadedBackend(std::unique_ptr<Backend> inner) {
     const char* e = std::getenv("NGB_D3D_THREAD");

@@ -110,6 +110,10 @@ void pgraph_allocate_inline_buffer_vertices(PGRAPHState *pg, unsigned int attr)
         return;
     }
 
+#ifdef NGB_SWITCH_PGRAPH
+    if (!attribute->inline_buffer)
+        attribute->inline_buffer = g_malloc(NV2A_MAX_BATCH_LENGTH * 4 * sizeof(float));
+#endif
     /* Now upload the previous attribute value */
     attribute->inline_buffer_populated = true;
     for (int i = 0; i < pg->inline_buffer_length; i++) {

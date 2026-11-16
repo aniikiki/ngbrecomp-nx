@@ -39,11 +39,17 @@ ShaderState pgraph_glsl_get_shader_state(PGRAPHState *pg)
 bool pgraph_glsl_check_shader_state_dirty(PGRAPHState *pg,
                                           const ShaderState *state)
 {
+#ifdef NGB_SWITCH_PGRAPH
+    if (state->psh.scissor_inside_window != pgraph_scissor_inside_window(pg)) return true;
+#endif
     if (pg->program_data_dirty) {
         return true;
     }
 
     unsigned int regs[] = {
+#ifdef NGB_SWITCH_PGRAPH
+        NV_PGRAPH_BLEND,
+#endif
         NV_PGRAPH_COMBINECTL,      NV_PGRAPH_COMBINESPECFOG0,
         NV_PGRAPH_COMBINESPECFOG1, NV_PGRAPH_CONTROL_0,
         NV_PGRAPH_CONTROL_3,       NV_PGRAPH_CSV0_C,

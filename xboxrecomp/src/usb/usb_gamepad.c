@@ -54,6 +54,12 @@ static const uint8_t s_config_desc[32] = {
 static uint8_t s_address[USB_GAMEPAD_MAX];
 static uint8_t s_configuration[USB_GAMEPAD_MAX];
 
+void usb_gamepad_reset(int pad)
+{
+    s_address[pad & 3] = 0;
+    s_configuration[pad & 3] = 0;
+}
+
 uint8_t usb_gamepad_address(int pad) { return s_address[pad & 3]; }
 int usb_gamepad_configured(int pad) { return s_configuration[pad & 3] != 0; }
 
@@ -215,6 +221,7 @@ int usb_gamepad_control(int pad, const UsbSetup *setup, uint8_t *out, int max)
     return -1;
 }
 
+#ifndef XBOX_USB_EXTERNAL_REPORT
 /* ---- the input report -------------------------------------------------- */
 
 /* The host's own pad, through the layer that already maps one to XInput.
@@ -689,3 +696,5 @@ void usb_gamepad_rumble(int pad, const uint8_t *data, int len)
     }
     xbox_InputSetState((DWORD)pad, &v);
 }
+
+#endif /* XBOX_USB_EXTERNAL_REPORT */

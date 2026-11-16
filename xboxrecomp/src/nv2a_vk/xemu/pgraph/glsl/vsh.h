@@ -100,6 +100,7 @@ typedef struct GenVshGlslOptions {
     bool vulkan;
     bool prefix_outputs;
     bool use_push_constants_for_uniform_attrs;
+    bool interpolate_z;
     int ubo_binding;
 } GenVshGlslOptions;
 

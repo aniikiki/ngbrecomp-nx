@@ -277,6 +277,7 @@ MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
     pgraph_glsl_get_vtx_header(header, opts.vulkan, state->smooth_shading,
                                false, opts.prefix_outputs, false);
 
+    if (opts.interpolate_z) mstring_append(header, "noperspective out float guestWindowZ;\n");
     if (opts.prefix_outputs) {
         mstring_append(header,
                        "#define vtxD0 v_vtxD0\n"
@@ -453,6 +454,8 @@ MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
                    "  triMZ = 0.0;\n"
                    "  gl_PointSize = oPts.x;\n"
     );
+
+    if (opts.interpolate_z) mstring_append(body, "  guestWindowZ = vtxPos.z;\n");
 
     if (state->specular_enable) {
         mstring_append(body,

@@ -27,7 +27,12 @@
 #include "util.h"
 #include "swizzle.h"
 #include "nv2a_vsh_emulator.h"
+#ifdef NGB_SWITCH_PGRAPH
+#include "scene.h"
+static bool nv2a_vk_draws_off(void) { return false; }
+#else
 #include "nv2a_vk_share.h"   /* nv2a_vk_draws_off */
+#endif
 void nv2a_renderer_fatal(const char *detail);   /* xboxrecomp: below */
 
 #define PG_GET_MASK(reg, mask) GET_MASK(pgraph_reg_r(pg, reg), mask)
@@ -242,8 +247,10 @@ void pgraph_init(NV2AState *d)
 
     for (int i = 0; i < NV2A_VERTEXSHADER_ATTRIBUTES; i++) {
         VertexAttribute *attribute = &pg->vertex_attributes[i];
+#ifndef NGB_SWITCH_PGRAPH
         attribute->inline_buffer = (float*)g_malloc(NV2A_MAX_BATCH_LENGTH
                                               * sizeof(float) * 4);
+#endif
         attribute->inline_buffer_populated = false;
     }
 
@@ -2817,6 +2824,24 @@ DEF_METHOD(NV097, ARRAY_ELEMENT16)
             *num_words_consumed = num_words_available;
         return;
     }
+#ifdef NGB_SWITCH_PGRAPH
+    if (!inc && num_words_available > 1) {
+        pgraph_check_within_begin_end_block(pg);
+        if (pg->draw_arrays_length) pgraph_expand_draw_arrays(d);
+        size_t count = num_words_available * 2;
+        if (count > NV2A_MAX_BATCH_LENGTH - pg->inline_elements_length)
+            nv2a_renderer_fatal("vertex index packet exceeds inline buffer");
+        uint32_t *dest = pg->inline_elements + pg->inline_elements_length;
+        for (size_t i = 0; i < num_words_available; ++i) {
+            uint32_t word = ldl_le_p(parameters + i);
+            dest[2*i] = word & 0xffff;
+            dest[2*i + 1] = word >> 16;
+        }
+        pg->inline_elements_length += count;
+        *num_words_consumed = num_words_available;
+        return;
+    }
+#endif
     pgraph_method_non_inc(METHOD_FUNC_NAME_INT(NV097, ARRAY_ELEMENT16), METHOD_HANDLER_ARGS);
 }
 DEF_METHOD_INT(NV097, ARRAY_ELEMENT16)
@@ -2841,6 +2866,20 @@ DEF_METHOD(NV097, ARRAY_ELEMENT32)
             *num_words_consumed = num_words_available;
         return;
     }
+#ifdef NGB_SWITCH_PGRAPH
+    if (!inc && num_words_available > 1) {
+        pgraph_check_within_begin_end_block(pg);
+        if (pg->draw_arrays_length) pgraph_expand_draw_arrays(d);
+        size_t count = num_words_available;
+        if (count > NV2A_MAX_BATCH_LENGTH - pg->inline_elements_length)
+            nv2a_renderer_fatal("vertex index packet exceeds inline buffer");
+        uint32_t *dest = pg->inline_elements + pg->inline_elements_length;
+        memcpy(dest, parameters, num_words_available * sizeof(*dest));
+        pg->inline_elements_length += count;
+        *num_words_consumed = num_words_available;
+        return;
+    }
+#endif
     pgraph_method_non_inc(METHOD_FUNC_NAME_INT(NV097, ARRAY_ELEMENT32), METHOD_HANDLER_ARGS);
 }
 DEF_METHOD_INT(NV097, ARRAY_ELEMENT32)
@@ -3305,6 +3344,9 @@ void pgraph_write_zpass_pixel_cnt_report(NV2AState *d, uint32_t parameter,
     assert(offset < report_dma_len);
     report_data += offset;
 
+#ifdef NGB_SWITCH_PGRAPH
+    if (ngb_scene_active) ngb_scene_cpu_access(report_data - d->vram_ptr, 16);
+#endif
     stq_le_p((uint64_t *)&report_data[0], timestamp);
     stl_le_p((uint32_t *)&report_data[8], result);
     stl_le_p((uint32_t *)&report_data[12], done);

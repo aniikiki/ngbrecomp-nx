@@ -55,8 +55,8 @@ bool VulkanBackend::SoftenGlow(Image& source) {
         ri.renderArea={{0,0},{width,height}};ri.layerCount=1;ri.colorAttachmentCount=1;ri.pColorAttachments=&color;
         d_.vkCmdBeginRendering(cmd_,&ri);
         VkViewport viewport{0,0,float(width),float(height),0,1};VkRect2D scissor{{0,0},{width,height}};
-        d_.vkCmdSetViewport(cmd_,0,1,&viewport);d_.vkCmdSetScissor(cmd_,0,1,&scissor);
-        d_.vkCmdBindPipeline(cmd_,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline);
+        SetViewport(viewport);SetScissor(scissor);
+        BindPipeline(pipeline);
         VkDescriptorImageInfo image{VK_NULL_HANDLE,input->view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
         VkDescriptorImageInfo sampler{glow_soft_sampler_,VK_NULL_HANDLE,VK_IMAGE_LAYOUT_UNDEFINED};
         VkWriteDescriptorSet writes[2]{};
@@ -184,8 +184,8 @@ bool VulkanBackend::ContinuousGlowPass(Image& input,Image& output,uint32_t w,uin
     VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};ri.renderArea={{0,0},{w,h}};
     ri.layerCount=1;ri.colorAttachmentCount=1;ri.pColorAttachments=&color;d_.vkCmdBeginRendering(cmd_,&ri);
     VkViewport viewport{0,0,float(w),float(h),0,1};VkRect2D scissor{{0,0},{w,h}};
-    d_.vkCmdSetViewport(cmd_,0,1,&viewport);d_.vkCmdSetScissor(cmd_,0,1,&scissor);
-    d_.vkCmdBindPipeline(cmd_,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline);
+    SetViewport(viewport);SetScissor(scissor);
+    BindPipeline(pipeline);
     VkDescriptorImageInfo image{VK_NULL_HANDLE,input.view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     VkDescriptorBufferInfo constants{ring_,at,16};
     VkWriteDescriptorSet writes[2]{};

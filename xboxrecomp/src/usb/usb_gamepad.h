@@ -40,6 +40,7 @@ void usb_gamepad_rumble(int pad, const uint8_t *data, int len);
 
 /* The address the host assigned pad `pad` with SET_ADDRESS, 0 until it does,
  * and whether it has been configured. */
+void usb_gamepad_reset(int pad);
 uint8_t usb_gamepad_address(int pad);
 int usb_gamepad_configured(int pad);
 

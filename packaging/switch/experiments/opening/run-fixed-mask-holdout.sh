@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+p=packaging/switch/experiments/opening
+d=build/switch-runtime/core-perf/opening-rng-correspondence
+mkdir -p "$d/hdd"
+export NGB_TEST_IDLE_SCENE=benchmark LP_NUM_THREADS=4 VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.aarch64.json NGB_DIRECT_SPIRV=/work/build/switch-runtime/direct/cache/spirv.bin XDG_CACHE_HOME=/work/build/switch-runtime/direct/mesa-cache
+trap 'rm -f "$d/host/replay" "$d/retained" "$d/fixed-mask-packet"' EXIT
+for arm in retained fixed-mask-packet; do
+ set --
+ set -- --full-page --command-record --batch-bytes --page-hot-o3 --after-regs --compact-loops --paired-copy
+ if [ "$arm" = fixed-mask-packet ]; then set -- "$@" --fixed-mask-packet; fi
+ python3 "$p/wide-motion.py" --serial --present-mix --rng-correspondence "$@"
+
+ mv "$d/host/replay" "$d/$arm"
+done
+export NGB_REPLAY_FIXED_SEED=1
+for name in fixed-mask-packet-1 retained-1 retained-2 fixed-mask-packet-2; do
+ "$d/${name%-*}" --start-button game_files "$d/hdd" >"$d/maskpkt-one-$name.log" 2>&1 || :
+ grep -Fq 'verified 120 original demo frames' "$d/maskpkt-one-$name.log"
+done

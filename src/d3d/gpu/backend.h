@@ -36,6 +36,8 @@ struct QuickPeek {
     bool fps_lettered = false;     // that picture has the text (not yet: the font not loaded)
 };
 
+struct IndexBounds;
+
 class Backend {
 public:
     virtual ~Backend() = default;
@@ -51,7 +53,8 @@ public:
     virtual void Clear(const State& s, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z,
                        uint32_t stencil) = 0;
     // indices: the title's 16 bit indices, null for non indexed draws, then start is the first vertex
-    virtual void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) = 0;
+    virtual void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices,
+                      const IndexBounds* bounds = nullptr) = 0;
     // src_rects: count D3DRECTs, dst_points: count POINTs (2 x int32), either null
     virtual void Copy(const Surface& src, const Surface& dst, uint32_t count, const uint8_t* src_rects,
                       const uint8_t* dst_points) = 0;

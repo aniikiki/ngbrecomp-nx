@@ -1,0 +1,5 @@
+ARG SDK_IMAGE=devkitpro/devkita64:20260219
+FROM ${SDK_IMAGE}
+RUN apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/debian.sources -o Dir::Etc::sourceparts=- update \
+ && apt-get install -y --no-install-recommends libavcodec-dev libavutil-dev libswscale-dev pkg-config libegl-dev libgles-dev libgl-dev libgl1-mesa-dri libegl-mesa0 libvulkan1 mesa-vulkan-drivers \
+ && rm -rf /var/lib/apt/lists/*

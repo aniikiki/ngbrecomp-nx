@@ -62,8 +62,8 @@ void VulkanBackend::QuickMenuBackground(Image& dst) {
         d_.vkCmdBeginRendering(cmd_, &ri);
         VkViewport vp{0, 0, float(out.w), float(out.h), 0, 1};
         VkRect2D sc{{0, 0}, {out.w, out.h}};
-        d_.vkCmdSetViewport(cmd_, 0, 1, &vp); d_.vkCmdSetScissor(cmd_, 0, 1, &sc);
-        d_.vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        SetViewport(vp); SetScissor(sc);
+        BindPipeline(pipe);
         VkDescriptorImageInfo im{VK_NULL_HANDLE, in.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
         VkDescriptorImageInfo sm{quick_sampler_, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
         VkWriteDescriptorSet w[2]{};
@@ -148,8 +148,8 @@ void VulkanBackend::QuickMenu(Image& dst) {
     VkViewport vp{0, float(dst.h) - NGB_QUICK_HEIGHT * sy,
                   NGB_QUICK_WIDTH * sx, NGB_QUICK_HEIGHT * sy, 0, 1};
     VkRect2D sc{{0, 0}, {dst.w, dst.h}};
-    d_.vkCmdSetViewport(cmd_, 0, 1, &vp); d_.vkCmdSetScissor(cmd_, 0, 1, &sc);
-    d_.vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    SetViewport(vp); SetScissor(sc);
+    BindPipeline(pipe);
     VkDescriptorImageInfo im{VK_NULL_HANDLE, quick_layer_.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     VkDescriptorImageInfo sm{quick_sampler_, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
     VkWriteDescriptorSet w[2]{};
@@ -222,8 +222,8 @@ void VulkanBackend::FpsCounter(Image& dst) {
     ngb_fps_cap(int(dst.h), &up);   // (lettered at most 40 pixels tall: drawn up larger)
     VkViewport vp{dst.h * 0.012f * sx, dst.h * 0.004f, kFpsWidth * sx * up, kFpsHeight * up, 0, 1};
     VkRect2D sc{{0, 0}, {dst.w, dst.h}};
-    d_.vkCmdSetViewport(cmd_, 0, 1, &vp); d_.vkCmdSetScissor(cmd_, 0, 1, &sc);
-    d_.vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    SetViewport(vp); SetScissor(sc);
+    BindPipeline(pipe);
     VkDescriptorImageInfo im{VK_NULL_HANDLE, fps_layer_.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     VkDescriptorImageInfo sm{quick_sampler_, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
     VkWriteDescriptorSet w[2]{};
