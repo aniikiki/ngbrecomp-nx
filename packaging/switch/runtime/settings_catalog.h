@@ -31,7 +31,9 @@ static const Preference settings[]={
  TOGGLE(GAMEPLAY,36,"responsive","Responsive menus",0,0),
  TOGGLE(GAMEPLAY,43,"talisman_rebirth","Talisman of Rebirth",1,0),
  TOGGLE(GAMEPLAY,44,"bow_crosshair","Bow crosshair",0,0),
- TOGGLE(CONTROLS,46,"third_person","Start in third person",0,0),
+ /* Older builds wrote third_person=0 even when only unrelated settings changed.
+  * A new key adopts the upstream default once, then preserves explicit choices. */
+ TOGGLE(CONTROLS,46,"third_person_on_load","Start in third person",1,0),
  {CONTROLS,47,2,0,"sensitivity","Camera sensitivity","50%|75%|100%|125%|150%|200%"},
  TOGGLE(CONTROLS,48,"first_x","Invert first-person X",0,0),
  TOGGLE(CONTROLS,49,"first_y","Invert first-person Y",0,0),

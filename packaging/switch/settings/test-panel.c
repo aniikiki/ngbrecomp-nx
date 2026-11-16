@@ -50,7 +50,12 @@ static void check_death(unsigned items,unsigned alive){
 }
 static void key(unsigned k){PadState pad={k,k};assert(settings_input(&pad));}
 int main(int argc,char**argv){
- assert(argc==2);ngb_fast_ram=calloc(1,0x1000000);prefs_load();assert(pref(24)&&!pref(44));atomic_store(&panel,PANEL);key(0);
+ assert(argc==2);ngb_fast_ram=calloc(1,0x1000000);prefs_load();assert(ngb_bind_third_person_start());
+ FILE *legacy=fopen(PREF_FILE,"w");assert(legacy);fputs("third_person=0\nthird_y=1\n",legacy);assert(!fclose(legacy));
+ prefs_load();assert(ngb_bind_third_person_start() && pref(51));
+ assert(prefs_save(46,0));prefs_load();assert(!ngb_bind_third_person_start() && pref(51));
+ assert(prefs_save(255,0));assert(ngb_bind_third_person_start() && !pref(51));
+ assert(pref(24)&&!pref(44));atomic_store(&panel,PANEL);key(0);
  /* Enter each category and scroll every row, including fixed targets and the
   * last controls row. The first/last page navigation must wrap independently. */
  for(unsigned c=0;c<PAGES;c++){

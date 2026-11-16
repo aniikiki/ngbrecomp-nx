@@ -102,7 +102,7 @@ if '--texture-preload' in sys.argv:
    flags=[*flags,'-DNGB_TEXTURE_PRELOAD','-I'+str(d)]""")
 if '--player' in sys.argv:
  assert '--texture-preload' in sys.argv
- replace("version='0.56.2';out=", "version='0.56.13';out=")
+ replace("version='0.56.2';out=", "version='0.56.14';out=")
  replace(" elf=d/'idx.elf';", " runpy.run_path('/work/packaging/switch/settings/link.py')['install'](commands,b,d,link,regs)\n elf=d/'idx.elf';")
  replace(" (out/'symbols.gz').write_bytes", """ table={v.split()[-1]:v.split() for v in nm.decode().splitlines() if v.split()}
  assert all("ngbs_sub_"+a in table for a in ("001764F0","00176840","00176E30","00177330","001EAA10"))
