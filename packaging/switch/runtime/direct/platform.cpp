@@ -22,7 +22,15 @@ void ngb_kernel_log(const char*);
 // The guest worker owns the standalone Vulkan queue. The Switch frontend
 // supplies input and diagnostics separately from the desktop overlays.
 extern "C" {
-int ngb_pc_setting(int which) { return which == 30; }
+#ifdef NGB_PLAYER_BUILD
+#include "../recomp_settings.h"
+#endif
+int ngb_pc_setting(int which) {
+#ifdef NGB_PLAYER_BUILD
+    return ngb_switch_setting(which);
+#endif
+    return which==30;
+}
 int ngb_2d_screen_flags() { return 0; }
 int ngb_2d_stretched() { return 0; }
 float ngb_hud_shape() { return 1.0f; } // native Xbox layout inside the scanout
@@ -30,13 +38,20 @@ bool nv2a_present_show_fps() { return false; }
 int ngb_fps_picture(uint32_t*, size_t, int*, int*, unsigned*) { return 0; }
 int ngb_fps_cap(int, float*) { return 0; }
 volatile int ngb_fps_target_h, ngb_nv2a_logdraws, nv2a_fps_drawn_outside;
+#ifndef NGB_PLAYER_BUILD
 int ngb_quick_frozen() { return 0; }
 int ngb_quick_layer(uint32_t*) { return 0; }
+#endif
 int nv2a_dirty_stamp(const void*, size_t, uint64_t*) { return 0; } // hash fallback
 void nv2a_quality_get(int* scale, int* aniso, int* shadow, int* msaa)
 {
+#ifdef NGB_PLAYER_BUILD
+    *scale=ngb_switch_setting(0);*aniso=ngb_switch_setting(1);
+    *shadow=ngb_switch_setting(2);*msaa=ngb_switch_setting(10);
+#else
     *scale = *shadow = *msaa = 1;
     *aniso = 0; // preserve the game's filtering, including single-level textures
+#endif
 }
 int nv2a_vk_share(nv2a_vk_shared*) { return -1; }
 void nv2a_vk_queue_lock() {}

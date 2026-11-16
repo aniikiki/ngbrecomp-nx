@@ -15,6 +15,9 @@
 #include "player_diagnostics.h"
 int ngb_diagnostics_enabled;
 #include "loading.inc"
+#ifdef NGB_PLAYER_BUILD
+#include "settings_panel.inc"
+#endif
 static atomic_bool finished;
 static int boot_status;
 static FILE *boot_log;
@@ -283,6 +286,9 @@ static void sample_pad(PadState *pad, bool game_input)
     if (!game_input && !ngb_movie_owns_input()) held &= ~HidNpadButton_Plus;
     uint16_t buttons=0;
     for (unsigned i=0;i<16;i++) if (held&mapped[i]) buttons|=1u<<i;
+#ifdef NGB_PLAYER_BUILD
+    ngb_switch_sample_quick(buttons);
+#endif
     HidAnalogStickState l=padGetStickPos(pad,0), r=padGetStickPos(pad,1);
     /* Saturate the negative extreme so that full stick never wraps. */
     ngb_ohci_pad_sample(buttons,l.x,l.y,
@@ -295,6 +301,9 @@ static void sample_pad(PadState *pad, bool game_input)
 static void poll_input(PadState *pad)
 {
     padUpdate(pad);
+#ifdef NGB_PLAYER_BUILD
+    if (settings_input(pad)) return;
+#endif
     bool game = atomic_load(&game_view);
     u64 down = padGetButtonsDown(pad);
     bool stopped = atomic_load(&finished);
@@ -343,6 +352,11 @@ int main(void)
     sample_pad(&pad, false);
     mkdir("sdmc:/switch", 0777);
     mkdir("sdmc:/switch/ngb-runtime", 0777);
+#ifdef NGB_PLAYER_BUILD
+    prefs_load();launch_aspect=pref(7);launch_thread=pref(30);
+    ngb_quick_set_game_dir("sdmc:/switch/ngb-runtime/disc");
+    bow_loaded=ngb_crosshair_picture(bow_art,64);
+#endif
     struct stat flag;
     ngb_diagnostics_enabled = stat("sdmc:/switch/ngb-runtime/diagnostics.flag",&flag)==0 && S_ISREG(flag.st_mode);
     if (ngb_diagnostics_enabled) {
@@ -423,11 +437,26 @@ int main(void)
         if (atomic_exchange(&commands,0)&EXIT_GAME) { ngb_request_stop(); exiting=true; }
         if (exiting && (!started || done)) break;
         if (done && !failed) break;
+#ifdef NGB_PLAYER_BUILD
+        static unsigned previous_panel,previous_revision;
+        unsigned view=atomic_load(&panel);
+        if (view && !failed && !exiting) {
+            unsigned changes=atomic_load(&revision);
+            if (previous_panel!=view || previous_revision!=changes) draw_settings(&surface,view);
+            previous_panel=view;previous_revision=changes;
+            svcSleepThread(4000000);
+            continue;
+        }
+        if (previous_panel) {previous_panel=0;displayed=~0u;}
+#endif
         if (!failed && ngb_scanout_ready() && (viewing || ngb_scanout_visible())) {
             unsigned next=ngb_scanout_generation();
             if (!viewing || displayed!=next) {
                 u32 stride; u32 *dst=framebufferBegin(&surface,&stride);
                 ngb_scanout_blit(dst,stride/4,1280,720);
+#ifdef NGB_PLAYER_BUILD
+                game_overlay(dst,stride/4);
+#endif
                 framebufferEnd(&surface);
                 ngb_scanout_displayed(); ngb_movie_displayed();
                 displayed=next; viewing=true; atomic_store(&game_view,true);

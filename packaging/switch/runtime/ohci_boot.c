@@ -11,10 +11,15 @@
 #include "guest_memory.h"
 #include "usb/ohci.h"
 #include "audio_boot.h"
+#include <stdbool.h>
+#ifdef NGB_PLAYER_BUILD
+#include "recomp_settings.h"
+static uint32_t settings_label;
+static bool settings_confirm_held;
+#endif
 #include "usb/usb_gamepad.h"
 #include <string.h>
 #include <stdatomic.h>
-#include <stdbool.h>
 
 enum {
     REVISION = 0x00, CONTROL = 0x04, COMMAND = 0x08, IRQ_STATUS = 0x0c,
@@ -85,6 +90,18 @@ void ngb_warning_file_read(const char *name, int64_t offset)
 
 void ngb_menu_draw(uint32_t cursor)
 {
+#ifdef NGB_PLAYER_BUILD
+    if (!settings_label) {
+        const char label[]="RECOMP SETTINGS";
+        settings_label=ngb_contiguous_allocate(sizeof label,0,UINT32_MAX,4,4);
+        if (settings_label) {
+            memcpy((void*)ngb_guest_pointer(settings_label,sizeof label),label,sizeof label);
+            /* Retail main menu text 0x90009, English and Japanese. */
+            memcpy(ngb_fast_ram+0x43618c,&settings_label,4);
+            memcpy(ngb_fast_ram+0x436190,&settings_label,4);
+        }
+    }
+#endif
     if (!menu_entry_ns) menu_entry_ns=ngb_elapsed_ns();
     menu_drawn=true;
     if (cursor!=last_cursor) {
@@ -176,11 +193,67 @@ void ngb_ohci_pad_sample(uint16_t buttons, int16_t lx, int16_t ly, int16_t rx, i
     ngb_publish(&pad_samples);
 }
 
+#ifdef NGB_PLAYER_BUILD
+static atomic_bool quick_play;
+extern int ngb_quick_controls_active(void);
+void ngb_switch_sample_quick(unsigned raw){
+    extern void ngb_switch_quick_pad(unsigned);
+    static bool was_enabled;
+    bool enabled=ngb_switch_setting(20)!=0;
+    if(!enabled && !was_enabled)return;
+    was_enabled=enabled;
+    unsigned quick=0;
+    if(enabled && (atomic_load(&quick_play) || ngb_quick_controls_active()))
+        for(int i=0;i<6;i++)quick|=((raw>>ngb_switch_setting(78+i))&1u)<<i;
+    ngb_switch_quick_pad(quick);
+}
+#endif
 int usb_gamepad_report(int pad, uint8_t *out, int max)
 {
     if (pad || max<20) return 0;
     memcpy(out,reports[ngb_latest(&pad_samples)],20);
     if (atomic_load(&menu_input)) out[2]=(out[2]&~15u)|menu_dpad;
+#ifdef NGB_PLAYER_BUILD
+    bool play=ngb_fast_ram && ngb_fast_ram[0x7F1B12]==1 && !ngb_fast_ram[0x7F1B11] &&
+        !ngb_fast_ram[0xDB9AD5] && (ngb_fast_ram[0xDB9894]==2 || ngb_fast_ram[0xDB9894]==3) && !atomic_load(&menu_input);
+    atomic_store(&quick_play,play);
+    static bool chord_held;
+    bool chord=(out[2]&96)==96; /* Minus + left stick: leave Start + Back available. */
+    if(chord && !chord_held && ngb_fast_ram && ngb_fast_ram[0x7F1B12]==1 && !atomic_load(&menu_input)){
+        chord_held=true;ngb_settings_open();memset(out+2,0,18);return 20;
+    }
+    chord_held=chord;
+    extern int ngb_camera_first_person(void);
+    unsigned raw=out[2];for(int i=0;i<8;i++)if(out[4+i])raw|=1u<<(8+i);
+    if(!ngb_switch_setting(52) && (out[2]&32))out[2]&=~16u;
+    static bool hud_held;
+    bool hud=play && (raw&(1u<<ngb_switch_setting(84)));
+    extern void ngb_switch_toggle_hud(void);
+    if(hud && !hud_held)ngb_switch_toggle_hud();
+    hud_held=hud;
+    if(ngb_quick_controls_active()){memset(out+2,0,18);return 20;}
+    if(play){
+        unsigned bits=out[2],mapped=0;
+        for(int i=0;i<8;i++)if(out[4+i])bits|=1u<<(8+i);
+        for(int i=0;i<16;i++)mapped|=((bits>>ngb_switch_setting(60+i))&1u)<<i;
+        if(bits&(1u<<ngb_switch_setting(76)))mapped|=(1u<<8)|(1u<<10);
+        if(bits&(1u<<ngb_switch_setting(77)))mapped|=(1u<<9)|(1u<<11);
+        out[2]=mapped;for(int i=0;i<8;i++)out[4+i]=(mapped&(1u<<(8+i)))?255:0;
+        int fp=ngb_camera_first_person(),pct=ngb_switch_setting(47);
+        for(int i=0;i<2;i++){int16_t v;memcpy(&v,out+16+2*i,2);
+            int axis=pct<100?v*pct/100:v;
+            if(ngb_switch_setting((fp?48:50)+i))axis=axis==-32768?32767:-axis;
+            v=axis;memcpy(out+16+2*i,&v,2);}
+    }
+    bool confirm=out[4] || (out[2]&16) || out[6];
+    bool pressed_confirm=confirm && !settings_confirm_held;
+    settings_confirm_held=confirm;
+    if (pressed_confirm && settings_label && atomic_load(&menu_input) && last_cursor==3) {
+        ngb_settings_open();
+        memset(out+2,0,18);
+        return 20;
+    }
+#endif
     /* Use the game state on the guest worker, after loading system.dat.
      * Xbox reports retain their native lettering in the front end and pause
      * screens. Flip the four analog button bytes only in active play. */
@@ -382,6 +455,10 @@ uint32_t ngb_ohci_irq_pending(void)
 
 void ngb_ohci_reset(void)
 {
+#ifdef NGB_PLAYER_BUILD
+    settings_label=0;
+    settings_confirm_held=false;
+#endif
     face_down=face_swapped=0;
     start_reported=false;
     atomic_store(&menu_input,false);

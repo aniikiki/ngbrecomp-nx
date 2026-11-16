@@ -3,6 +3,9 @@
 #include "scanout.h"
 #include "files.h"
 #include "ohci_boot.h"
+#ifdef NGB_PLAYER_BUILD
+#include "recomp_settings.h"
+#endif
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -25,7 +28,7 @@ int ngb_movie_owns_input(void) { return atomic_load(&owns_input); }
 
 /* Only known retail assets; never pass a guest path to the host filesystem. */
 static const char *const titles[] = {
-    "2_VI_WIDE_B.sfd","4_VI_STD_B.sfd","ninja_gaiden.sfd",
+    "2_VI_WIDE_B.sfd","4_VI_STD_B.sfd","ninja_gaiden.sfd","doa4.sfd",
     "pre_movie1.sfd","pre_movie2.sfd","pre_movie3.sfd","pre_movie4.sfd",
     "pre_movie5.sfd","pre_movie5_j.sfd","pre_movie6.sfd","pre_movie8.sfd",
     "pre_movie8_j.sfd","pre_movie9.sfd","pre_movie10.sfd","pre_movie10_j.sfd",
@@ -241,6 +244,12 @@ uint32_t ngb_movie_status(uint32_t status)
     selected=NULL;
 #ifndef __SWITCH__
     if (getenv("NGB_TEST_ORIGINAL_MOVIE")) { atomic_store(&owns_input,false); return status; }
+#endif
+#ifdef NGB_PLAYER_BUILD
+    if (ngb_settings_skip_intro() && (!strcmp(name,"2_VI_WIDE_B.sfd") || !strcmp(name,"4_VI_STD_B.sfd"))) {
+        atomic_store(&owns_input,false);
+        return 3;
+    }
 #endif
     FILE *file=ngb_open_disc_movie(name);
     if (!file) { atomic_store(&owns_input,false); return status; }

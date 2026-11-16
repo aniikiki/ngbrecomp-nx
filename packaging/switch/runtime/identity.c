@@ -88,7 +88,13 @@ uint32_t ngb_query_setting(uint32_t index, uint32_t type, uint32_t value,
         (void *)ngb_guest_pointer(value, length), length, result_ptr);
 }
 
-void ngb_video_init(void) { xbox_XcVideoFlags |= XC_VIDEO_FLAGS_WIDESCREEN; }
+void ngb_video_init(void) {
+#ifdef NGB_PLAYER_BUILD
+    extern int ngb_settings_standard_aspect(void);
+    if(ngb_settings_standard_aspect()){xbox_XcVideoFlags &= ~XC_VIDEO_FLAGS_WIDESCREEN;return;}
+#endif
+    xbox_XcVideoFlags |= XC_VIDEO_FLAGS_WIDESCREEN;
+}
 
 uint32_t ngb_av_pack(void)
 {

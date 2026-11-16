@@ -102,13 +102,19 @@ if '--texture-preload' in sys.argv:
    flags=[*flags,'-DNGB_TEXTURE_PRELOAD','-I'+str(d)]""")
 if '--player' in sys.argv:
  assert '--texture-preload' in sys.argv
- replace("version='0.56.2';out=", "version='0.56.8';out=")
+ replace("version='0.56.2';out=", "version='0.56.13';out=")
+ replace(" elf=d/'idx.elf';", " runpy.run_path('/work/packaging/switch/settings/link.py')['install'](commands,b,d,link,regs)\n elf=d/'idx.elf';")
+ replace(" (out/'symbols.gz').write_bytes", """ table={v.split()[-1]:v.split() for v in nm.decode().splitlines() if v.split()}
+ assert all("ngbs_sub_"+a in table for a in ("001764F0","00176840","00176E30","00177330","001EAA10"))
+ handlers=[n for n in table if n.startswith('ngbs_sub_')]
+ assert "ngbs_sub_002FD3E0" in handlers and len(handlers)>12 and all(table['ngb_reg_'+n[5:]][1:3]==['0000000000000030','T'] for n in handlers)
+ (out/'symbols.gz').write_bytes""")
  replace(" def comp(name,s,flags=[]):",""" def comp(name,s,flags=[]):
   if name=='opening_movie.c':
    flags=[*flags,'-DNGB_PROLOGUE_START=ngb_reg_sub_003443D0','-DNGB_PROLOGUE_CAPTION=ngb_reg_sub_00344AD0']
    link.insert(1,'-Wl,--wrap=ngb_reg_sub_003443D0,--wrap=ngb_reg_sub_00344AD0')
   flags=[*flags,'-DNGB_PLAYER_BUILD','-include',str(root/'player_diagnostics.h')]""")
- replace(" comp('threaded.cpp',renderer", " comp('files_bridge.c',(root/'files_bridge.c').read_text())\n comp('direct/platform.cpp',(root/'direct/platform.cpp').read_text())\n comp('threaded.cpp',renderer")
+ replace(" comp('threaded.cpp',renderer", " comp('shaders.cpp',Path('/work/src/d3d/gpu/shaders.cpp').read_text())\n comp('files_bridge.c',(root/'files_bridge.c').read_text())\n comp('direct/platform.cpp',(root/'direct/platform.cpp').read_text())\n comp('threaded.cpp',renderer")
  replace("bd_present_mark(); g_backend->Present", "if(NGB_DIAG) bd_present_mark(); g_backend->Present")
  replace("pt_flip(f);", "if(!NGB_DIAG)return;pt_flip(f);")
  replace("sdk/'libnx/default_icon.jpg'", "base/'branding/ngb-icon.jpg'")

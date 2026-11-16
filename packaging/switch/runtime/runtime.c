@@ -184,6 +184,26 @@ static void checkpoint_event(uint32_t va)
             ngb_frontend_menu_controls();
 #endif
         }
+#ifdef NGB_PLAYER_BUILD
+        extern void ngb_switch_sync_settings(void);
+        ngb_switch_sync_settings();
+        /* Refresh cached rows using the retail flag lookup, including earned flags
+         * when a temporary unlock is switched off. Never edit system.dat. */
+        static int previous[3]={-1,-1,-1};
+        const unsigned row[]={2,4,5};uint32_t list=MEM32(g_ebx);
+        for(unsigned i=0;i<3;i++){
+            extern int ngb_switch_setting(unsigned);
+            int on=ngb_switch_setting(26+i);
+            if(on!=previous[i] && (on || previous[i]>=0)){
+                uint32_t e=list+row[i]*8,flag=MEM32(e);
+                if(flag==10+i){
+                    uint32_t a=g_eax,c=g_ecx;g_ecx=flag;PUSH32(g_esp,0);sub_001DB520();
+                    MEM8(e+4)=MEM8(e+5)=(g_eax&255)!=0;g_eax=a;g_ecx=c;
+                }
+            }
+            previous[i]=on;
+        }
+#endif
         ngb_menu_draw(cursor);
         if (menu_cursor != cursor) {
             char line[80];

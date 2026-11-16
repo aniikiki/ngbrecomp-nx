@@ -1,0 +1,72 @@
+/* IDs 0..39 match the upstream menu. 44 is the upstream Bow Crosshair.
+ * Fixed platform rows are descriptive; never persist a value without a consumer. */
+enum { GRAPHICS,DISPLAY,SOUND,GAMEPLAY,CONTROLS,CHEATS,UNLOCKS,PAGES };
+static const char *const categories[PAGES]={"Graphics","Display","Sound","Gameplay","Controls","Cheats","Unlocks"};
+enum { SESSION=1, FIXED=2, BUTTON=4 };
+typedef struct {unsigned char page,id,initial,flags;const char *key,*label,*choices;} Preference;
+#define TOGGLE(p,i,k,l,d,f) {p,i,d,f,k,l,"Off|On"}
+#define BIND(i,n,k,l) {CONTROLS,i,n,BUTTON,k,l,"Up|Down|Left|Right|+|-|L Stick|R Stick|A|B|X|Y|R|L|ZL|ZR|None"}
+static const Preference settings[]={
+ {GRAPHICS,0,0,0,"scale","Render resolution","1x|2x"},
+ {GRAPHICS,1,0,0,"filter","Anisotropic filtering","Original|2x|4x|8x|16x"},
+ {GRAPHICS,2,0,0,"shadow","Shadow resolution","1x|2x|4x"},
+ {GRAPHICS,10,0,0,"msaa","Anti-aliasing","Off|2x|4x"},
+ TOGGLE(GRAPHICS,18,"smoother_glow","Smoother glow",0,0),
+ TOGGLE(GRAPHICS,29,"lower_detail","Lower detail under load",1,0),
+ TOGGLE(GRAPHICS,30,"thread","Multithreaded renderer",1,0),
+ {DISPLAY,7,0,0,"aspect","Aspect ratio","16:9 widescreen|4:3 original"},
+ {DISPLAY,6,0,FIXED,"window","Output resolution","1280 x 720"},
+ {DISPLAY,3,0,FIXED,"display","Display mode","Fullscreen"},
+ {DISPLAY,4,0,FIXED,"vsync","V-Sync","System managed"},
+ TOGGLE(DISPLAY,5,"fps","FPS counter",0,0),
+ TOGGLE(DISPLAY,24,"hud","HUD",1,0),
+ TOGGLE(DISPLAY,8,"skip_intro","Skip startup movie",0,0),
+ {SOUND,23,0,FIXED,"positional","Positional audio","Not supported"},
+ {SOUND,25,0,FIXED,"audio_out","Audio output mode","System managed"},
+ {GAMEPLAY,20,0,0,"quick_scale","Quick menu","Off|25%|50%|75%|100%"},
+ TOGGLE(GAMEPLAY,19,"quick_pause","Quick menu pause",1,0),
+ {GAMEPLAY,31,0,0,"intercept","Intercept","Off|Black|Hurricane Pack"},
+ TOGGLE(GAMEPLAY,33,"essence_charge","Essence-only charging",0,0),
+ TOGGLE(GAMEPLAY,34,"skip_cutscene","Skip any cutscene",0,0),
+ TOGGLE(GAMEPLAY,36,"responsive","Responsive menus",0,0),
+ TOGGLE(GAMEPLAY,43,"talisman_rebirth","Talisman of Rebirth",1,0),
+ TOGGLE(GAMEPLAY,44,"bow_crosshair","Bow crosshair",0,0),
+ TOGGLE(CONTROLS,46,"third_person","Start in third person",0,0),
+ {CONTROLS,47,2,0,"sensitivity","Camera sensitivity","50%|75%|100%|125%|150%|200%"},
+ TOGGLE(CONTROLS,48,"first_x","Invert first-person X",0,0),
+ TOGGLE(CONTROLS,49,"first_y","Invert first-person Y",0,0),
+ TOGGLE(CONTROLS,50,"third_x","Invert third-person X",0,0),
+ TOGGLE(CONTROLS,51,"third_y","Invert third-person Y",0,0),
+ TOGGLE(CONTROLS,52,"soft_reset","Start + Back resets game",1,0),
+ {CONTROLS,53,0,FIXED,"prompts","In-game button prompts","Original Xbox"},
+ BIND(76,16,"ninpo_button","Cast Ninpo (shortcut)"), BIND(77,16,"wind_button","Wind Run (shortcut)"),
+ BIND(78,0,"quick_up","Quick: previous category"), BIND(79,1,"quick_down","Quick: next category"),
+ BIND(80,2,"quick_left","Quick: previous item"), BIND(81,3,"quick_right","Quick: next item"),
+ BIND(82,8,"quick_ok","Quick: confirm"), BIND(83,9,"quick_cancel","Quick: cancel"),
+ BIND(84,16,"toggle_hud","Toggle HUD"),
+ BIND(68,8,"pad_a","Projectile"), BIND(69,9,"pad_b","Jump"),
+ BIND(70,10,"pad_x","Special attack"), BIND(71,11,"pad_y","Attack"),
+ BIND(72,12,"pad_black","Display map"), BIND(73,13,"pad_white","Karma window"),
+ BIND(74,14,"pad_lt","Guard"), BIND(75,15,"pad_rt","Center camera"),
+ BIND(64,4,"pad_start","Start"), BIND(65,5,"pad_back","Back"),
+ BIND(66,6,"pad_ls","Left stick click"), BIND(67,7,"pad_rs","Right stick click"),
+ BIND(60,0,"pad_up","D-pad up"), BIND(61,1,"pad_down","D-pad down"),
+ BIND(62,2,"pad_left","D-pad left"), BIND(63,3,"pad_right","D-pad right"),
+ TOGGLE(CHEATS,11,"health","Infinite health",0,SESSION),
+ TOGGLE(CHEATS,12,"ninpo","Infinite Ninpo",0,SESSION),
+ TOGGLE(CHEATS,13,"essence","Infinite essence",0,SESSION),
+ TOGGLE(CHEATS,15,"scarabs","Golden scarabs",0,SESSION),
+ TOGGLE(CHEATS,21,"items","Infinite items",0,SESSION),
+ TOGGLE(CHEATS,22,"projectiles","Infinite projectiles",0,SESSION),
+ TOGGLE(CHEATS,39,"one_hit","One-hit kill",0,SESSION),
+ TOGGLE(UNLOCKS,14,"difficulty","All difficulties",0,0),
+ TOGGLE(UNLOCKS,16,"costumes","All costumes",0,0),
+ TOGGLE(UNLOCKS,26,"missions","Missions",0,0),
+ TOGGLE(UNLOCKS,27,"arcade","Arcade Ninja Gaiden",0,0),
+ TOGGLE(UNLOCKS,28,"movies","Movie theater",0,0),
+ TOGGLE(UNLOCKS,32,"weapons","All weapons",0,SESSION),
+ TOGGLE(UNLOCKS,37,"armlets","All armlets",0,SESSION),
+ TOGGLE(UNLOCKS,38,"scrolls","All technique scrolls",0,SESSION)
+};
+#undef BIND
+#undef TOGGLE

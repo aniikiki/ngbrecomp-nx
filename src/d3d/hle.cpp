@@ -1,3 +1,6 @@
+#ifdef NGB_PLAYER_BUILD
+extern "C" void ngb_switch_frame(void);
+#endif
 // The title's Direct3D calls as state for the renderer (docs/renderer.md). Ported from
 // SCDA-XBERecomp's xdk/d3d8.cpp (see NOTICE) to Ninja Gaiden Black's XDK 5849 D3D8LTCG build:
 // its own calling conventions (src/d3d/d3d_funcs.h), vertex programs loaded into the GPU's
@@ -602,6 +605,9 @@ bool Before(int fn, Call c) {
             std::memcpy(&m22, &m[5], 4);
             if (n++ % 120 == 0) std::fprintf(stderr, "[ASPECT] projection m11 %.4f m22 %.4f aspect %.4f\n", m11, m22, m22 / m11);
         }
+#ifdef NGB_PLAYER_BUILD
+        ngb_switch_frame();
+#endif
         if (g_backend) g_backend->Present(g_state.rt);
         break;
     case D3DF_D3DDevice_SetGammaRamp:

@@ -187,6 +187,14 @@ void ngb_scanout_publish_movie(void)
 void ngb_scanout_blit(uint32_t *dst, unsigned stride, unsigned w, unsigned h)
 {
     if (!dst || !ngb_scanout_ready() || stride<w || w<8 || h<8) return;
+#ifdef NGB_PLAYER_BUILD
+    extern int ngb_settings_standard_aspect(void);
+    if(w==1280 && h==720 && ngb_settings_standard_aspect()){
+        for(unsigned y=0;y<h;y++)for(unsigned x=0;x<160;x++)
+            dst[(size_t)y*stride+x]=dst[(size_t)y*stride+1120+x]=0xff000000;
+        dst+=160;w=960;
+    }
+#endif
     /* The Xbox widescreen signal is anamorphic: all 720x480 source pixels
      * map onto the Switch's 1280x720 framebuffer. No overscan or crop. */
     const uint32_t (*pixels)[NGB_SCAN_W]=frames[ngb_latest(&snapshots)];

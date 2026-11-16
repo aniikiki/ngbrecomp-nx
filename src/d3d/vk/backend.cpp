@@ -1,3 +1,4 @@
+#include "vk/depth_bias.h"
 #ifndef NGB_DIAG
 #define NGB_DIAG 1
 #endif
@@ -763,6 +764,7 @@ private:
         void* mapped{};
         bool queued{};
     } scanout_[2];
+    Image scanout_display_;
     void QueueScanout(const Surface& front);
 #endif
     void Dump(Target& t, const char* name = nullptr);
@@ -1218,6 +1220,7 @@ VulkanBackend::~VulkanBackend() {
         d_.vkDeviceWaitIdle(dev_);
     }
 #ifdef NGB_DIRECT3D
+    DestroyImage(scanout_display_);
     if (geometry_buffer_) vmaDestroyBuffer(vma_, geometry_buffer_, geometry_memory_);
     for (auto& slot : scanout_)
         if (slot.buffer) vmaDestroyBuffer(vma_, slot.buffer, slot.allocation);
@@ -3345,6 +3348,22 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     if (noshadow && (info[0].shadow || info[1].shadow || info[2].shadow || info[3].shadow)) return;
     PixelKey pk = MakePixelKey(s, info);
     pk.quad = quad;
+    // The heat haze over lava -- fixed-function sprites blended by their alpha, reading a 512x256 copy of the
+    // screen on stage 0 at projected coordinates, clamped -- reads a little past the copy's right edge; clamped there,
+    // the last column ran down the right of the screen as a streaky band, the console's too (#55). Near the copy's
+    // edges the haze's move toward the edge fades out (the shader, TexFetch's caller): it is drawn up to the edge,
+    // less moved, and never reads past the picture (left out there instead, as akirahayabusa's ngb-pc-native-port
+    // does, the strip had no haze; mirrored, it showed the picture's mirror). The draws are found as his are:
+    // fixed-function stages reading a colour target at projected, clamped coordinates. NGB_D3D_HAZE_CLAMP=1: as the
+    // console.
+    static const bool haze_clamp = std::getenv("NGB_D3D_HAZE_CLAMP") != nullptr;
+    if (!haze_clamp && !pk.programmable && SimpleState(s, kMBlendEnable) && SimpleState(s, kMSrcBlend) == 0x302 &&
+        SimpleState(s, kMDestBlend) == 0x303)
+        for (int i = 0; i < 4; i++)
+            if (from_target[i] && !info[i].shadow && info[i].kind == kTex2D && ((pk.proj >> i) & 1) &&
+                s.tss[size_t(i)][kTssAddressU] == 3 && s.tss[size_t(i)][kTssAddressV] == 3) {
+                pk.alphakill |= 1u << (4 + i);
+            }
     if (sprite && !pk.programmable) {   // stage 3 alone, whatever the stages before it hold (PixelHlsl)
         const auto& t = s.tss[3];
         uint32_t v[9] = {t[kTssColorOp], t[kTssColorArg1], t[kTssColorArg2], t[kTssColorArg0], t[kTssAlphaOp],
@@ -3469,7 +3488,22 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         }
         if (a.topology == Topology::Triangles && SimpleState(s, kMSolidOffsetEnable)) {
             k.zbias = int32_t(std::lround(Bits(SimpleState(s, kMDepthOffset)) * 16777215.0f / s.zscale));
-            k.zslope = Bits(SimpleState(s, kMSlopeScale));
+            // The slope part is in the console's pixels: depth changes per pixel as the triangle is drawn, at the
+            // render scale a fraction of what it is per console pixel, so the bias at it the same fraction -- the
+            // lava light laid over the cave walls (blended, depth test LEQUAL) fell back onto the walls above 1x and
+            // fought them in a flicker of specks (#213). At the target's scale, as the pull below.
+            const Target* zt = rt ? rt : ds;   // (a depth-only pass: its depth target's scale)
+            float zs = zt ? float(zt->img.w) / float(std::max<uint32_t>(zt->gw, 1)) : 1.0f;
+            // and three times the game's slope part where nothing writes depth (#213): the lava light laid over the
+            // cave walls specked at grazing angles, its margin too small (twice left a few in the Magma and Ice
+            // Caverns); what writes depth (shadow casters) as the game
+            // sets it. NGB_D3D_ZSLOPE_X=<n>: n times instead (1: as the game sets it; kept within 1..8)
+            static const float zslope_x = [] {
+                const char* e = std::getenv("NGB_D3D_ZSLOPE_X");
+                float x = e ? float(std::atof(e)) : 3.0f;
+                return x >= 1.0f && x <= 8.0f ? x : (e ? 1.0f : 3.0f);
+            }();
+            k.zslope = gpu::ScaledSlopeBias(Bits(SimpleState(s, kMSlopeScale)), zs, k.zwrite, zslope_x);
         }
         if (SectionPull() > 0 && a.topology == Topology::Triangles && k.zen && k.has_ds) {   // a pull of 0 turns it off
             // by the vertex buffer (its header in the towers' chunk), not the texture: every pass over the same mesh -- the
@@ -4603,7 +4637,7 @@ void VulkanBackend::TraceFrame(Target& t) {
 #ifdef NGB_DIRECT3D
 void VulkanBackend::QueueScanout(const Surface& front) {
     Target* t = EnsureTarget(front, false);
-    if (!t || t->img.w != NGB_SCAN_W || t->img.h != NGB_SCAN_H) return;
+    if (!t || (t->gw != NGB_SCAN_W && t->gw != 640) || t->gh != NGB_SCAN_H) return;
     auto& out = scanout_[slot_];
     if (!out.buffer) {
         VkBufferCreateInfo buffer{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -4619,10 +4653,24 @@ void VulkanBackend::QueueScanout(const Surface& front) {
     }
     EndRendering();
     Barrier(t->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    Image* source=&t->img;
+    if(source->w!=NGB_SCAN_W || source->h!=NGB_SCAN_H || !qk_.layer.empty()){
+        auto& display=scanout_display_;
+        if(!display.image && !CreateImage(display,kColorFormat,NGB_SCAN_W,NGB_SCAN_H,1,1,false,false,
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
+            ngb_renderer_fatal("Cannot allocate scanout display");
+        Barrier(display,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkImageBlit b{};b.srcSubresource=b.dstSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};
+        b.srcOffsets[1]={int32_t(source->w),int32_t(source->h),1};b.dstOffsets[1]={NGB_SCAN_W,NGB_SCAN_H,1};
+        d_.vkCmdBlitImage(cmd_,source->image,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            display.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&b,VK_FILTER_LINEAR);
+        if(!qk_.layer.empty())QuickMenu(display);
+        Barrier(display,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);source=&display;
+    }
     VkBufferImageCopy copy{};
     copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     copy.imageExtent = {NGB_SCAN_W, NGB_SCAN_H, 1};
-    d_.vkCmdCopyImageToBuffer(cmd_, t->img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, out.buffer, 1, &copy);
+    d_.vkCmdCopyImageToBuffer(cmd_, source->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, out.buffer, 1, &copy);
     out.queued = true;
 }
 #endif

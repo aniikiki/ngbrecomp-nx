@@ -12,7 +12,7 @@ plays at a steady 60 fps on modest hardware (including the Steam Deck) and adds 
 resolutions, widescreen and ultrawide, keyboard and mouse, rebindable controls and more.
 
 **You need your own copy of the game.** This project contains none of the game's data (graphics,
-sound, movies, text): on first start it asks for your disc image and installs the game from it. It is made for the **retail USA
+sound, movies, text). The PC version asks for your disc image on first start; for Switch, see [Switch 安装指南](#nintendo-switch). It is made for the **retail USA
 release** (NTSC-U, title ID `5443000D`) and checks for it.
 
 ## Screenshots
@@ -58,6 +58,16 @@ release** (NTSC-U, title ID `5443000D`) and checks for it.
 
 On every system, the first start after installing takes longer to load (the shaders are prepared then and
 kept); later starts are quicker.
+
+### Nintendo Switch
+
+首次安装需要自己的原版 Xbox《Ninja Gaiden Black》美版零售光盘镜像（NTSC-U）和 Switch 版程序 `ngb-startup.nro`。Switch 版读取解包后的游戏文件。即使 ISO 超过 4 GiB，也不用分卷或把镜像复制到 FAT32 格式的 SD 卡。
+
+1. 在电脑上用 Chrome 或 Edge 打开 [XISO Tool](https://xiso.antangelo.com/)，选择 **Unpack（解包）**。选中游戏 ISO，再选一个空文件夹作为输出目录，等待解包完成。解包在本机进行，不会上传镜像。
+2. 在 SD 卡上创建 `/switch/ngb-runtime/disc/`，把输出文件夹**里面的全部内容**复制进去，保留子目录。打开 SD 卡上的 `disc` 就应该看到 `default.xbe` 和 `movie/`；如果中间多了一层游戏名文件夹，把里面的内容移上来。
+3. 将 `ngb-startup.nro` 放到 SD 卡的 `/switch/ngb-runtime/`。把 SD 卡放回 Switch，从 Homebrew Menu 启动 **Ninja Gaiden Black**。
+
+以后更新只需替换 `ngb-startup.nro`，不用重新解包，也不用移动存档。
 
 ### Linux and Steam Deck
 
