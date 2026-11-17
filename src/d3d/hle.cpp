@@ -681,6 +681,10 @@ extern "C" [[noreturn]] void ngb_renderer_fatal(const char* detail);  // src/ing
 extern "C" int ngb_pc_setting(int which);                            // src/ingame_menu.c
 
 bool g_started;
+#ifdef NGB_DIRECT3D
+// Keep the device and its caches while Sofdec uses the guest framebuffer.
+std::unique_ptr<gpu::Backend> prologue_backend;
+#endif
 
 void Start() {
     g_started = true;
@@ -694,6 +698,10 @@ void Start() {
     // the surfaces, shader handles and state needed for the first 3D draw.
     g_mirror = false;
     if (!ngb_scene_active) return;
+    if (prologue_backend) {
+        g_backend = std::move(prologue_backend);
+        return;
+    }
 #endif
     g_backend = gpu::CreateBackend();
     if (g_backend && !g_backend->Init(640, 480)) {
@@ -811,11 +819,27 @@ extern "C" void d3d_hle_after(int fn, const uint32_t regs[8]) {
 }
 
 #ifdef NGB_DIRECT3D
+extern "C" void ngb_direct_park_prologue(void)
+{
+    ngb_direct_finish_put();
+    // SetRenderState_Simple can be taken by HLE without emitting FIFO words.
+    // Rehydrate the boot compositor from the same XDK table as SyncDeferred.
+    const auto* methods = static_cast<const uint32_t*>(HostPtr(kSimpleEncode));
+    const auto* states = static_cast<const uint32_t*>(HostPtr(kRenderState));
+    for (uint32_t i = 0; i < gpu::kRsDeferredFirst; ++i) {
+        uint32_t m = methods[i] & 0x1ffc;
+        if ((m >= 0x300 && m < 0x400) || m == 0x1d78)
+            ngb_prologue_simple_state(m, states[i]);
+    }
+    prologue_backend = std::move(g_backend);
+    captured_index_stack = 0;
+}
 extern "C" void ngb_direct_close(void)
 {
     captured_index_stack = 0;
     compact_indices = compact_draws = 0;
     ngb_direct_index_close();
+    prologue_backend.reset();
     g_backend.reset();
     ngb_render_threaded = 0;
     g_state = gpu::State{};

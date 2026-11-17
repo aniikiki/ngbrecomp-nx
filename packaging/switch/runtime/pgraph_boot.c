@@ -1,3 +1,4 @@
+#include "mission_perf.h"
 #include "pgraph_boot.h"
 #include "nv2a_vk/xemu/nv2a_regs.h"
 #include "runtime.h"
@@ -16,6 +17,13 @@ static struct {
 } state;
 
 #include "inline_draw.inc"
+
+#ifdef NGB_DIRECT3D
+void ngb_prologue_simple_state(uint32_t method, uint32_t value)
+{
+    state.methods[method / 4] = value;
+}
+#endif
 
 void ngb_pgraph_reset(void) { memset(&state, 0, sizeof(state)); }
 
@@ -146,7 +154,11 @@ void ngb_pgraph_method(uint32_t *r, uint32_t cls, uint32_t m, uint32_t v)
         if (m==NV097_SET_BEGIN_END) {
             if (v==6 && !state.primitive) { state.primitive=v; state.inline_count=0; return; }
             if (v || !state.primitive) ngb_stop("unsupported primitive",v);
-            draw_strip();
+            if (MP_ACTIVE) {
+                uint64_t t=ngb_elapsed_ns();
+                draw_strip();
+                MP_ADD(MP_STRIP,ngb_elapsed_ns()-t,0);
+            } else draw_strip();
             state.primitive=0;
             return;
         }
@@ -201,6 +213,14 @@ void ngb_pgraph_method(uint32_t *r, uint32_t cls, uint32_t m, uint32_t v)
             case NV097_SET_FLIP_WRITE: off = NV_PGRAPH_SURFACE; mask = NV_PGRAPH_SURFACE_WRITE_3D; v <<= 20; break;
             case NV097_SET_FLIP_MODULO: off = NV_PGRAPH_SURFACE; mask = NV_PGRAPH_SURFACE_MODULO_3D; v <<= 28; break;
             case NV097_SET_PROVOKING_VERTEX: off = NV_PGRAPH_CONTROL_3; mask = NV_PGRAPH_CONTROL_3_PROVOKING_VERTEX; break;
+            /* Mission setup emits these Kelvin state writes before its first
+             * indexed draw, while the startup compositor still owns PGRAPH. */
+            case NV097_SET_EYE_VECTOR: case NV097_SET_EYE_VECTOR+4: case NV097_SET_EYE_VECTOR+8:
+                off=NV_PGRAPH_EYEVEC0+(m-NV097_SET_EYE_VECTOR);break;
+            case NV097_SET_SPECULAR_FOG_FACTOR: case NV097_SET_SPECULAR_FOG_FACTOR+4:
+                off=NV_PGRAPH_SPECFOGFACTOR0+(m-NV097_SET_SPECULAR_FOG_FACTOR);break;
+            case NV097_SET_DOT_RGBMAPPING: off=NV_PGRAPH_SHADERCTL;mask=0xfff;break;
+            case NV097_SET_SHADER_CLIP_PLANE_MODE: off = NV_PGRAPH_SHADERCLIPMODE; break;
             case NV097_SET_SHADER_OTHER_STAGE_INPUT: off = NV_PGRAPH_SHADERCTL; mask = 0x0ffff000; break;
             case NV097_SET_SHADOW_ZSLOPE_THRESHOLD: off = NV_PGRAPH_SHADOWZSLOPETHRESHOLD; break;
             case NV097_SET_TRANSFORM_CONSTANT_LOAD:

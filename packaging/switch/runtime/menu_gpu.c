@@ -1,3 +1,4 @@
+#include "mission_perf.h"
 #include "menu_gpu.h"
 #include "runtime.h"
 #include "scanout.h"
@@ -22,6 +23,7 @@ static struct {
     int enabled, attempted, ready;
     GLuint fbo, target, vertices;
     unsigned stride, replace, draws, batches;
+    int left,top,right,bottom;
     uint64_t read_ns;
     struct alpha_texture textures[SLOTS];
 } gpu;
@@ -165,7 +167,26 @@ void ngb_menu_gpu_flush(void)
     if (!ngb_menu_dirty_end) return;
     uint64_t start = ngb_elapsed_ns();
     glPixelStorei(GL_PACK_ROW_LENGTH,gpu.stride);
-    glReadPixels(0,0,NGB_SCAN_W,NGB_SCAN_H,GL_RGBA,GL_UNSIGNED_BYTE,(void *)ngb_menu_dirty_begin);
+    // CPU pixels outside the overlay bounds still contain the uploaded input.
+    // PACK_ROW_LENGTH retains the guest pitch even for a narrow subrectangle.
+    if(gpu.left<gpu.right && gpu.top<gpu.bottom){
+        uint32_t *dst=(uint32_t *)ngb_menu_dirty_begin+gpu.top*gpu.stride+gpu.left;
+        uint64_t mt=MP_ACTIVE?ngb_elapsed_ns():0;
+#ifdef NGB_PLAYER_BUILD
+        static unsigned sample_seq;
+        uint64_t finished=0;
+        if(mt && ngb_mission_gl_split && (++sample_seq%61)==0){
+            glFinish();finished=ngb_elapsed_ns();
+            MP_ADD(MP_FINISH,finished-mt,0);
+        }
+#endif
+        glReadPixels(gpu.left,gpu.top,gpu.right-gpu.left,gpu.bottom-gpu.top,GL_RGBA,GL_UNSIGNED_BYTE,dst);
+#ifdef NGB_PLAYER_BUILD
+        if(finished)MP_ADD(MP_POST_FINISH,ngb_elapsed_ns()-finished,0);
+#endif
+        MP_ADD(MP_READ,ngb_elapsed_ns()-mt,(gpu.right-gpu.left)*(gpu.bottom-gpu.top));
+        (void)mt;
+    }
     ngb_menu_dirty_begin = ngb_menu_dirty_end = 0;
     GLenum error = glGetError();
     if (error) ngb_stop("menu overlay readback failed",error);
@@ -188,6 +209,16 @@ void ngb_menu_gpu_prepare(void)
 
 void ngb_menu_gpu_enable(void) { gpu.enabled = 1; }
 
+static void upload_rect(const uint32_t *dst,unsigned stride,int l,int t,int r,int b)
+{
+    if(l<r && t<b){
+        uint64_t mt=MP_ACTIVE?ngb_elapsed_ns():0;
+        glTexSubImage2D(GL_TEXTURE_2D,0,l,t,r-l,b-t,GL_RGBA,GL_UNSIGNED_BYTE,dst+t*stride+l);
+        MP_ADD(MP_UPLOAD,ngb_elapsed_ns()-mt,(r-l)*(b-t));
+        (void)mt;
+    }
+}
+
 int ngb_menu_gpu_overlay(const struct screen_vertex v[4], const uint8_t *texture,
                          unsigned tw, unsigned th, uint32_t *dst, unsigned stride,
                          unsigned width, unsigned height, int additive)
@@ -202,18 +233,42 @@ int ngb_menu_gpu_overlay(const struct screen_vertex v[4], const uint8_t *texture
     if (ngb_menu_dirty_begin != address || stride != gpu.stride) ngb_menu_gpu_flush();
     GLuint mask=alpha_mask(texture,tw,th);
     if (!mask) ngb_stop("menu alpha texture upload failed",tw);
-    if (!ngb_menu_dirty_end) {
+    int l=width,t=height,r=0,b=0;
+    // Include a guard pixel for the NV2A half-pixel transform and GL rounding.
+    for(unsigned i=0;i<4;i++){
+        int x=(int)v[i].x,y=(int)v[i].y;
+        if(x-1<l)l=x<=1?0:x-1;
+        if(y-1<t)t=y<=1?0:y-1;
+        if(x+2>r)r=x+2>(int)width?(int)width:x+2;
+        if(y+2>b)b=y+2>(int)height?(int)height:y+2;
+    }
+    if(l>=r || t>=b)return 1;
+    if(!ngb_menu_dirty_end || l<gpu.left || r>gpu.right || t<gpu.top || b>gpu.bottom){
         glBindTexture(GL_TEXTURE_2D,gpu.target);
         glPixelStorei(GL_UNPACK_ROW_LENGTH,stride);
-        glTexSubImage2D(GL_TEXTURE_2D,0,0,0,width,height,GL_RGBA,GL_UNSIGNED_BYTE,dst);
+        if(!ngb_menu_dirty_end){
+            upload_rect(dst,stride,l,t,r,b);
+        }else{
+            // Initialize just the exposed strips of the enlarged rectangle.
+            // The old rectangle may already contain several blended draws.
+            if(l>gpu.left)l=gpu.left;
+            if(r<gpu.right)r=gpu.right;
+            if(t>gpu.top)t=gpu.top;
+            if(b<gpu.bottom)b=gpu.bottom;
+            upload_rect(dst,stride,l,t,r,gpu.top);
+            upload_rect(dst,stride,l,gpu.bottom,r,b);
+            upload_rect(dst,stride,l,gpu.top,gpu.left,gpu.bottom);
+            upload_rect(dst,stride,gpu.right,gpu.top,r,gpu.bottom);
+        }
         glPixelStorei(GL_UNPACK_ROW_LENGTH,0);
-        gpu.stride = stride;
-        ngb_menu_dirty_begin = address; ngb_menu_dirty_end = end;
+        gpu.left=l;gpu.top=t;gpu.right=r;gpu.bottom=b;gpu.stride=stride;
+        ngb_menu_dirty_begin=address;ngb_menu_dirty_end=end;
     }
     glBindTexture(GL_TEXTURE_2D,mask);
     glBufferData(GL_ARRAY_BUFFER,sizeof(*v)*4,v,GL_STREAM_DRAW);
     glBlendFunc(GL_SRC_ALPHA,additive ? GL_ONE : GL_ONE_MINUS_SRC_ALPHA);
     glDrawArrays(GL_TRIANGLE_STRIP,0,4);
+    MP_ADD(MP_GL_DRAW,0,0);
     ++gpu.draws;
     return 1;
 }

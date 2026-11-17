@@ -12,6 +12,7 @@ uint32_t ngb_file_open(const char *path, uint32_t root, uint32_t access,
                        uint32_t share, uint32_t disposition, uint32_t options,
                        uint32_t *handle, uint32_t *information);
 uint32_t ngb_file_disposition(uint32_t handle, int pending);
+uint32_t ngb_file_wait_status(uint32_t handle);
 uint32_t ngb_file_flush(uint32_t handle);
 uint32_t ngb_file_close(uint32_t handle);
 const char *ngb_file_basename(uint32_t handle);

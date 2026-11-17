@@ -1,3 +1,4 @@
+#include "mission_perf.h"
 #include "services.h"
 /* Register subset for MCPX USB startup and root-hub interrupts. All device
  * state belongs to the guest worker except the sampled pad presence flag. */
@@ -5,6 +6,7 @@
 #include "menu_gpu.h"
 #include "frame_exchange.h"
 #include "scanout.h"
+#include "scene.h"
 #include "nv2a_boot.h"
 #include "contiguous.h"
 #include "runtime.h"
@@ -16,6 +18,8 @@
 #include "recomp_settings.h"
 static uint32_t settings_label;
 static bool settings_confirm_held;
+static uint64_t exit_draw_ns; // Guest thread only.
+void ngb_pause_tab_seen(unsigned row){exit_draw_ns=row==5?ngb_elapsed_ns():0;}
 #endif
 #include "usb/usb_gamepad.h"
 #include <string.h>
@@ -123,6 +127,11 @@ static void sample_menu_frame(void)
         menu_flips=0;
         change_ns=0;
     }
+#ifdef NGB_DIRECT3D
+    /* A menu draw or completed prologue can request ownership of the next
+     * frame. A title-screen strip by itself cannot trigger the handoff. */
+    if (!ngb_scene_active) ngb_scene_menu_flip(menu_drawn);
+#endif
     if (!menu_drawn) return;
     unsigned edges=atomic_exchange(&menu_edges,0);
     unsigned held=reports[ngb_latest(&pad_samples)][2]&15;
@@ -156,6 +165,7 @@ static void sample_menu_frame(void)
 
 void ngb_pad_flip(void)
 {
+    MP_ADD(MP_FLIP,0,0);
     sample_menu_frame();
     if (!warning_armed || warning_done) return;
     if (atomic_exchange(&start_edge, false)) {
@@ -214,6 +224,10 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     memcpy(out,reports[ngb_latest(&pad_samples)],20);
     if (atomic_load(&menu_input)) out[2]=(out[2]&~15u)|menu_dpad;
 #ifdef NGB_PLAYER_BUILD
+    int pause_state=ngb_fast_ram?ngb_fast_ram[0x7F1B12]:0;
+    int exit_tab=(pause_state==2 || pause_state==3) && ngb_fast_ram[0xDA41D1]==5 &&
+                 exit_draw_ns && ngb_elapsed_ns()-exit_draw_ns<250000000ull;
+    if(ngb_switch_exit_report(exit_tab,out))return 20;
     bool play=ngb_fast_ram && ngb_fast_ram[0x7F1B12]==1 && !ngb_fast_ram[0x7F1B11] &&
         !ngb_fast_ram[0xDB9AD5] && (ngb_fast_ram[0xDB9894]==2 || ngb_fast_ram[0xDB9894]==3) && !atomic_load(&menu_input);
     atomic_store(&quick_play,play);
@@ -268,6 +282,7 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     unsigned routed=(held & ~face_swapped) | ((face_swapped&5)<<1) | ((face_swapped&10)>>1);
     for(unsigned i=0;i<4;i++) out[4+i]=(routed&(1u<<i))?255:0;
     if (replay_start) out[2] |= 16;
+    MP_ADD(MP_PAD,0,out[2]|(routed<<8));
     return 20;
 }
 

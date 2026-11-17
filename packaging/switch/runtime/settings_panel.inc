@@ -7,6 +7,9 @@
 #include "../../../src/quick_select.h"
 enum { PANEL=1u<<16,SAVE_ERROR=1u<<17, COUNT=sizeof settings/sizeof settings[0] };
 static atomic_uint panel, revision, aim;
+enum { EXIT_PANEL=1u<<18, EXIT_CONFIRM=1u<<19, EXIT_ERROR=1u<<20 };
+static atomic_bool exit_preview,exit_resume,exit_return_boot;
+static const char *exit_program_path;
 static atomic_uchar value[85];
 static int launch_aspect,launch_thread;
 static int choices(const Preference *p) {int n=1;for(const char *s=p->choices;*s;s++)n+=*s=='|';return n;}
@@ -29,7 +32,7 @@ static unsigned saved_choice(const Preference *p,unsigned id,unsigned v){return 
 void ngb_switch_toggle_hud(void){if(prefs_save(24,!pref(24)))atomic_fetch_add(&revision,1);}
 int ngb_settings_glow(void){return pref(18);}
 int ngb_settings_standard_aspect(void){return launch_aspect;}
-int ngb_settings_skip_intro(void){return pref(8);}
+int ngb_settings_skip_intro(void){return pref(8) || atomic_load(&exit_return_boot);}
 int ngb_bind_third_person_start(void){return pref(46);}
 float ngb_bind_camera_boost(void){int pct=ngb_switch_setting(47);return pct>100?pct/100.f:1.f;}
 int ngb_movie_active(void){return ngb_movie_owns_input();}
@@ -116,6 +119,25 @@ static bool settings_input(PadState *pad)
         if (!(held&controls)) { armed=closing=false;atomic_store(&panel,0); }
     } else if (!armed) {
         if (!(held&controls)) armed=true;
+    } else if(view&EXIT_PANEL){
+        unsigned row=view&3;
+        if(down&HidNpadButton_B){
+            if(view&(EXIT_CONFIRM|EXIT_ERROR))view=EXIT_PANEL|row;else closing=true;
+        }else if(view&EXIT_ERROR){ /* B returns to the choices. */ }
+        else if(!(view&EXIT_CONFIRM) && (down&(HidNpadButton_AnyUp|HidNpadButton_AnyDown))){
+            view=EXIT_PANEL|((row+((down&HidNpadButton_AnyUp)?2:1))%3);
+        }else if(down&HidNpadButton_A){
+            if(!row){atomic_store(&exit_resume,true);closing=true;}
+            else if(!(view&EXIT_CONFIRM))view|=EXIT_CONFIRM;
+            else if(row==1){
+                char args[1024];int n=snprintf(args,sizeof args,"\"%s\" --return-to-title",exit_program_path);
+                struct stat file;
+                if(n<0 || (size_t)n>=sizeof args || stat(exit_program_path,&file) || !S_ISREG(file.st_mode) || !envHasNextLoad() ||
+                   R_FAILED(envSetNextLoad(exit_program_path,args)))view=EXIT_PANEL|EXIT_ERROR|row;
+                else atomic_fetch_or(&commands,EXIT_GAME);
+            }else atomic_fetch_or(&commands,EXIT_GAME);
+        }
+        atomic_store(&panel,view);
     } else {
         unsigned page=(view>>8)&255,row=view&255,start=0,n=PAGES;
         if(page){while(start<COUNT && settings[start].page!=page-1)start++;
@@ -156,6 +178,36 @@ static void panel_text(u32 *dst,unsigned stride,int x,int y,const char *s,u32 fg
         x+=w;
     }
 }
+/* Only the guest USB consumer reads retail RAM. Intercept the select
+ * press before the original Exit action closes the pause menu. */
+int ngb_switch_exit_report(int tab,uint8_t *report){
+    static bool held;
+    bool select=report[4]!=0;
+    bool edge=select && !held;held=select;
+    atomic_store_explicit(&exit_preview,tab,memory_order_relaxed);
+    if(!tab)atomic_store(&exit_resume,false);
+    if(tab && atomic_load(&exit_resume)){
+        memset(report+2,0,18);report[2]=16;return 1;
+    }
+    if(tab && edge && !atomic_load(&panel))atomic_store(&panel,EXIT_PANEL);
+    if(atomic_load(&panel)&EXIT_PANEL){memset(report+2,0,18);return 1;}
+    return 0;
+}
+static void exit_contents(u32 *dst,unsigned stride,unsigned view){
+    const char *rows[]={"Return to Game","Return to Main Menu","Quit Game"};
+    unsigned row=view&3;
+    for(unsigned y=215;y<505;y++)for(unsigned x=345;x<935;x++)
+        dst[y*stride+x]=view && y>=277+row*50 && y<320+row*50?0xff424143:0xff211d1d;
+    panel_text(dst,stride,380,227,"EXIT",0xff80c7eb);
+    for(unsigned i=0;i<3;i++)panel_text(dst,stride,388,280+50*i,rows[i],~0u);
+    const char *hint=!view?"A: Choose     Left / Right: Tabs":view&EXIT_ERROR?"Cannot restart here. B: Back":
+       view&EXIT_CONFIRM?"Unsaved progress will be lost. A: Yes   B: No":"Up / Down: Select     A: Confirm     B: Back";
+    panel_text(dst,stride,355,455,hint,0xff80c7eb);
+}
+static void draw_exit_panel(Framebuffer *fb,unsigned view){
+    u32 bytes,*dst=framebufferBegin(fb,&bytes);ngb_scanout_blit(dst,bytes/4,1280,720);
+    exit_contents(dst,bytes/4,view);framebufferEnd(fb);
+}
 static void draw_settings(Framebuffer *fb,unsigned view)
 {
     u32 bytes,*dst=framebufferBegin(fb,&bytes);unsigned stride=bytes/4;
@@ -188,6 +240,7 @@ static void draw_settings(Framebuffer *fb,unsigned view)
 }
 
 static void game_overlay(u32 *dst,unsigned stride){
+    if(atomic_load_explicit(&exit_preview,memory_order_relaxed))exit_contents(dst,stride,0);
     unsigned bow=atomic_load(&aim);
     if(bow && bow_loaded && pref(44) && pref(24) && !ngb_movie_owns_input()){
         int offset=bow==2?0:9;

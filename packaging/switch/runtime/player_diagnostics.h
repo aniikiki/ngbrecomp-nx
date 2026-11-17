@@ -7,3 +7,7 @@ extern int ngb_diagnostics_enabled; /* Set before starting either worker. */
 }
 #endif
 #define NGB_DIAG ngb_diagnostics_enabled
+
+#if defined(NGB_PLAYER_BUILD) && defined(__cplusplus)
+#include "mission_perf.h"
+#endif

@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "runtime.h"
 #include "scanout.h"
+#include "scene.h"
 #include "files.h"
 #include "ohci_boot.h"
 #ifdef NGB_PLAYER_BUILD
@@ -18,6 +19,8 @@
 #include <libavcodec/avcodec.h>
 #include <libavutil/mathematics.h>
 #include <libswscale/swscale.h>
+
+#include "movie_audio.inc"
 
 static const char *selected;
 static bool guest_prologue;
@@ -46,6 +49,9 @@ void ngb_movie_displayed(void)
 
 void ngb_select_movie(uint32_t address)
 {
+#ifdef NGB_DIRECT3D
+    if (guest_prologue) ngb_scene_end_prologue();
+#endif
     seq_close();
     selected = NULL;
     guest_prologue=false;
@@ -62,6 +68,9 @@ void ngb_select_movie(uint32_t address)
                 if (strcasecmp(name,titles[j])) continue;
                 selected=titles[j];
                 guest_prologue=!strcmp(selected,"ninja_gaiden.sfd");
+#ifdef NGB_DIRECT3D
+                if (guest_prologue) ngb_scene_begin_prologue();
+#endif
                 selected_ns=ngb_elapsed_ns();
                 selection_edge=ngb_movie_skip_edges();
                 atomic_store(&owns_input,true);
@@ -81,7 +90,7 @@ static int next_packet(FILE *file, uint8_t sector[2048+AV_INPUT_BUFFER_PADDING_S
     while (fread(sector,1,2048,file)==2048) {
         if (!memcmp(sector,"\0\0\1\xb9",4)) return 0;
         if (memcmp(sector,"\0\0\1\xba",4) || memcmp(sector+12,"\0\0\1",3)) break;
-        if (sector[15]!=0xe0) continue;
+        if (sector[15]!=0xe0 && sector[15]!=0xc0) continue;
         size_t end=18u + ((unsigned)sector[16]<<8) + sector[17], pos=18;
         if (end>2048) break;
         while (pos<end && sector[pos]==255) ++pos;
@@ -93,6 +102,7 @@ static int next_packet(FILE *file, uint8_t sector[2048+AV_INPUT_BUFFER_PADDING_S
         else if ((flags>>4)==3) pos+=10;
         else break;
         if (pos>=end) break;
+        if(sector[15]==0xc0){movie_audio_packet(sector+pos,(unsigned)(end-pos));continue;}
         memset(sector+end,0,AV_INPUT_BUFFER_PADDING_SIZE);
         *payload=sector+pos;
         return (int)(end-pos);
@@ -234,6 +244,9 @@ uint32_t ngb_movie_status(uint32_t status)
             if (selection_edge==ngb_movie_skip_edges()) return status;
             status=3;
         } else if (status==0) return status;
+#ifdef NGB_DIRECT3D
+        ngb_scene_end_prologue();
+#endif
         guest_prologue=false;
         selected=NULL;
         atomic_store(&owns_input,false);
@@ -264,7 +277,7 @@ uint32_t ngb_movie_status(uint32_t status)
     sws_freeContext(movie.colors);
     av_frame_free(&movie.frame);
     avcodec_free_context(&movie.codec);
-    fclose(file);
+    fclose(file);movie_audio_end();
     char log[144];
     snprintf(log,sizeof(log),"Opening movie %s frames=%u elapsed_ms=%llu displayed=%u late=%u",
         ngb_stop_requested() ? "cancelled" : movie.skipped ? "skipped" : complete ? "EOF" : "fallback",movie.count,

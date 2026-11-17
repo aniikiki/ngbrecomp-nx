@@ -514,7 +514,7 @@ static void kernel_call(void)
         g_eax=0; g_esp+=16;
         return;
     }
-    if (thread_object_call(ordinal) || event_call(ordinal)) return;
+    if (thread_object_call(ordinal) || event_call(ordinal) || other_handle_wait(ordinal)) return;
     if (ordinal == 255 && thread_count) { create_worker(); return; }
     if (ordinal == 258 && running_worker) {
         write32(workers[running_worker].object+0x120,arg(0));

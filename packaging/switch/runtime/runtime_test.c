@@ -1017,7 +1017,10 @@ static void check_worker_reuse(void)
     uint32_t first=read32(args[0]), obj=workers[1].object;
     invoke(246,(uint32_t[]){first,0,0x6f08},3);
     CHECK(!g_eax && read32(0x6f08)==obj);
+    write32(0x6f10,0);write32(0x6f14,0);
+    invoke(234,(uint32_t[]){first,1,0,0x6f10},4);CHECK(g_eax==0x102);
     workers[1].exited=1; write32(obj+4,1);
+    invoke(234,(uint32_t[]){first,1,0,0},4);CHECK(!g_eax);
     for (unsigned i=0;i<WORKER_LIMIT*2;i++) {
         invoke(255,args,10);
         uint32_t now=read32(args[0]);
@@ -1025,7 +1028,9 @@ static void check_worker_reuse(void)
         invoke(187,&now,1);CHECK(!g_eax);
         workers[1].exited=1;
     }
+    invoke(233,(uint32_t[]){first,0,0},3);CHECK(!g_eax);
     invoke(187,&first,1);CHECK(!g_eax && !worker_handle(first));
+    invoke(234,(uint32_t[]){first,1,0,0},4);CHECK(g_eax==NGB_FS_INVALID_HANDLE);
     invoke(246,(uint32_t[]){first,0,0x6f08},3);CHECK(g_eax==0xc0000008u);
     reap_thread_objects();CHECK(retired && read32(obj+4)==1);
     g_ecx=obj;invoke(250,NULL,0);reap_thread_objects();CHECK(!retired);

@@ -555,6 +555,13 @@ uint32_t ngb_file_open(const char *path, uint32_t root, uint32_t access,
     *handle = handles[slot].token; *information = created ? 2 : overwrite ? 3 : 1;
     return 0;
 }
+/* All guest file operations complete synchronously before returning to XAPI. */
+uint32_t ngb_file_wait_status(uint32_t handle)
+{
+    int i=object_index(handle);
+    if(i<0)return NGB_FS_INVALID_HANDLE;
+    return handles[i].link_id?0xc0000024u:0; /* STATUS_OBJECT_TYPE_MISMATCH */
+}
 uint32_t ngb_file_flush(uint32_t handle)
 {
     int i = index_for(handle);

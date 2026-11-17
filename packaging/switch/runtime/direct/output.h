@@ -8,6 +8,8 @@ extern "C" {
 extern int ngb_scene_active;
 void ngb_scanout_direct(const void *bgra);
 void ngb_direct_close(void);
+void ngb_direct_park_prologue(void);
+void ngb_prologue_simple_state(uint32_t method, uint32_t value);
 #define NGB_DIRECT_KICKOFF_KIB 256u
 void ngb_direct_finish_put(void);
 void ngb_direct_render_core(void);

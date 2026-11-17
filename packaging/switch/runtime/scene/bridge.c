@@ -332,6 +332,73 @@ static void record_flip(void)
     }
 }
 
+#ifdef NGB_DIRECT3D
+enum { MENU_NORMAL, PROLOGUE_PLAYING, PROLOGUE_FINISHED };
+static unsigned presenter_phase;
+#endif
+
+/* Guest worker only. Both entry paths transfer the same renderer state. */
+static void activate_scene(void)
+{
+    ngb_menu_gpu_flush();
+    ngb_menu_gpu_close();
+#ifndef NGB_DIRECT3D
+    nv2a_context_init();
+    pgraph_init_thread(device);
+#endif
+    previous_flip = window_start = scene_epoch = ngb_elapsed_ns();
+    fifo_epoch = ngb_fifo_time_ns();
+    window_display = ngb_scanout_display_count();
+#ifndef NGB_DIRECT3D
+    GLint timer_bits = 0;
+    glGetQueryiv(GL_TIMESTAMP, GL_QUERY_COUNTER_BITS, &timer_bits);
+    if (timer_bits > 0) {
+        draw_timer.mask = timer_bits >= 64 ? UINT64_MAX : (UINT64_C(1) << timer_bits) - 1;
+        glGenQueries(TIMER_SLOTS, draw_timer.starts);
+        glGenQueries(TIMER_SLOTS, draw_timer.ends);
+    }
+#endif
+    ngb_scene_active = 1;
+    // Blocking waits poll directly, and queued DPCs bypass this mask.
+    // Coalesce periodic device checks once the direct renderer owns the frame.
+    ngb_poll_mask = 63;
+#ifdef NGB_DIRECT3D
+    presenter_phase = MENU_NORMAL;
+    ngb_contiguous_map_guest_banks(1);
+    ngb_direct_reset_stats();
+#ifdef __SWITCH__
+    ngb_profile_next_frame(1, draws);
+#endif
+    ngb_kernel_log("3D scene Direct3D Vulkan renderer active");
+#endif
+}
+
+#ifdef NGB_DIRECT3D
+void ngb_scene_begin_prologue(void)
+{
+    if (presenter_phase == PROLOGUE_FINISHED) presenter_phase = PROLOGUE_PLAYING;
+    if (!ngb_scene_active) return;
+    presenter_phase = PROLOGUE_PLAYING;
+    ngb_direct_park_prologue();
+    ngb_scene_active = 0;
+    ngb_contiguous_map_guest_banks(0);
+    ngb_poll_mask = 3;
+    pending_primitive = 0;
+    ngb_menu_gpu_enable();
+}
+
+void ngb_scene_end_prologue(void)
+{
+    if (presenter_phase == PROLOGUE_PLAYING) presenter_phase = PROLOGUE_FINISHED;
+}
+
+void ngb_scene_menu_flip(int menu_drawn)
+{
+    if (device && !ngb_scene_active && presenter_phase != PROLOGUE_PLAYING &&
+        (menu_drawn || presenter_phase == PROLOGUE_FINISHED)) activate_scene();
+}
+#endif
+
 int ngb_scene_method(uint32_t *regs, uint32_t method, uint32_t value, uint32_t constants[][4])
 {
     if (!memory.ram_ptr) return 0;
@@ -359,36 +426,8 @@ int ngb_scene_method(uint32_t *regs, uint32_t method, uint32_t value, uint32_t c
     if (!ngb_scene_active) {
         bool indexed = method == NV097_ARRAY_ELEMENT16 || method == NV097_ARRAY_ELEMENT32 || method == NV097_DRAW_ARRAYS;
         if (indexed || (method == NV097_SET_BEGIN_END && value && value != 6)) {
-            ngb_menu_gpu_flush();
-            ngb_menu_gpu_close();
+            activate_scene();
 #ifndef NGB_DIRECT3D
-            nv2a_context_init();
-            pgraph_init_thread(device);
-#endif
-            previous_flip = window_start = scene_epoch = ngb_elapsed_ns();
-            fifo_epoch = ngb_fifo_time_ns();
-            window_display = ngb_scanout_display_count();
-#ifndef NGB_DIRECT3D
-            GLint timer_bits = 0;
-            glGetQueryiv(GL_TIMESTAMP, GL_QUERY_COUNTER_BITS, &timer_bits);
-            if (timer_bits > 0) {
-                draw_timer.mask = timer_bits >= 64 ? UINT64_MAX : (UINT64_C(1) << timer_bits) - 1;
-                glGenQueries(TIMER_SLOTS, draw_timer.starts);
-                glGenQueries(TIMER_SLOTS, draw_timer.ends);
-            }
-#endif
-            ngb_scene_active = 1;
-            // Blocking waits poll directly, and queued DPCs bypass this mask.
-            // Coalesce periodic device checks only after the first 3D draw.
-            ngb_poll_mask = 63;
-#ifdef NGB_DIRECT3D
-            ngb_contiguous_map_guest_banks(1);
-            ngb_direct_reset_stats();
-#ifdef __SWITCH__
-            ngb_profile_next_frame(1, draws);
-#endif
-            ngb_kernel_log("3D scene Direct3D Vulkan renderer active");
-#else
             if (indexed && pending_primitive) submit(NV097_SET_BEGIN_END, pending_primitive);
             ngb_kernel_log("3D scene renderer active");
             char driver[160];
@@ -452,6 +491,7 @@ uint32_t *ngb_scene_constant(unsigned word)
 void ngb_scene_close(void)
 {
 #ifdef NGB_DIRECT3D
+    presenter_phase = MENU_NORMAL;
     ngb_direct_close();
     ngb_contiguous_map_guest_banks(0);
 #endif

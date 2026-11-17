@@ -210,6 +210,59 @@ static void reset_workers(void)
     fiber_switches = skipped_event_waits = 0;
 }
 
+static struct worker *worker_object(uint32_t object)
+{
+    for(unsigned i=0;i<thread_count;i++)if(workers[i].object==object)return &workers[i];
+    for(struct retired_worker *r=retired;r;r=r->next)if(r->object.object==object)return &r->object;
+    return NULL;
+}
+
+static uint64_t nt_wait_deadline(uint32_t address)
+{
+    if(!address)return UINT64_MAX;
+    int64_t value;
+    memcpy(&value,(const void *)ngb_guest_pointer(address,8),8);
+    uint64_t delta;
+    if(value>0){
+        struct timespec ts;
+        if(clock_gettime(CLOCK_REALTIME,&ts))ngb_stop("system clock unavailable",address);
+        uint64_t wall=116444736000000000ull+(uint64_t)ts.tv_sec*10000000+ts.tv_nsec/100;
+        delta=(uint64_t)value>wall?(uint64_t)value-wall:0;
+    }else delta=(uint64_t)(-(value+1))+1;
+    uint64_t now=now_ns()/100;
+    return delta>UINT64_MAX-now?UINT64_MAX:now+delta;
+}
+
+// Named events are handled by event_call. Resolve the remaining Nt waits by
+// handle type. Never treat an unfinished worker or an invalid handle as done.
+static int other_handle_wait(uint32_t ordinal)
+{
+    if(ordinal!=233 && ordinal!=234)return 0;
+    unsigned argc=ordinal==234?4:3;
+    uint32_t handle=arg(0),status=NGB_FS_INVALID_HANDLE;
+    struct worker *w=handle==0xfffffffeu?&workers[running_worker]:worker_handle(handle);
+    if(w){
+        uint32_t object=w->object;
+        uint64_t end=nt_wait_deadline(arg(argc-1));
+        ++w->references; // Pin the dispatcher allocation across close and slot reuse.
+        status=0;
+        while(!read32(object+4)){
+            if(now_ns()/100>=end){status=0x102;break;}
+            struct worker *self=&workers[running_worker];
+            self->wait_key=object;self->wait_until=end;self->wait_named=0;self->waiting=1;
+            yield_worker();poll_runtime(true);
+            if(!read32(object+4))idle_if_all_waiting();
+            self->waiting=0;
+            if(atomic_load(&cancel)){stopped_status=NGB_BOOT_CANCELLED;ngb_stop("cancel requested",handle);}
+            if(startup_expired())ngb_stop("thread wait budget",handle);
+        }
+        --worker_object(object)->references;
+    }else if((handle>>28)==6){
+        status=ngb_file_wait_status(handle);
+    }
+    g_eax=status;g_esp+=4*(argc+1);return 1;
+}
+
 static int thread_object_call(uint32_t ordinal)
 {
     if (ordinal == 246) {
@@ -231,10 +284,7 @@ static int thread_object_call(uint32_t ordinal)
     if (ordinal != 250 && ordinal != 143 && ordinal != 144 && ordinal != 124)
         return 0;
     uint32_t object = ordinal == 250 ? g_ecx : arg(0);
-    struct worker *w=NULL;
-    for (unsigned i=0;i<thread_count;i++) if (workers[i].object==object) { w=&workers[i]; break; }
-    if (!w) for (struct retired_worker *r=retired;r;r=r->next)
-        if (r->object.object==object) { w=&r->object;break; }
+    struct worker *w=worker_object(object);
     if (w) {
         if (ordinal == 250) {
             if (!w->references)

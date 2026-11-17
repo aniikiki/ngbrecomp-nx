@@ -8,6 +8,11 @@ enum NgbPresent ngb_scene_present(uint32_t physical, unsigned pitch, void *pixel
 void ngb_scene_discard_present(void);
 void ngb_scene_memory(uint8_t *base, size_t bytes);
 void ngb_scene_close(void);
+#ifdef NGB_DIRECT3D
+void ngb_scene_menu_flip(int menu_drawn);
+void ngb_scene_end_prologue(void);
+void ngb_scene_begin_prologue(void);
+#endif
 int ngb_scene_method(uint32_t *registers, uint32_t method, uint32_t value, uint32_t constants[][4]);
 uint32_t *ngb_scene_constant(unsigned word);
 void ngb_scene_shader_time(int linked, uint64_t ns);

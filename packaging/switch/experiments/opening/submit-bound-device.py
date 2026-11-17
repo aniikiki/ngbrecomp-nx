@@ -42,7 +42,7 @@ static void bd_boundary(unsigned f){
 }
 """+k)
  s=once(s,'    ++scene_flips;','    ++scene_flips; bd_boundary(scene_flips);')
- s=once(s,'            ngb_direct_reset_stats();','            ngb_direct_reset_stats(); bd_boundary(0);')
+ s=once(s,'    ngb_direct_reset_stats();','    ngb_direct_reset_stats(); bd_boundary(0);')
  if wide:
   s=once(s,'static void bd_boundary(unsigned f){','''unsigned bd_present_seq;
 static unsigned bd_last_present,bd_present_delta[121];

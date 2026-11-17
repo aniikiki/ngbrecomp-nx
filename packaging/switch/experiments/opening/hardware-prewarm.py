@@ -1,6 +1,6 @@
 """Build the pipe diagnostic with one reusable title device and a same-NRO A/B switch."""
 def hle(s):
-    k='bool g_started;'
+    k='std::unique_ptr<gpu::Backend> prologue_backend;'
     assert s.count(k)==1
     s=s.replace(k,k+'''
 static std::unique_ptr<gpu::Backend> title_device;
@@ -11,7 +11,7 @@ extern "C" void ngb_texture_title_tick(){
 }
 #endif
 extern "C" void ngb_prepare_title_device(){
-    if(g_backend || title_device || ngb_scene_active) return;
+    if(g_backend || prologue_backend || title_device || ngb_scene_active) return;
     auto candidate=gpu::CreateBackend();
     if(candidate && candidate->Init(640,480)) title_device=std::move(candidate);
 }

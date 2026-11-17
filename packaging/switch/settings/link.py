@@ -16,6 +16,19 @@ def technique_icons(unit):
     assert '_fas < 0' in body.split('loc_001EADC8: ;',1)[1].split('goto',1)[0]
     return body
 
+def mission_loop(unit):
+    a=unit.index('void sub_00175A00(void)\n{')
+    body=unit[a:unit.index('\n}',a)+2]
+    # Retail Mission selection owns this loop until return, including
+    # the difficulty overlay. The original three callees stay intact.
+    for addr,probe in [('14','ngb_mission_stage(0,MEM32(edi+8))'),
+                       ('1B','ngb_mission_stage(1,0)'),('20','ngb_mission_stage(2,0)'),
+                       ('42','ngb_mission_stage(3,0)'),('44','ngb_mission_dump()')]:
+        tag='loc_00175A'+addr+': ;'
+        assert body.count(tag)==1
+        body=body.replace(tag,tag+' if(ngb_mission_enabled) '+probe+';')
+    return '#define RECOMP_GENERATED_CODE\n#include "recomp_funcs.h"\n#define NGB_MISSION_PROBE 1\n#include "mission_perf.h"\n'+body
+
 def install(commands,b,d,link,regs):
     base=next(shlex.split(c) for c in commands if c.endswith('/runtime.c'))
     tool=Path(base[0]).parent
@@ -26,7 +39,7 @@ def install(commands,b,d,link,regs):
         if name.endswith('.S'): c=[base[0],'-c',str(p),'-o',str(o)]
         sp.run(c,cwd=b,check=True);link.insert(1,str(o))
     funcs=[]
-    for name in ('hud','camera','cheats','ut_charge','responsive','intercept','cutscene_skip','quick_select','quick_ui','costume_menu','talisman','missions','technique_icons','load_detail'):
+    for name in ('hud','camera','cheats','ut_charge','responsive','intercept','cutscene_skip','quick_select','quick_ui','costume_menu','talisman','missions','mission_loop','technique_icons','pause_tabs','load_detail'):
         if name=='load_detail':
             # Same GPU cycle delta as the lifted rdtsc/sub/sbb callback.
             s="""#define RECOMP_GENERATED_CODE
@@ -39,9 +52,21 @@ void sub_0030E060(void)
     MEM32(0xD21690)=eax=(uint32_t)ticks;MEM32(0xD21694)=edx=(uint32_t)(ticks>>32);esp+=4;
 }
 """
+        elif name=='mission_loop':
+            s=mission_loop((SRC.parent/'build/switch-runtime/gen/recomp_0012.c').read_text())
         elif name=='missions':
             tail=(SRC/'main_menu.c').read_text().split('static uint8_t mission_bits(',1)[1]
             s='#define RECOMP_GENERATED_CODE\n#include "recomp_funcs.h"\nstatic uint8_t mission_bits('+tail
+        elif name=='pause_tabs':
+            # Mark the retail pause page at its own draw call. Other menus
+            # can leave both the pause-state byte and the Exit index stale.
+            unit=(SRC.parent/'build/switch-runtime/gen/recomp_0013.c').read_text()
+            a=unit.index('void sub_00182240(void)\n{')
+            body=unit[a:unit.index('\n}',a)+2]
+            tag='RECOMP_ENTRY(0x00182240u);'
+            assert body.count(tag)==1
+            body=body.replace(tag,tag+'\n    if(MEM32(esp)==0x00180CC9u) ngb_pause_tab_seen(MEM8(0xDA41D1));')
+            s='#define RECOMP_GENERATED_CODE\n#include "recomp_funcs.h"\nvoid ngb_pause_tab_seen(unsigned);\n'+body
         elif name=='technique_icons':
             unit=(SRC.parent/'build/switch-runtime/gen/recomp_0018.c').read_text()
             body=technique_icons(unit)
@@ -73,7 +98,10 @@ void sub_0030E060(void)
     store='stp w19,w20,[x28]\nstp w21,w22,[x28,8]\nstp w23,w24,[x28,16]\nstr w25,[x28,24]'
     asm='.text\n'
     for f in funcs:
-        asm+=f'.global ngb_reg_{f}\n.type ngb_reg_{f},%function\nngb_reg_{f}:\nstp x29,x30,[sp,-16]!\n{store}\nbl ngbs_{f}\n'+store.replace('stp','ldp').replace('str','ldr')+f'\nldp x29,x30,[sp],16\nret\n.size ngb_reg_{f},.-ngb_reg_{f}\n'
+        # Preserve the existing optimized ARM body on the daily path.
+        off=('adrp x9,ngb_mission_enabled\nldr w9,[x9,:lo12:ngb_mission_enabled]\ncbnz w9,1f\nb ngb_mission_original\n1:\n'
+             if f=='sub_00175A00' else '')
+        asm+=f'.global ngb_reg_{f}\n.type ngb_reg_{f},%function\nngb_reg_{f}:\n{off}stp x29,x30,[sp,-16]!\n{store}\nbl ngbs_{f}\n'+store.replace('stp','ldp').replace('str','ldr')+f'\nldp x29,x30,[sp],16\nret\n.size ngb_reg_{f},.-ngb_reg_{f}\n'
     compile('gameplay.S',asm)
     names=set('ngb_reg_'+f for f in funcs)
     found=set()
@@ -82,6 +110,11 @@ void sub_0030E060(void)
         subset={line.split()[-1] for line in nm.splitlines() if line.startswith(str(obj)+':')}&names
         if subset:
             dest=d/('retained-'+obj.name)
-            sp.run([tool/'aarch64-none-elf-objcopy',*['--weaken-symbol='+n for n in sorted(subset)],obj,dest],check=True)
+            alias=[]
+            if 'ngb_reg_sub_00175A00' in subset:
+                table=sp.check_output([tool/'aarch64-none-elf-objdump','-t',obj],text=True)
+                orig=next(l.split() for l in table.splitlines() if l.endswith(' ngb_reg_sub_00175A00'))
+                alias=['--add-symbol',f'ngb_mission_original={orig[3]}:0x{orig[0]},global,function']
+            sp.run([tool/'aarch64-none-elf-objcopy',*alias,*['--weaken-symbol='+n for n in sorted(subset)],obj,dest],check=True)
             link[link.index(str(obj))]=str(dest);found.update(subset)
     assert found==names,names-found

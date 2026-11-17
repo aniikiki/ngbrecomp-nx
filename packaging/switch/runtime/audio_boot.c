@@ -14,11 +14,16 @@ static uint32_t voice_setup[0x1900 / 4];
 static uint32_t dsp_words[2][0x10000 / 4];
 static uint32_t apu_config[0x5000 / 4];
 
+#include "audio_output.inc"
+#include "voice_pcm.inc"
+
 void ngb_audio_reset(void)
 {
+    init_levels();ngb_pcm_flush(0);ngb_pcm_flush(1);
     reported_voice = voice_engine_paused = 0;
     last_audio_frame = 0;
     last_idle_scan_frame = UINT64_MAX;
+    memset(mix_params,0,sizeof mix_params);
     memset(active_voices, 0, sizeof(active_voices));
     memset(fractional_samples, 0, sizeof(fractional_samples));
     memset(ac97, 0, sizeof(ac97));
@@ -111,8 +116,7 @@ static void finish_buffer_voice(unsigned id, uint32_t *v)
     apu_config[NV_PAPU_ISTS / 4] |= NV_PAPU_ISTS_FEVINTSTS | NV_PAPU_ISTS_FENINTSTS;
 }
 
-/* The movie synchronizes its decoder to DirectSound's play cursor. Even
- * without a speaker backend, looped buffers consume samples at the APU rate. */
+/* Mix from the same play cursor and fractional pitch used by guest notifications. */
 static void advance_buffer_voices(void)
 {
     uint64_t frame = ngb_elapsed_ns() * 48 / 1000000 / 32;
@@ -120,6 +124,11 @@ static void advance_buffer_voices(void)
     if (!samples) return;
     last_audio_frame = frame;
     if (voice_engine_paused) return;
+    unsigned n=samples>MIX_LIMIT?MIX_LIMIT:(unsigned)samples;
+    if(!(active_voices[0]|active_voices[1]|active_voices[2]|active_voices[3])){
+        ngb_pcm_submit(0,NULL,n);return;
+    }
+    memset(pcm_mix,0,n*sizeof(*pcm_mix));
     for (unsigned group = 0; group < 4; ++group) {
         uint64_t handles = active_voices[group];
         while (handles) {
@@ -139,7 +148,9 @@ static void advance_buffer_voices(void)
             uint32_t loop = v[NV_PAVS_VOICE_CUR_PSH_SAMPLE / 4] & NV_PAVS_VOICE_CUR_PSH_SAMPLE_LBO;
             if ((fmt & NV_PAVS_VOICE_CFG_FMT_LOOP) && loop > end) continue;
             int16_t pitch = (int16_t)(v[NV_PAVS_VOICE_TAR_PITCH_LINK / 4] >> 16);
-            double step = fractional_samples[id] + samples * (pitch ? exp2(pitch / 4096.0) : 1.0);
+            double rate=playback_rate(id,pitch);
+            mix_voice(id,v,fmt,v[NV_PAVS_VOICE_PAR_OFFSET/4]&0xffffff,end,loop,fractional_samples[id],rate,n,samples-n);
+            double step = fractional_samples[id] + samples * rate;
             uint64_t advance = (uint64_t)step;
             fractional_samples[id] = step - advance;
             uint32_t *offset = &v[NV_PAVS_VOICE_PAR_OFFSET / 4];
@@ -155,6 +166,7 @@ static void advance_buffer_voices(void)
             *offset = (*offset & ~NV_PAVS_VOICE_PAR_OFFSET_CBO) | (uint32_t)pos;
         }
     }
+    submit_mix(n);
 }
 
 static void start_voice(uint32_t arg)
@@ -293,6 +305,7 @@ void ngb_apu_write(uint32_t va, uint32_t value)
             apu_config[NV_PAPU_FEDECMETH / 4] = m;
             apu_config[NV_PAPU_FEDECPARAM / 4] = value;
         }
+        if(m>=0x200 && m<=0x224 && ((voice_setup[m/4]^value)&7))gain_generation++;
         voice_setup[m / 4] = value;
         return;
     }

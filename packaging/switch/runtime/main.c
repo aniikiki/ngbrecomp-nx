@@ -1,5 +1,6 @@
 #include "runtime.h"
 #include "profile.h"
+#include "audio_output.h"
 #include "frontend_input.h"
 #include "scanout.h"
 #include "files.h"
@@ -16,6 +17,7 @@
 int ngb_diagnostics_enabled;
 #include "loading.inc"
 #ifdef NGB_PLAYER_BUILD
+static atomic_uint commands;
 #include "settings_panel.inc"
 #endif
 static atomic_bool finished;
@@ -23,8 +25,15 @@ static int boot_status;
 static FILE *boot_log;
 static const char *startup_error;
 static atomic_bool input_stop, game_view, gameplay_controls;
-void ngb_frontend_menu_controls(void) { atomic_store(&gameplay_controls,true); }
+void ngb_frontend_menu_controls(void) {
+    atomic_store(&gameplay_controls,true);
+#ifdef NGB_PLAYER_BUILD
+    atomic_store(&exit_return_boot,false);
+#endif
+}
+#ifndef NGB_PLAYER_BUILD
 static atomic_uint commands;
+#endif
 static u64 launch_tick;
 
 #ifdef NGB_DIRECT3D
@@ -65,6 +74,10 @@ static Result thread_ticks(Handle handle, u64 *value)
                       InfoType_ThreadTickCountDeprecated, handle, TickCountInfo_Total);
 }
 
+#ifdef NGB_PLAYER_BUILD
+#include "mission_perf.inc"
+#endif
+
 void ngb_profile_next_frame(unsigned frame, unsigned draws)
 {
     if (frame==1) atomic_store(&gameplay_controls,true);
@@ -95,6 +108,50 @@ static uint32_t module_offset(uint64_t address)
     uintptr_t base = (uintptr_t)_start;
     return address >= base && address - base < UINT32_MAX ? (uint32_t)(address - base) : UINT32_MAX;
 }
+
+#ifdef NGB_PLAYER_BUILD
+// UI-owned buffer; the guest never takes a lock or writes this trace.
+static int mp_pc_enabled;
+static struct { unsigned id,pc,lr,cost_us,rc; } mp_pc[1024];
+static unsigned mp_pc_count,mp_pc_saved;
+static void mission_pc_tick(Thread *guest){
+    static uint64_t due;
+    static unsigned jitter=0x50a143;
+    unsigned id=atomic_load(&mp_ui_id);
+    if(!id || mp_pc_count==1024)return;
+    uint64_t now=armGetSystemTick();
+    if(now<due)return;
+    jitter=1664525u*jitter+1013904223u;
+    due=now+armNsToTicks(43000000u+(jitter%41000000u));
+    ThreadContext ctx;
+    Result rc=threadPause(guest);
+    unsigned pc=UINT32_MAX,lr=UINT32_MAX;
+    if(R_SUCCEEDED(rc)){
+        // Recheck after suspension: the iteration may already have ended.
+        id=atomic_load(&mp_ui_id);
+        rc=threadDumpContext(&ctx,guest);
+        if(R_SUCCEEDED(rc)){pc=module_offset(ctx.pc.x);lr=module_offset(ctx.lr);}
+        Result resumed=threadResume(guest);
+        if(R_FAILED(resumed))rc=resumed;
+    }
+    if(id || R_FAILED(rc)){
+        mp_pc[mp_pc_count++]=(typeof(mp_pc[0])){id,pc,lr,armTicksToNs(armGetSystemTick()-now)/1000,rc};
+        if(R_FAILED(rc))mp_pc_enabled=0;
+    }
+}
+static void mission_pc_save(void){
+    if(mp_pc_saved==mp_pc_count)return;
+    mkdir("sdmc:/switch/ngb-runtime/logs",0777);
+    FILE *f=fopen("sdmc:/switch/ngb-runtime/logs/mission-pc.csv",mp_pc_saved?"a":"w");
+    if(!f)return;
+    if(!mp_pc_saved)fputs("iteration,pc_offset,lr_offset,sample_us,rc\n",f);
+    for(;mp_pc_saved<mp_pc_count;mp_pc_saved++){
+        const typeof(mp_pc[0])*v=&mp_pc[mp_pc_saved];
+        fprintf(f,"%u,%08x,%08x,%u,%08x\n",v->id,v->pc,v->lr,v->cost_us,v->rc);
+    }
+    fclose(f);
+}
+#endif
 
 /* Unwind AAPCS64 frame records only within the paused thread's actual
  * stack. Cooperative Xbox threads and XAPI fibers have separate stacks. */
@@ -284,6 +341,10 @@ static void sample_pad(PadState *pad, bool game_input)
     else if ((held & (HidNpadButton_Minus|HidNpadButton_B))==(HidNpadButton_Minus|HidNpadButton_B))
         held &= ~(HidNpadButton_Minus|HidNpadButton_B);
     if (!game_input && !ngb_movie_owns_input()) held &= ~HidNpadButton_Plus;
+#ifdef NGB_PLAYER_BUILD
+    if(atomic_load(&exit_return_boot) && game_input && !atomic_load(&gameplay_controls))
+        held|=((armGetSystemTick()/(armGetSystemTickFreq()/4))&3)==1?HidNpadButton_Plus:0;
+#endif
     uint16_t buttons=0;
     for (unsigned i=0;i<16;i++) if (held&mapped[i]) buttons|=1u<<i;
 #ifdef NGB_PLAYER_BUILD
@@ -342,8 +403,14 @@ static void guest_worker(void *arg)
 }
 
 /* Retained build version: 0.51.0-rc1 */
-int main(void)
+int main(int argc,char **argv)
 {
+#ifdef NGB_PLAYER_BUILD
+    exit_program_path=(argc && argv[0] && *argv[0])?argv[0]:"sdmc:/switch/ngb-runtime/ngb-startup.nro";
+    atomic_store(&exit_return_boot,argc>1 && !strcmp(argv[1],"--return-to-title"));
+#else
+    (void)argc;(void)argv;
+#endif
     launch_tick=armGetSystemTick();
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
     PadState pad;
@@ -358,6 +425,11 @@ int main(void)
     bow_loaded=ngb_crosshair_picture(bow_art,64);
 #endif
     struct stat flag;
+#if defined(NGB_PLAYER_BUILD) && defined(NGB_DIRECT3D)
+    ngb_mission_enabled = stat("sdmc:/switch/ngb-runtime/mission-perf.flag",&flag)==0 && S_ISREG(flag.st_mode);
+    ngb_mission_gl_split = ngb_mission_enabled && stat("sdmc:/switch/ngb-runtime/mission-gl-sync.flag",&flag)==0 && S_ISREG(flag.st_mode);
+    mp_pc_enabled = ngb_mission_enabled && stat("sdmc:/switch/ngb-runtime/mission-pc.flag",&flag)==0 && S_ISREG(flag.st_mode);
+#endif
     ngb_diagnostics_enabled = stat("sdmc:/switch/ngb-runtime/diagnostics.flag",&flag)==0 && S_ISREG(flag.st_mode);
     if (ngb_diagnostics_enabled) {
         mkdir("sdmc:/switch/ngb-runtime/logs", 0777);
@@ -390,6 +462,7 @@ int main(void)
     }
     Thread worker, input;
     bool input_started = false;
+    int audio_open=R_SUCCEEDED(rc) && ngb_audio_device_open();
     bool created = false, started = false;
     if (R_SUCCEEDED(rc)) {
         u64 allowed = 0;
@@ -434,6 +507,10 @@ int main(void)
             printf("Ninja Gaiden Black\n\n%s\n\nPress + to return.\n",why);
             consoleUpdate(NULL);
         }
+#if defined(NGB_PLAYER_BUILD) && defined(NGB_DIRECT3D)
+        if(started && !done && !exiting && mp_pc_enabled)mission_pc_tick(&worker);
+        if(ngb_mission_enabled && atomic_exchange(&mp_exited,0))mission_pc_save();
+#endif
         if (atomic_exchange(&commands,0)&EXIT_GAME) { ngb_request_stop(); exiting=true; }
         if (exiting && (!started || done)) break;
         if (done && !failed) break;
@@ -442,7 +519,9 @@ int main(void)
         unsigned view=atomic_load(&panel);
         if (view && !failed && !exiting) {
             unsigned changes=atomic_load(&revision);
-            if (previous_panel!=view || previous_revision!=changes) draw_settings(&surface,view);
+            if (previous_panel!=view || previous_revision!=changes) {
+                if(view&EXIT_PANEL) draw_exit_panel(&surface,view); else draw_settings(&surface,view);
+            }
             previous_panel=view;previous_revision=changes;
             svcSleepThread(4000000);
             continue;
@@ -452,12 +531,25 @@ int main(void)
         if (!failed && ngb_scanout_ready() && (viewing || ngb_scanout_visible())) {
             unsigned next=ngb_scanout_generation();
             if (!viewing || displayed!=next) {
+#if defined(NGB_PLAYER_BUILD) && defined(NGB_DIRECT3D)
+                unsigned mid=ngb_mission_enabled?atomic_load(&mp_ui_id):0;
+                uint64_t ma=mid?ngb_elapsed_ns():0;
+#endif
                 u32 stride; u32 *dst=framebufferBegin(&surface,&stride);
+#if defined(NGB_PLAYER_BUILD) && defined(NGB_DIRECT3D)
+                uint64_t mb=mid?ngb_elapsed_ns():0;
+#endif
                 ngb_scanout_blit(dst,stride/4,1280,720);
 #ifdef NGB_PLAYER_BUILD
                 game_overlay(dst,stride/4);
 #endif
+#if defined(NGB_PLAYER_BUILD) && defined(NGB_DIRECT3D)
+                uint64_t mc=mid?ngb_elapsed_ns():0;
+#endif
                 framebufferEnd(&surface);
+#if defined(NGB_PLAYER_BUILD) && defined(NGB_DIRECT3D)
+                if(mid)mp_display(mid,ma,mb,mc,ngb_elapsed_ns());
+#endif
                 ngb_scanout_displayed(); ngb_movie_displayed();
                 displayed=next; viewing=true; atomic_store(&game_view,true);
             }
@@ -481,7 +573,12 @@ int main(void)
     if (input_started) { threadWaitForExit(&input); threadClose(&input); }
     ngb_request_stop();
     if (started) threadWaitForExit(&worker);
+#if defined(NGB_PLAYER_BUILD) && defined(NGB_DIRECT3D)
+    ngb_mission_dump();
+    mission_pc_save();
+#endif
     if (created) threadClose(&worker);
+    if(audio_open)ngb_audio_device_close();
 #ifdef NGB_DIRECT3D
     write_guest_samples(PROFILE_WINDOWS);
 #endif

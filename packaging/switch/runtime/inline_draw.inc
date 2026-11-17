@@ -194,6 +194,8 @@ static void sprite_memo_end(struct sprite_memo *entry,struct sprite_rect rect,co
     entry->valid=1;
 }
 
+#include "menu_thumbnails.inc"
+
 static void raster_sprite(const struct screen_vertex v[4], unsigned width, unsigned height,
                           uint32_t tf, const uint8_t *tex, unsigned tw, unsigned th,
                           uint32_t *dst, unsigned pitch, uint32_t lut[256], unsigned count,
@@ -251,6 +253,37 @@ static void raster_sprite(const struct screen_vertex v[4], unsigned width, unsig
     }
     int x0 = fmaxf(0, ceilf(v[0].x)), x1 = fminf(width, ceilf(v[1].x));
     int y0 = fmaxf(0, ceilf(v[0].y)), y1 = fminf(height, ceilf(v[2].y));
+    if(x1<=x0 || y1<=y0)return;
+    Thumb *thumb=NULL;
+    unsigned sw=x1-x0,sh=y1-y0;
+    int strip=allow_memo && !alpha_only && !additive && tw==256 && th==64 &&
+        sw>=600 && sw<=STRIP_W && sh<=STRIP_H &&
+        ((uintptr_t)dst+(size_t)pitch*height<=(uintptr_t)tex || (uintptr_t)tex+tw*th<=(uintptr_t)dst);
+    if(strip && title_strip_hit(v,x0,y0,sw,sh,tex,lut,count)){
+        for(unsigned y=0;y<sh;y++){
+            uint32_t *row=dst+(y+y0)*(pitch/4)+x0;
+            const uint32_t *src=title_strip.pixels+y*sw;
+            if(title_strip.opaque)memcpy(row,src,sw*4);
+            else for(unsigned x=0;x<sw;x++)row[x]=blend_sprite(row[x],src[x],0);
+        }
+        return;
+    }
+    if(tw==1024 && th==1024 && !alpha_only && !additive && allow_memo &&
+       ((uintptr_t)dst+(size_t)pitch*height<=(uintptr_t)tex ||
+        (uintptr_t)tex+tw*th<=(uintptr_t)dst)){
+        int cached=0;
+        thumb=thumbnail(v,tex,lut,count,x0,y0,x1-x0,y1-y0,&cached);
+        if(thumb) MP_ADD(cached?MP_THUMB_HIT:MP_THUMB_MISS,0,0);
+        if(cached){
+            for(int y=y0;y<y1;y++){
+                uint32_t *row=dst+y*(pitch/4)+x0;
+                const uint32_t *src=thumb->pixels+(y-y0)*thumb->w;
+                if(thumb->opaque)memcpy(row,src,thumb->w*4);
+                else for(unsigned x=0;x<thumb->w;x++)row[x]=blend_sprite(row[x],src[x],0);
+            }
+            return;
+        }
+    }
     struct { unsigned left, right; float fraction; } columns[2048];
     for (int x = x0; x < x1; x++) {
         float ax = (x - v[0].x) / (v[1].x - v[0].x);
@@ -291,12 +324,16 @@ static void raster_sprite(const struct screen_vertex v[4], unsigned width, unsig
             uint32_t a = mix_texels(lut[ia], lut[ib], columns[x].fraction);
             uint32_t b = mix_texels(lut[ic], lut[id], columns[x].fraction);
             uint32_t color = mix_texels(a, b, sy - ty), alpha = color >> 24;
+            if(strip){title_strip.pixels[(y-y0)*sw+x-x0]=color;title_strip.opaque&=alpha==255;}
+            if(thumb){thumb->pixels[(y-y0)*thumb->w+x-x0]=color;thumb->opaque&=alpha==255;}
             if (alpha) {
                 uint32_t *pixel = &dst[y * (pitch / 4) + x];
                 *pixel = blend_sprite(*pixel, color, additive);
             }
         }
     }
+    if(strip)title_strip.valid=1;
+    if(thumb)thumb->valid=1;
     sprite_memo_end(memo,rect,dst,pitch/4);
 }
 
@@ -405,11 +442,11 @@ static void draw_alpha_sprite(const struct screen_vertex v[4], unsigned width, u
     for (unsigned i = 0; i < 4; ++i)
         standard &= v[i].x == v[i&1].x && v[i].y == v[i&2].y && v[i].u == v[i&1].u &&
                     v[i].v == v[i&2].v && v[i].color == v[0].color;
+    if(!((v[0].color|v[1].color|v[2].color|v[3].color)>>24))return;
     uint8_t *tex = (uint8_t *)draw_surface(NV097_SET_CONTEXT_DMA_B, m[0x1b00 / 4], tw * th, TEXTURE_SOURCE);
     uint32_t *dst =
         draw_surface(NV097_SET_CONTEXT_DMA_COLOR, m[0x210 / 4], (height - 1) * pitch + 4 * width, OVERLAY_TARGET);
     int alpha_only = ((tf >> 8) & 255) == 0x19;
-    if (alpha_only && !((v[0].color | v[1].color | v[2].color | v[3].color) >> 24)) return;
     if (alpha_only && ngb_menu_gpu_overlay(v,tex,tw,th,dst,pitch/4,width,height,additive)) return;
     ngb_menu_gpu_sync(dst,(height-1)*pitch+4*width);
     if (!standard && alpha_only &&

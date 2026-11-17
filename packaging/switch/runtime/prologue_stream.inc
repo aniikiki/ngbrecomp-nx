@@ -18,6 +18,7 @@ static struct {
 
 static void seq_close(void)
 {
+    movie_audio_end();
     if (seq.file) fclose(seq.file);
     if (seq.parser) av_parser_close(seq.parser);
     sws_freeContext(seq.scale);
