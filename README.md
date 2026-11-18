@@ -42,9 +42,3 @@ SD 卡/
 感谢 [ngbrecomp 上游项目及其贡献者](https://github.com/gamboozino/ngbrecomp#credits)，以及提供渲染实现与优化参考的 [black-pc](https://github.com/Spark198rus/black-pc) 和 [ngb-pc-native-port](https://github.com/akirahayabusa/ngb-pc-native-port) 项目及其贡献者。
 
 项目代码按 [GPL-3.0-or-later](LICENSE) 授权，第三方组件遵循[各自的许可](THIRD_PARTY.md)。本项目与 Koei Tecmo 或 Team Ninja 没有关联，也未获其背书。
-
-## 0.56.25 觉醒 Alma 性能诊断（可选）
-
-在程序旁放一个空文件 `alma-perf.flag` 后重启。只需开启这一项。进入 **Missions → Captivating Goddesses → Phase 1**，首次交战后直接重试一次。选定该任务后开始记录，因此加载、任务说明、死亡和重试都有上下文。UI 每秒将缓冲记录追加到 `/switch/ngb-runtime/logs/alma-perf.csv`，无需返回主菜单才能保存；强制关闭可能丢失最后一批。重新启动会追加新的 SESSION。取走 CSV 后删除 flag 并重启即可关闭。
-
-G 是游戏线程的帧边界和累计 CPU、I/O、显示计数；R 是渲染帧（绘制、绑定、几何、编译、纹理、队列、等待、上屏拷贝及每 64 个 draw 的轮换抽样）；Q 是带提交帧号的 GPU 命令缓冲时间戳，同一帧可有多条。D 记录显示线程取得缓冲、缩放叠加和提交的耗时。P 是游戏或渲染线程的 PC/LR 模块偏移和采样成本，C 是读取到的 CPU/GPU/内存频率及服务返回码。线程 CPU 为 0 表示读不到；GPU 只用 valid=1，不能把缺失当成耗时为零。P、C、D 取决于主机支持和显示路径。各线程时间可重叠，不可相加。用 `python3 packaging/switch/analyze-alma.py alma-perf.csv` 查看最近一次采集；定位 PC 时需使用同一构建的 symbols.gz。
