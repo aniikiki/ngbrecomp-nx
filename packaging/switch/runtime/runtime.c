@@ -234,8 +234,22 @@ void ngb_checkpoint(uint32_t va)
 
 void ngb_poll_due(uint64_t ticket)
 {
+#ifdef NGB_DIRECT3D
+    extern unsigned ngb_d3d_model_suspend(void);
+    extern void ngb_d3d_model_resume(unsigned);
+    unsigned model_owner = ngb_d3d_model_suspend();
+#endif
     if (interrupt_enabled && !delivering_callback && (usb_interrupt || gpu_interrupt || apu_interrupt || ac97_interrupt || ngb_pending_dpcs)) poll_callbacks();
-    if ((ticket & 255u) != 0) return;
+    if ((ticket & 255u) != 0) {
+#ifdef NGB_DIRECT3D
+        ngb_d3d_model_resume(model_owner);
+#endif
+        return;
+    }
+#ifdef NGB_DIRECT3D
+    extern void ngb_d3d_native_poll(void);
+    ngb_d3d_native_poll();
+#endif
     ngb_audio_poll();
     yield_worker();
     if (atomic_load(&cancel)) {
@@ -249,6 +263,9 @@ void ngb_poll_due(uint64_t ticket)
         ngb_timers_poll(now_ns() / 100, fire_timer);
         delivering_callback = 0;
     }
+#ifdef NGB_DIRECT3D
+    ngb_d3d_model_resume(model_owner);
+#endif
 }
 
 static void poll_runtime(bool waiting)
@@ -363,6 +380,65 @@ static void write32(uint32_t va, uint32_t value)
 }
 static uint32_t arg(unsigned index) { return read32(g_esp + 4 + index * 4); }
 
+/* The native graphics front end uses the same pool as guest ExAllocatePool.
+ * Headers remain ordinary guest allocations, including when game code frees them. */
+uint32_t ngb_graphics_pool_alloc(uint32_t bytes)
+{
+    uint32_t address = 0, rounded = bytes ? bytes : 1;
+    if (ngb_vm_allocate(&address, &rounded, 0, 0x3000, 4)) return 0;
+    pool_sizes[(address - NGB_VM_BEGIN) / 4096] = bytes ? bytes : 1;
+    return address;
+}
+
+void ngb_graphics_pool_free(uint32_t address)
+{
+    if (address < NGB_VM_BEGIN || address >= NGB_VM_END || (address & 4095))
+        ngb_stop("invalid graphics pool block", address);
+    uint32_t *size = &pool_sizes[(address - NGB_VM_BEGIN) / 4096], release = 0;
+    if (!*size || ngb_vm_free(&address, &release, 0x8000))
+        ngb_stop("graphics pool release failed", address);
+    *size = 0;
+}
+
+uint32_t ngb_graphics_guest_call(uint32_t routine, const uint32_t *arguments, unsigned count)
+{
+#ifdef NGB_DIRECT3D
+    unsigned model_owner = ngb_d3d_model_suspend();
+#endif
+    static unsigned depth;
+    recomp_func_t fn = recomp_lookup(routine);
+    if (!fn) ngb_stop("unresolved graphics callback", routine);
+    RecompRegs saved = g_regs;
+    uint32_t saved_va = current_va, saved_ordinal = pending_ordinal;
+    int outer = delivering_callback;
+    delivering_callback = 1;
+    /* A callback can run while an API hook owns a register snapshot. Use a
+     * separate stack and restore all registers before that hook continues. */
+    uint32_t top = depth ? saved.r_esp - 64 : 0x03edf000;
+    ++depth;
+    g_esp = top;
+    for (unsigned i = count; i; --i) PUSH32(g_esp, arguments[i - 1]);
+    PUSH32(g_esp, 0);
+    fn();
+    if (g_esp != top && g_esp != top - count * 4)
+        ngb_stop("unbalanced graphics callback", routine);
+    uint32_t result = g_eax;
+    --depth;
+    g_regs = saved;
+    current_va = saved_va;
+    pending_ordinal = saved_ordinal;
+    delivering_callback = outer;
+#ifdef NGB_DIRECT3D
+    ngb_d3d_model_resume(model_owner);
+#endif
+    return result;
+}
+
+void ngb_graphics_callback(uint32_t routine, uint32_t argument)
+{
+    ngb_graphics_guest_call(routine, &argument, 1);
+}
+
 static uint32_t run_callback(uint32_t routine, uint8_t irql, const uint32_t *args, unsigned count)
 {
     recomp_func_t fn = recomp_lookup(routine);
@@ -437,6 +513,22 @@ static void poll_callbacks(void)
 }
 
 #include "workers.inc"
+
+void ngb_graphics_wait_until(uint64_t nanoseconds)
+{
+    // VBlank callers include background game workers. Parking the whole host
+    // thread here would also stop the main game fiber for every wait.
+    uint64_t end = (start_ns + nanoseconds) / 100;
+    uint64_t previous = workers[running_worker].wake_tick;
+    workers[running_worker].wake_tick = end;
+    while (now_ns() / 100 < end) {
+        yield_worker();
+        if (now_ns() / 100 >= end) break;
+        idle_if_all_waiting();
+        poll_runtime(true);
+    }
+    workers[running_worker].wake_tick = previous;
+}
 
 #if defined(__SWITCH__) && defined(NGB_DIRECT3D)
 void ngb_profile_work_counts(uint64_t *entry_count, uint64_t *poll_count, uint64_t *switches, uint64_t *skips)

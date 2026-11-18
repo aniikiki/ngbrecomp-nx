@@ -1,0 +1,96 @@
+// Included once by hle.cpp, outside its anonymous namespace. Producers only
+// enqueue integer rows; the combat writer consumes them off the display thread.
+#ifdef NGB_NATIVE_DIAG
+bool ngb_native_diag_on, ngb_native_diag_sample;
+namespace {
+NativeDiagScope* nd_stack[16]{};
+unsigned nd_worker, nd_draws;
+uint64_t nd_last, nd_frame_time, nd_frame_cpu, nd_calls[ND_COUNT]{}, nd_ns[ND_COUNT]{}, nd_words;
+
+void NativeDiagCharge(uint64_t now) {
+    if (ngb_native_diag_on && nd_stack[nd_worker]) {
+        const unsigned kind = nd_stack[nd_worker]->kind;
+        if (ngb_native_diag_sample || kind >= ND_PRESENT) nd_ns[kind] += now - nd_last;
+    }
+    nd_last = now;
+}
+uint64_t NativeDiagCpuDelta(uint64_t before, uint64_t after) {
+    return before && after >= before ? after - before : 0;
+}
+}
+
+// Called at the actual context switch, even when diagnostics are disabled, so
+// an activation during a different guest worker starts with the right stack.
+extern "C" void ngb_native_diag_switch(unsigned next, uint64_t now) {
+    if (ngb_native_diag_on) NativeDiagCharge(now);
+    nd_worker = next;
+}
+NativeDiagScope::NativeDiagScope(unsigned k) : kind(k) {
+    if (!ngb_native_diag_on) return;
+    ++nd_calls[k];
+    // Keep the nesting across frame boundaries: a background VBlank waiter can
+    // stay suspended over several presents. Only sampled frames time hot calls.
+    if (!ngb_native_diag_sample && k < ND_PRESENT) return;
+    NativeDiagCharge(ngb_elapsed_ns());
+    worker = nd_worker; previous = nd_stack[worker]; nd_stack[worker] = this; linked = true;
+}
+NativeDiagScope::~NativeDiagScope() {
+    if (!linked) return;
+    NativeDiagCharge(ngb_elapsed_ns());
+    nd_stack[worker] = previous;
+}
+void NativeDiagWords(unsigned words) { if (ngb_native_diag_on) nd_words += words; }
+void NativeDiagFrame(unsigned frame) {
+    const bool on = ngb_combat_enabled && ngb_combat_active();
+    uint64_t now = (on || ngb_native_diag_on) ? ngb_elapsed_ns() : 0;
+    uint64_t cpu = (on || ngb_native_diag_on) ? ngb_combat_cpu_us() : 0;
+    if (ngb_native_diag_on) {
+        NativeDiagCharge(now);
+        uint64_t n[] = {frame, now/1000, cpu, (now-nd_frame_time)/1000,
+            NativeDiagCpuDelta(nd_frame_cpu,cpu), ngb_native_diag_sample, nd_draws,
+            nd_calls[ND_STATE], nd_calls[ND_SHADER], nd_calls[ND_RESOURCE], nd_calls[ND_DRAW],
+            nd_calls[ND_HELPER], nd_calls[ND_OTHER], nd_calls[ND_INLINE], nd_words,
+            nd_ns[ND_FRAME_WAIT]/1000, nd_ns[ND_FENCE_WAIT]/1000, nd_ns[ND_RESOURCE_WAIT]/1000,
+            nd_ns[ND_READBACK_WAIT]/1000, nd_ns[ND_VBLANK_WAIT]/1000, nd_ns[ND_PACE]/1000,
+            nd_ns[ND_PRESENT]/1000, nd_ns[ND_CALLBACK]/1000,
+            nd_calls[ND_FRAME_WAIT], nd_calls[ND_RESOURCE_WAIT], nd_calls[ND_READBACK_WAIT]};
+        ngb_combat_row('N', n, sizeof n/sizeof *n);
+        if (ngb_native_diag_sample) {
+            uint64_t t[ND_COUNT+2] = {frame, now/1000};
+            for (unsigned i=0; i<ND_COUNT; ++i) t[i+2] = nd_ns[i];
+            ngb_combat_row('T', t, ND_COUNT+2);
+        }
+    }
+    std::fill(std::begin(nd_calls), std::end(nd_calls), 0);
+    std::fill(std::begin(nd_ns), std::end(nd_ns), 0);
+    nd_words = nd_draws = 0;
+    ngb_native_diag_on = on;
+    ngb_native_diag_sample = on && (frame % 32 == 0);
+    nd_frame_time = nd_last = now; nd_frame_cpu = cpu;
+}
+NativeDiagSwap::NativeDiagSwap(unsigned frame, unsigned interval) : on(ngb_native_diag_on) {
+    if (!on) return;
+    v[0]=frame; v[1]=ngb_elapsed_ns()/1000; v[2]=ngb_combat_cpu_us(); v[3]=interval;
+}
+void NativeDiagSwap::Plan(unsigned periods,unsigned previous,unsigned current,unsigned target,bool retargeted) {
+    if (!on) return;
+    v[4]=periods; v[5]=previous; v[6]=current; v[7]=target; v[8]=retargeted;
+}
+void NativeDiagSwap::WaitBegin(uint64_t deadline) {
+    if (!on) return;
+    v[9]=deadline/1000; v[10]=ngb_elapsed_ns()/1000; v[12]=ngb_combat_cpu_us();
+}
+void NativeDiagSwap::WaitEnd() {
+    if (!on) return;
+    v[11]=ngb_elapsed_ns()/1000-v[10]; v[12]=NativeDiagCpuDelta(v[12],ngb_combat_cpu_us());
+}
+void NativeDiagSwap::PresentBegin() { if (on) v[13]=ngb_elapsed_ns()/1000; }
+void NativeDiagSwap::PresentEnd() { if (on) v[14]=ngb_elapsed_ns()/1000-v[13]; }
+void NativeDiagSwap::Finish(unsigned blank,unsigned draws) {
+    nd_draws = draws;
+    if (!on) return;
+    v[15]=ngb_elapsed_ns()/1000-v[1]; v[16]=NativeDiagCpuDelta(v[2],ngb_combat_cpu_us());
+    v[17]=blank; v[18]=draws;
+    ngb_combat_row('V',v,sizeof v/sizeof *v);
+}
+#endif

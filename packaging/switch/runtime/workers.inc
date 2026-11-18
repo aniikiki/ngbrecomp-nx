@@ -89,12 +89,17 @@ static void yield_worker(void)
 {
     if (!interrupt_enabled || delivering_callback || thread_count <= 1 || MEM8(g_fs_base + 0x24) >= 2)
         return;
-    unsigned next = next_worker(now_ns() / 100);
+    uint64_t switch_time = now_ns();
+    unsigned next = next_worker(switch_time / 100);
     if (next == running_worker) return;
     struct worker *old = &workers[running_worker], *dest = &workers[next];
     old->regs = g_regs;
     old->ordinal = pending_ordinal;
     old->va = current_va;
+#ifdef NGB_NATIVE_DIAG
+    extern void ngb_native_diag_switch(unsigned, uint64_t);
+    ngb_native_diag_switch(next, switch_time - start_ns);
+#endif
     running_worker = next;
     g_regs = dest->regs;
     current_va = dest->va;

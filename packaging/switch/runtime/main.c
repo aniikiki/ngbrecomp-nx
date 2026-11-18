@@ -76,6 +76,9 @@ static Result thread_ticks(Handle handle, u64 *value)
 
 #ifdef NGB_PLAYER_BUILD
 #include "mission_perf.inc"
+#ifdef NGB_COMBAT_PERF
+#include "combat_perf.inc"
+#endif
 #endif
 
 void ngb_profile_next_frame(unsigned frame, unsigned draws)
@@ -114,6 +117,41 @@ static uint32_t module_offset(uint64_t address)
 static int mp_pc_enabled;
 static struct { unsigned id,pc,lr,cost_us,rc; } mp_pc[1024];
 static unsigned mp_pc_count,mp_pc_saved;
+#ifdef NGB_COMBAT_PERF
+/* UI sampler: only query context while paused; release before recording. */
+static void combat_pc(Thread *th,unsigned renderer){
+    ThreadContext ctx;uint64_t now=ngb_elapsed_ns();uint32_t pc=UINT32_MAX,lr=UINT32_MAX;
+    Result rc=threadPause(th);
+    if(R_SUCCEEDED(rc)){
+        rc=threadDumpContext(&ctx,th);
+        if(R_SUCCEEDED(rc)){pc=module_offset(ctx.pc.x);lr=module_offset(ctx.lr);}
+        Result resumed=threadResume(th);if(R_FAILED(resumed))rc=resumed;
+    }
+    uint64_t v[]={now/1000,renderer,pc,lr,(ngb_elapsed_ns()-now)/1000,rc};
+    ngb_combat_row('P',v,6);
+}
+static void combat_render_pc(void *th){combat_pc(th,1);}
+static void combat_sample(Thread *guest){
+    static uint64_t next,clock_due;static unsigned seq;
+    if(!ngb_combat_active())return;
+    uint64_t now=ngb_elapsed_ns();
+    if(now>=clock_due){
+        uint64_t v[7]={now/1000};const PcvModuleId id[]={PcvModuleId_CpuBus,PcvModuleId_GPU,PcvModuleId_EMC};
+        Result init=clkrstInitialize();
+        for(unsigned i=0;i<3;i++){
+            ClkrstSession sess;u32 hz=0;Result rc=init;
+            if(R_SUCCEEDED(rc))rc=clkrstOpenSession(&sess,id[i],3);
+            if(R_SUCCEEDED(rc)){rc=clkrstGetClockRate(&sess,&hz);clkrstCloseSession(&sess);}
+            v[i+1]=hz;v[i+4]=rc;
+        }
+        if(R_SUCCEEDED(init))clkrstExit();
+        ngb_combat_row('C',v,7);clock_due=now+5000000000ull;
+    }
+    if(now<next || !envIsSyscallHinted(0x32) || !envIsSyscallHinted(0x33))return;
+    next=now+(97000000u+((++seq*2654435761u)%43000000u));
+    if(seq&1)combat_pc(guest,0);else ngb_direct_visit_worker(combat_render_pc);
+}
+#endif
 static void mission_pc_tick(Thread *guest){
     static uint64_t due;
     static unsigned jitter=0x50a143;
@@ -426,6 +464,12 @@ int main(int argc,char **argv)
 #endif
     struct stat flag;
 #if defined(NGB_PLAYER_BUILD) && defined(NGB_DIRECT3D)
+#ifdef NGB_COMBAT_PERF
+    if(stat("sdmc:/switch/ngb-runtime/alma-perf.flag",&flag)==0 && S_ISREG(flag.st_mode)){
+        mkdir("sdmc:/switch/ngb-runtime/logs",0777);
+        ngb_combat_enabled=combat_open("sdmc:/switch/ngb-runtime/logs/alma-perf.csv") && combat_start_writer();
+    }
+#endif
     ngb_mission_enabled = stat("sdmc:/switch/ngb-runtime/mission-perf.flag",&flag)==0 && S_ISREG(flag.st_mode);
     ngb_mission_gl_split = ngb_mission_enabled && stat("sdmc:/switch/ngb-runtime/mission-gl-sync.flag",&flag)==0 && S_ISREG(flag.st_mode);
     mp_pc_enabled = ngb_mission_enabled && stat("sdmc:/switch/ngb-runtime/mission-pc.flag",&flag)==0 && S_ISREG(flag.st_mode);
@@ -508,6 +552,9 @@ int main(int argc,char **argv)
             consoleUpdate(NULL);
         }
 #if defined(NGB_PLAYER_BUILD) && defined(NGB_DIRECT3D)
+#ifdef NGB_COMBAT_PERF
+        if(ngb_combat_enabled && started && !done && !exiting)combat_sample(&worker);
+#endif
         if(started && !done && !exiting && mp_pc_enabled)mission_pc_tick(&worker);
         if(ngb_mission_enabled && atomic_exchange(&mp_exited,0))mission_pc_save();
 #endif
@@ -533,21 +580,29 @@ int main(int argc,char **argv)
             if (!viewing || displayed!=next) {
 #if defined(NGB_PLAYER_BUILD) && defined(NGB_DIRECT3D)
                 unsigned mid=ngb_mission_enabled?atomic_load(&mp_ui_id):0;
-                uint64_t ma=mid?ngb_elapsed_ns():0;
+                int measure_display=mid!=0;
+#ifdef NGB_COMBAT_PERF
+                int combat_display=ngb_combat_enabled && ngb_combat_active();
+                measure_display|=combat_display;
+#endif
+                uint64_t ma=measure_display?ngb_elapsed_ns():0;
 #endif
                 u32 stride; u32 *dst=framebufferBegin(&surface,&stride);
 #if defined(NGB_PLAYER_BUILD) && defined(NGB_DIRECT3D)
-                uint64_t mb=mid?ngb_elapsed_ns():0;
+                uint64_t mb=measure_display?ngb_elapsed_ns():0;
 #endif
                 ngb_scanout_blit(dst,stride/4,1280,720);
 #ifdef NGB_PLAYER_BUILD
                 game_overlay(dst,stride/4);
 #endif
 #if defined(NGB_PLAYER_BUILD) && defined(NGB_DIRECT3D)
-                uint64_t mc=mid?ngb_elapsed_ns():0;
+                uint64_t mc=measure_display?ngb_elapsed_ns():0;
 #endif
                 framebufferEnd(&surface);
 #if defined(NGB_PLAYER_BUILD) && defined(NGB_DIRECT3D)
+#ifdef NGB_COMBAT_PERF
+                if(combat_display){uint64_t end=ngb_elapsed_ns();uint64_t v[]={next,end/1000,(mb-ma)/1000,(mc-mb)/1000,(end-mc)/1000};ngb_combat_row('D',v,5);}
+#endif
                 if(mid)mp_display(mid,ma,mb,mc,ngb_elapsed_ns());
 #endif
                 ngb_scanout_displayed(); ngb_movie_displayed();
@@ -581,6 +636,9 @@ int main(int argc,char **argv)
     if(audio_open)ngb_audio_device_close();
 #ifdef NGB_DIRECT3D
     write_guest_samples(PROFILE_WINDOWS);
+#endif
+#ifdef NGB_COMBAT_PERF
+    combat_close();
 #endif
     if (boot_log) fclose(boot_log);
     romfsExit();

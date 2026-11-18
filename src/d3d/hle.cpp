@@ -10,11 +10,14 @@ extern "C" void ngb_switch_frame(void);
 // NGB_RENDERER=mirror: every call still goes to the recompiled Direct3D (xemu draws and shows the
 // game); this keeps a copy of the state and draws it with the renderer as well, for comparing.
 #include "gpu/sync_constants.h"
+#include "native_diag.h"
+#include "native_pacing.h"
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -24,6 +27,12 @@ extern "C" void ngb_switch_frame(void);
 #include "gpu/backend.h"
 #include "gpu/state.h"
 #include "gpu/texture.h"
+#ifdef NGB_NATIVE_CONTRACT_TEST
+#include "gpu/readback.h"
+#include <condition_variable>
+#include <thread>
+#include <chrono>
+#endif
 #include "gpu/vertex.h"
 #include "kernel/kernel.h"
 
@@ -33,6 +42,15 @@ extern "C" { int ngb_render_threaded = 0; }
 
 #ifdef NGB_DIRECT3D
 #include "output.h"
+extern "C" uint32_t ngb_native_mesh_enabled;
+extern "C" int ngb_d3d_native_enabled(void) {
+#ifdef NGB_NATIVE_XDK
+    return 1;
+#else
+    static const bool on = std::getenv("NGB_D3D_NATIVE") && std::strcmp(std::getenv("NGB_D3D_NATIVE"), "0");
+    return on;
+#endif
+}
 #endif
 using kernel::HostPtr;
 using kernel::R32;
@@ -62,6 +80,13 @@ gpu::State g_state;
 // ticket; the interrupted call then emits its original packet in full.
 uint32_t captured_index_stack;
 uint64_t compact_draws, compact_indices;
+bool native_mesh_coherent;
+uint32_t native_mesh_changed = ~0u;
+uint64_t native_mesh_revision;
+unsigned native_model_depth;
+uint64_t native_mesh_attempts, native_mesh_batches, native_mesh_draws, native_mesh_syncs, native_mesh_reused;
+extern uint32_t native_draws;
+#include "native_simple.inc"
 #endif
 // The Switch adapter runs every guest worker as a fiber on one host thread.
 #ifndef NGB_DIRECT3D
@@ -118,6 +143,10 @@ void SyncDrawConstants() {
 #endif
 
 void SyncDeferred() {
+    NativeDiagScope diag(ND_DEFERRED);
+#ifdef NGB_DIRECT3D
+    native_mesh_changed = ~0u;
+#endif
     // deferred states live in the title's memory, which the inline SetRenderState and
     // SetTextureStageState write; so do the vertex shader constants
     // deferred and complex alike: the XDK keeps every one in D3D__RenderState, and inlined code
@@ -127,6 +156,9 @@ void SyncDeferred() {
                 (gpu::kRsMax - gpu::kRsDeferredFirst) * 4);
     // the simple states too, as SetRenderState keeps them (the device's defaults were set before
     // the hooks saw anything); not the pixel shader's, which SetPixelShader loads from its definition
+#ifdef NGB_DIRECT3D
+    NativeSyncSimple();
+#else
     const auto* methods = static_cast<const uint32_t*>(HostPtr(kSimpleEncode));
     const auto* states = static_cast<const uint32_t*>(HostPtr(kRenderState));
     for (uint32_t i = 0; i < gpu::kRsDeferredFirst; i++) {
@@ -134,6 +166,7 @@ void SyncDeferred() {
         if ((method >= 0x300 && method < 0x400) || method == 0x1D78)
             g_state.simple[method >> 2] = states[i];
     }
+#endif
     for (int s = 0; s < 4; s++)
         std::memcpy(g_state.tss[s].data(), HostPtr(kTextureState + s * 32 * 4), gpu::kTssBumpEnvMat00 * 4);
 #ifdef NGB_DIRECT3D
@@ -145,6 +178,14 @@ void SyncDeferred() {
     // material (+0xF00) are written into the device by inlined code
     uint32_t dev = R32(kDevicePtr);
     if (dev) {
+#ifdef NGB_DIRECT3D
+        if (ngb_d3d_native_enabled()) {
+            // NGB inlines palette unbinding in its own code. The device fields
+            // and Common reference bits are authoritative on both sides.
+            std::memcpy(g_state.textures.data(), HostPtr(dev + 0xf88), 16);
+            std::memcpy(g_state.palettes.data(), HostPtr(dev + 0xf98), 16);
+        }
+#endif
         for (uint32_t t = 0; t < 10; t++) {
             uint32_t pc = t < 2 ? t + 2 : t < 6 ? t + 14 : t + 250;
             std::memcpy(g_state.transforms[pc].data(), HostPtr(dev + 0xC60 + t * 64), 64);
@@ -186,13 +227,13 @@ std::shared_ptr<gpu::VertexShader> ReadVertexShader(uint32_t decl, uint32_t func
     return vs;
 }
 
-void Draw(uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) {
+void Draw(uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices, bool prepared = false) {
 #ifdef NGB_DIRECT3D
     if (!g_backend) return;
     bool measure = ngb_direct_detail_frame != 0;
     uint64_t start_ns = measure ? ngb_elapsed_ns() : 0;
 #endif
-    SyncDeferred();
+    if (!prepared) SyncDeferred();
     static bool nolight = std::getenv("NGB_D3D_NOLIGHT") != nullptr;   // debugging
     if (nolight) g_state.rs[gpu::kRsLighting] = 0;
     static bool nofog = std::getenv("NGB_D3D_NOFOG") != nullptr;       // debugging
@@ -216,28 +257,65 @@ void Draw(uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices)
 #else
     ViewportConstants(g_state.vsc[58], g_state.vsc[59]);
 #endif
-    if (g_backend) g_backend->Draw(g_state, prim, start, count, indices);
+    if (g_backend) {
+        NativeDiagScope diag(ND_RECORD);
 #ifdef NGB_DIRECT3D
+        if (prepared) {
+            g_backend->DrawPrepared(g_state, prim, start, count, indices,
+                                    {++native_mesh_revision, native_mesh_changed});
+            native_mesh_changed = 0;
+        } else
+#endif
+            g_backend->Draw(g_state, prim, start, count, indices);
+    }
+#ifdef NGB_DIRECT3D
+    if (ngb_d3d_native_enabled()) ++native_draws;
     if (measure) ngb_direct_draw_time(record_start - start_ns, ngb_elapsed_ns() - record_start);
 #endif
 }
 
 // A pushed index list (RunPushBuffer): BEGIN (0x17FC) with the primitive, then 16-bit index
 // pairs (0x1800) or 32-bit indices (0x1808), END (BEGIN 0). Anything else is reported once.
-void RunPushBuffer(uint32_t pb) {
+void RunPushBuffer(uint32_t pb, bool prepared = false) {
     uint32_t data = R32(pb + 4) | 0x80000000u, size = R32(pb + 0xC);
+#ifdef NGB_DIRECT3D
+    if (ngb_d3d_native_enabled()) {
+        // XDK RunPushBuffer reserves the last word for its return jump. The
+        // unpatched value in that slot is not part of the recorded commands.
+        if (size < 4 || (size & 3)) ngb_stop("invalid native push buffer size", pb);
+        size -= 4;
+    }
+#endif
     std::vector<uint16_t> idx;
     uint32_t prim = 0;
     for (uint32_t o = 0; o + 4 <= size;) {
         uint32_t h = R32(data + o), count = (h >> 18) & 0x7FF, method = h & 0x1FFC;
         if ((h & 0xE0000003) == 0x20000000 || (h & 3) == 1) break;   // jump or call: not expected
+        if (!count) { o += 4; continue; } // legal padding/NOP in preallocated push buffers
+#ifdef NGB_DIRECT3D
+        if (ngb_d3d_native_enabled() && count > (size - o - 4) / 4) {
+#ifdef NGB_NATIVE_PUSH_DIAG
+            // Host replay only: preserve the failing packet before the strict stop.
+            std::fprintf(stderr, "[PUSH-TRUNCATED] pb=%08x common=%08x data=%08x size=%u allocation=%u offset=%u header=%08x count=%u method=%04x prim=%u indices=%zu\n",
+                         pb, R32(pb), data, size, R32(pb + 16), o, h, count, method, prim, idx.size());
+            if (size <= 1024 * 1024) {
+                if (FILE* dump = std::fopen("failed-push-buffer.bin", "wb")) {
+                    std::fwrite(HostPtr(pb, 20), 1, 20, dump);
+                    std::fwrite(HostPtr(data, size), 1, size, dump);
+                    std::fclose(dump);
+                }
+            }
+#endif
+            ngb_stop("truncated native index push buffer", pb);
+        }
+#endif
         const uint32_t* v = static_cast<const uint32_t*>(HostPtr(data + o + 4));
         if (method == 0x17FC) {
             if (v[0]) {
                 prim = v[0];
                 idx.clear();
             } else if (prim) {
-                Draw(prim, 0, uint32_t(idx.size()), reinterpret_cast<const uint8_t*>(idx.data()));
+                Draw(prim, 0, uint32_t(idx.size()), reinterpret_cast<const uint8_t*>(idx.data()), prepared);
                 prim = 0;
             }
         } else if (method == 0x1800) {
@@ -248,6 +326,9 @@ void RunPushBuffer(uint32_t pb) {
         } else if (method == 0x1808) {
             for (uint32_t i = 0; i < count; i++) idx.push_back(uint16_t(v[i]));
         } else {
+#ifdef NGB_DIRECT3D
+            if (ngb_d3d_native_enabled()) ngb_stop("unsupported native index push method", method);
+#endif
             static uint32_t seen[64];
             static int n;
             bool known = false;
@@ -260,7 +341,7 @@ void RunPushBuffer(uint32_t pb) {
         o += 4 + 4 * count;
     }
     // a buffer that ends without END still draws what it began
-    if (prim && !idx.empty()) Draw(prim, 0, uint32_t(idx.size()), reinterpret_cast<const uint8_t*>(idx.data()));
+    if (prim && !idx.empty()) Draw(prim, 0, uint32_t(idx.size()), reinterpret_cast<const uint8_t*>(idx.data()), prepared);
 }
 
 // The hooked functions Before does nothing for, found at their first call: those skip g_lock. Taken and
@@ -762,9 +843,75 @@ void TakeInit() {
     }
 }
 
+#ifdef NGB_DIRECT3D
+#include "native_device.inc"
+#include "native_material.inc"
+#ifdef NGB_NATIVE_CONTRACT_TEST
+#include "native_contract.inc"
+#endif
+#endif
+
 }  // namespace
 
+#include "native_diag.inc"
+
 #ifdef NGB_DIRECT3D
+namespace {
+uint64_t material_frame, material_mode, material_attempts, material_batches;
+}
+extern "C" { uint32_t ngb_native_material_enabled = 1; }
+static bool NativeMaterialEnabled() {
+    if (!ngb_d3d_native_enabled()) return 0;
+    static const bool encoding_matches = [] {
+        const unsigned methods[] = {0x304, 0x340, 0x344, 0x348, 0x368, 0x35c};
+        const unsigned states[] = {59, 61, 62, 63, 71, 64};
+        for (unsigned j = 0; j < 6; ++j) {
+            unsigned matches = 0;
+            for (unsigned i = 0; i < gpu::kRsDeferredFirst; ++i)
+                if ((R32(kSimpleEncode + i * 4) & 0x1ffc) == methods[j]) {
+                    if (i != states[j]) return false;
+                    ++matches;
+                }
+            if (matches != 1) return false;
+        }
+        return true;
+    }();
+    if (!encoding_matches) return false;
+    static const int mode = [] {
+        const char* value = std::getenv("NGB_NATIVE_MATERIAL");
+        return value && !std::strcmp(value, "ab") ? 2 : value && !std::strcmp(value, "0") ? 0 : 1;
+    }();
+    unsigned phase = (native_frames / 8) & 3;
+    return mode == 2 ? (phase == 1 || phase == 2) : mode;
+}
+
+#include "native_mesh.inc"
+extern "C" int ngb_d3d_material_fixed(uint32_t address) {
+    material_frame = native_frames + 1;
+    material_mode = NativeMaterialEnabled();
+    ++material_attempts;
+    if (!material_mode) return 0;
+    NativeFlush(); NativeDiagScope diag(ND_STATE);
+    material::Fixed(address);
+    ++material_batches;
+    return 1;
+}
+extern "C" int ngb_d3d_material_texture(unsigned stage, uint32_t address) {
+    if (!NativeMaterialEnabled() || stage >= 4) return 0;
+    NativeFlush(); NativeDiagScope diag(ND_STATE);
+    material::Texture(stage, address);
+    return 1;
+}
+// Used by the isolated host comparison; no per-draw clock or extra SD logging.
+extern "C" void ngb_d3d_material_stats(uint64_t out[4]) {
+    out[0] = native_frames; out[1] = ngb_native_material_enabled;
+    out[2] = ngb_native_material_meshes; out[3] = material_batches;
+    ngb_native_material_meshes = 0;
+    material_attempts = material_batches = 0;
+    // The host ABBA selector runs once per completed frame. The reference
+    // helper calls take only an assembly branch, without entering C++ first.
+    ngb_native_material_enabled = NativeMaterialEnabled();
+}
 extern "C" int ngb_direct_index_capture_ready(uint32_t stack) {
     return stack && captured_index_stack == stack && g_take[D3DF_CDevice_SetStateVB];
 }
@@ -782,6 +929,12 @@ extern "C" void ngb_direct_index_stats(uint64_t* draws, uint64_t* indices) {
 #endif
 
 extern "C" int d3d_hle_call(int fn, uint32_t regs[8]) {
+#ifdef NGB_DIRECT3D
+    if (ngb_d3d_native_enabled()) {
+        if (unsigned(fn) >= D3DF_COUNT) ngb_stop("invalid native D3D hook", fn);
+        return NativeCall(fn, Call{regs});
+    }
+#endif
     if (!g_started) {
         Start();
         if (g_started) TakeInit();
@@ -802,10 +955,17 @@ extern "C" int d3d_hle_call(int fn, uint32_t regs[8]) {
 // g_backend is set once, at the first call, by this same thread.
 extern "C" void d3d_hle_frame_wait(void) {
     if (g_backend) g_backend->FrameWait();
+#ifdef NGB_NATIVE_DIAG
+    if (ngb_d3d_native_enabled()) NativeDiagFrame(native_frames);
+#endif
 }
 
 // D3DDevice_BeginVisibilityTest, inlined into the title (src/d3d/d3d_hooks.c)
 extern "C" void d3d_visibility_begin(void) {
+#ifdef NGB_DIRECT3D
+    // The inline packet is consumed in order with the following API call.
+    if (ngb_d3d_native_enabled()) return;
+#endif
     if (!g_started) Start();
 #ifndef NGB_DIRECT3D
     std::lock_guard<std::recursive_mutex> lock(g_lock);
@@ -819,6 +979,15 @@ extern "C" void d3d_hle_after(int fn, const uint32_t regs[8]) {
 }
 
 #ifdef NGB_DIRECT3D
+extern "C" void ngb_d3d_native_poll(void) {
+    if (ngb_d3d_native_enabled()) NativePoll();
+}
+extern "C" int d3d_hle_native_address(uint32_t address, uint32_t regs[8]) {
+    if (!ngb_d3d_native_enabled()) return 0;
+    for (unsigned i = 0; i < D3DF_COUNT; ++i)
+        if (d3d_funcs[i].va == address) return NativeCall(i, Call{regs});
+    return NativeHelper(address, Call{regs});
+}
 extern "C" void ngb_direct_park_prologue(void)
 {
     ngb_direct_finish_put();
@@ -849,5 +1018,15 @@ extern "C" void ngb_direct_close(void)
     std::memset(g_program, 0, sizeof(g_program));
     guest_header = 0;
     g_started = false;
+    native_push = native_read = native_lights = native_back = native_front = native_depth = 0;
+    native_prim = native_callback = native_last_report = native_draws = native_frames = 0;
+    native_scratch = native_scratch_bytes = native_callback_data = native_vblanks = 0;
+    native_vblank_due = 0;
+    native_flushing = native_polling = false;
+    native_callbacks.clear(); native_inline.clear(); native_vertices.clear();
+    native_resource_events.clear(); native_current_fn = native_present_blank = 0;
+    native_pacer = {};
+    native_helper_calls.clear();
+    std::memset(native_calls, 0, sizeof native_calls);
 }
 #endif

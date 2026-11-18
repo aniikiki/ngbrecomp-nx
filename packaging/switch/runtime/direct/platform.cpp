@@ -51,6 +51,9 @@ void nv2a_quality_get(int* scale, int* aniso, int* shadow, int* msaa)
 #else
     *scale = *shadow = *msaa = 1;
     *aniso = 0; // preserve the game's filtering, including single-level textures
+#ifndef __SWITCH__
+    if (const char* samples = std::getenv("NGB_REPLAY_MSAA")) *msaa = std::atoi(samples);
+#endif
 #endif
 }
 int nv2a_vk_share(nv2a_vk_shared*) { return -1; }
@@ -113,6 +116,9 @@ extern "C" void ngb_direct_render_core(void) {
 // Elapsed render work outside an explicit guest wait. Includes driver waits
 // and scheduling on both cores, so this is wall-time overlap, not CPU time.
 extern "C" void ngb_direct_render_event(int renderer, int active) {
+#ifdef NGB_COMBAT_PERF
+    if(!renderer && ngb_combat_enabled)ngb_combat_wait(active);
+#endif
     if (!NGB_DIAG) return;
     std::lock_guard lock(timing_mutex);
     uint64_t now = ngb_elapsed_ns(), dt = now - edge_ns;

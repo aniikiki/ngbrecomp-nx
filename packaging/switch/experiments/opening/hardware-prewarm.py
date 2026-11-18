@@ -26,19 +26,7 @@ extern "C" void ngb_prepare_title_device(){
     assert s.count(k)==1
     return 'extern "C" void ngb_kernel_log(const char*);\n'+s.replace(k,'    title_device.reset();\n'+k)
 def backend(s):
-    k='    CacheOpen();'
-    assert s.count(k)==1
-    s=s.replace(k,k+'''
-    if(FILE* flag=std::fopen("sdmc:/switch/ngb-runtime/disable-prewarm.flag","rb")){
-        std::fclose(flag);ngb_kernel_log("3D scene [WARM_MODE] enabled=0");
-    }else{
-        ngb_kernel_log("3D scene [WARM_MODE] enabled=1");
-        Prewarm();
-    }
-''')
-    k='    prewarm_done_ = 1;'
-    i=s.index(k,s.index('    WarmSamples(uint32_t(ms));',s.index('void VulkanBackend::Prewarm()')))
-    return s[:i]+'''    char line[160];
-    std::snprintf(line,sizeof line,"3D scene [WARM_DONE] records=%zu modules=%u pipelines=%u",recs.size(),made,pipes);
-    ngb_kernel_log(line);
-'''+s[i:]
+    # Direct3D now finishes prewarming in the backend itself, on both host and
+    # Switch. Keep the title-device transformation, without warming twice.
+    assert 'if (!disabled && !std::getenv("NGB_D3D_NO_CACHE")) Prewarm();' in s
+    return s

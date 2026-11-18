@@ -30,6 +30,7 @@ static struct {
  * the same instant. The sampler reads it before resuming the worker. */
 static atomic_uint sample_scope;
 uint64_t ngb_material_hits[MaterialCount];
+uint64_t ngb_native_material_meshes;
 
 static void publish_scope(void)
 {
@@ -90,7 +91,7 @@ void ngb_direct_timing_flip(unsigned completed)
 void ngb_direct_mesh_scope(int enter)
 {
     charge_scope();
-    if (enter) ++index_time.mesh_depth;
+    if (enter) { ++index_time.mesh_depth; ++ngb_native_material_meshes; }
     else --index_time.mesh_depth;
     publish_scope();
 }
@@ -231,6 +232,34 @@ int d3d_hook(int fn)
     esp = regs[4]; g_ebp = regs[5]; esi = regs[6]; edi = regs[7];
     return 1;
 }
+
+int d3d_hle_native_address(uint32_t address, uint32_t regs[8]);
+int ngb_d3d_native_entry(uint32_t address)
+{
+    if (!ngb_d3d_native_enabled()) ngb_stop("native graphics objects require native mode", address);
+    uint32_t regs[] = {eax, ecx, edx, ebx, esp, g_ebp, esi, edi};
+    int took = d3d_hle_native_address(address, regs);
+    eax = regs[0]; ecx = regs[1]; edx = regs[2]; ebx = regs[3];
+    esp = regs[4]; g_ebp = regs[5]; esi = regs[6]; edi = regs[7];
+    return took;
+}
+
+int ngb_direct_material_fixed(void)
+{
+    if (g_df || !ngb_d3d_material_fixed(esi)) return 0;
+    esp += 4;
+    return 1;
+}
+
+int ngb_direct_material_texture(void)
+{
+    if (g_df || !ngb_d3d_material_texture(eax, edi)) return 0;
+    esp += 4;
+    return 1;
+}
+
+#include "native_mesh.inc"
+#include "native_model.inc"
 
 void d3d_after(int fn)
 {

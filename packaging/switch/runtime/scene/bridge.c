@@ -271,6 +271,13 @@ static void submit(uint32_t method, uint32_t value)
 
 static void record_flip(void)
 {
+#ifdef NGB_COMBAT_PERF
+    if(ngb_combat_enabled && ngb_fast_ram){
+        uint16_t hp,maxhp;memcpy(&hp,ngb_fast_ram+0x58a566,2);memcpy(&maxhp,ngb_fast_ram+0x58a564,2);
+        ngb_combat_guest(scene_flips+1,ngb_fast_ram[0x589758],ngb_fast_ram[0x58975a],ngb_fast_ram[0x589755],
+          hp,maxhp,ngb_scanout_display_count(),work.transfers,work.file_bytes,work.file_ns/1000);
+    }
+#endif
     if (!NGB_DIAG) { scene_flips += 1; return; }
     uint64_t now = ngb_elapsed_ns();
     collect_draw_timers();
@@ -374,8 +381,22 @@ static void activate_scene(void)
 }
 
 #ifdef NGB_DIRECT3D
+void ngb_scene_native_start(void)
+{
+    if (!ngb_scene_active) activate_scene();
+}
+
+void ngb_scene_native_present(unsigned submitted_draws)
+{
+    draws += submitted_draws;
+    record_flip();
+}
+#endif
+
+#ifdef NGB_DIRECT3D
 void ngb_scene_begin_prologue(void)
 {
+    if (ngb_d3d_native_enabled()) return;
     if (presenter_phase == PROLOGUE_FINISHED) presenter_phase = PROLOGUE_PLAYING;
     if (!ngb_scene_active) return;
     presenter_phase = PROLOGUE_PLAYING;

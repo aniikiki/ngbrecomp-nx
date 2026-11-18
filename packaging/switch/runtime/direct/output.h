@@ -6,6 +6,24 @@ extern "C" {
 [[noreturn]] void ngb_stop(const char*, uint32_t);
 #endif
 extern int ngb_scene_active;
+int ngb_d3d_native_enabled(void);
+int ngb_d3d_native_entry(uint32_t address);
+int ngb_d3d_material_fixed(uint32_t address);
+int ngb_d3d_material_texture(unsigned stage, uint32_t address);
+void ngb_d3d_material_stats(uint64_t out[4]);
+void ngb_d3d_mesh_stats(uint64_t out[8]);
+unsigned ngb_d3d_model_suspend(void);
+void ngb_d3d_model_resume(unsigned depth);
+extern uint64_t ngb_native_material_meshes;
+void ngb_d3d_native_poll(void);
+void ngb_d3d_native_report(void);
+void ngb_scene_native_start(void);
+void ngb_scene_native_present(unsigned draws);
+uint32_t ngb_graphics_pool_alloc(uint32_t bytes);
+void ngb_graphics_pool_free(uint32_t address);
+void ngb_graphics_callback(uint32_t routine, uint32_t argument);
+uint32_t ngb_graphics_guest_call(uint32_t routine, const uint32_t *arguments, unsigned count);
+void ngb_graphics_wait_until(uint64_t nanoseconds);
 void ngb_scanout_direct(const void *bgra);
 void ngb_direct_close(void);
 void ngb_direct_park_prologue(void);

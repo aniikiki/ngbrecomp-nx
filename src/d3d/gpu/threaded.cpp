@@ -36,6 +36,7 @@
 #include <vector>
 
 #include "gpu/backend.h"
+#include "native_diag.h"
 #include "gpu/headers.h"
 #include "gpu/vertex.h"
 #include "kernel/kernel.h"
@@ -48,6 +49,9 @@ extern void (*nv2a_user_read_hook)(void);     // xboxrecomp xemu/user.c
 
 // NGB_D3D_GATE=0 (a test): the GPU emulation not held back
 static void Gate(int on, uint32_t put) {
+#ifdef NGB_DIRECT3D
+    if (ngb_d3d_native_enabled()) return;
+#endif
     static const bool off = std::getenv("NGB_D3D_GATE") && *std::getenv("NGB_D3D_GATE") == '0';
     nv2a_pfifo_gate(off ? 0 : on, put);
 }
@@ -83,7 +87,7 @@ static uint64_t PaceNowUs() {
         std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
-enum class Op : uint8_t { State, Headers, Peek, Draw, Clear, Copy, Present, Flush, Gamma, VisBegin, VisEnd };
+enum class Op : uint8_t { State, Headers, Peek, Draw, Clear, Copy, Present, Flush, Gamma, VisBegin, VisEnd, Sync };
 
 struct Cmd {
     Op op;
@@ -172,6 +176,14 @@ constexpr auto StateRanges() {
 }
 
 constexpr auto kStateRanges = StateRanges();
+#ifdef NGB_DIRECT3D
+static_assert(kStateRanges.size() == 15 &&
+              kStateRanges[6].off == offsetof(State, rs) &&
+              kStateRanges[7].off == offsetof(State, index_buffer) &&
+              kStateRanges[10].off == offsetof(State, transforms) + 16 * 64 &&
+              kStateRanges[11].off == offsetof(State, transforms) + 256 * 64 &&
+              kStateRanges[12].off == offsetof(State, material));
+#endif
 
 constexpr size_t kPiece = 64;
 
@@ -280,11 +292,19 @@ public:
     bool Init(uint32_t width, uint32_t height) override { return inner_->Init(width, height); }
 
     void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices, const IndexBounds*) override {
+        RecordDraw(s, prim, start, count, indices, {0, ~0u});
+    }
+    void DrawPrepared(const State& s, uint32_t prim, uint32_t start, uint32_t count,
+                      const uint8_t* indices, PreparedState changes) override {
+        RecordDraw(s, prim, start, count, indices, changes);
+    }
+    void RecordDraw(const State& s, uint32_t prim, uint32_t start, uint32_t count,
+                    const uint8_t* indices, PreparedState changes) {
         std::lock_guard lock(cap_);
 #ifdef NGB_DIRECT3D
         const size_t before = cur_->cmds.size();
 #endif
-        SendState(s, start + count);
+        SendState(s, start + count, changes);
 #ifdef NGB_DIRECT3D
         if (before == cur_->cmds.size() && before && cur_->cmds.back().op == Op::Draw) {
             ++same_state_pairs_;
@@ -385,16 +405,54 @@ public:
         }
     }
     void FrameWait() override {
+        NativeDiagScope diag(ND_FRAME_WAIT);
         uint64_t id = frame_wait_;
         frame_wait_ = 0;
         if (thread_ && id) Wait(id);
     }
 
+    // A native API fence names a recorded batch. Reaching it means all guest
+    // input has been uploaded; Vulkan owns the GPU lifetimes from that point.
+    uint32_t Fence() override {
+        std::lock_guard lock(cap_);
+        return uint32_t(Submit());
+    }
+    bool FencePending(uint32_t fence) override {
+        return thread_ && fence && done_.load(std::memory_order_acquire) < fence;
+    }
+    void WaitFence(uint32_t fence) override {
+        NativeDiagScope diag(ND_FENCE_WAIT);
+        if (thread_ && fence) Wait(fence);
+    }
+    bool Busy(uint32_t resource) override {
+        std::lock_guard lock(cap_);
+        return thread_ && done_.load() < ResourceBatch(resource);
+    }
+    void WaitResource(uint32_t resource) override {
+        NativeDiagScope diag(ND_RESOURCE_WAIT);
+        uint64_t id = 0;
+        {
+            std::lock_guard lock(cap_);
+            id = ResourceBatch(resource);
+        }
+        if (thread_ && id) Wait(id);
+    }
+
     void Sync(uint32_t data, uint32_t size) override {
-        if (!thread_) inner_->Sync(data, size);   // (the renderer writes nothing back to the title's memory)
+        NativeDiagScope diag(ND_READBACK_WAIT);
+        uint64_t id;
+        {
+            std::lock_guard lock(cap_);
+            Cmd c{Op::Sync}; c.a = data; c.b = size;
+            cur_->cmds.push_back(c);
+            id = Submit();
+        }
+        if (thread_) Wait(id);
     }
     void SyncLate(uint32_t data) override {
-        if (!thread_) inner_->SyncLate(data);
+        // A synchronous result is also valid for a non-blocking lock. This
+        // uncommon path favours correctness until an asynchronous copy exists.
+        Sync(data, 0);
     }
     void Flush() override {
         std::lock_guard lock(cap_);
@@ -549,8 +607,32 @@ private:
     }
 
     // a header as it is now, to the renderer's copies when it changed since it was last sent
+    uint64_t ResourceBatch(uint32_t resource) {
+        if (!resource) return 0;
+        uint64_t id = 0;
+        auto take = [&](const auto& map, uint32_t key) {
+            auto i = map.find(key); if (i != map.end()) id = std::max(id, i->second);
+        };
+        take(resource_batches_, resource);
+        take(data_batches_, kernel::R32(resource + 4) & 0x0fffffffu);
+        if ((kernel::R32(resource) & 0x70000) == 0x50000) {
+            uint32_t parent = kernel::R32(resource + 20);
+            if (parent) take(resource_batches_, parent);
+        }
+        return id;
+    }
     void SendHeader(uint32_t header) {
         if (!header) return;
+#ifdef NGB_DIRECT3D
+        if (ngb_d3d_native_enabled()) {
+            resource_batches_[header] = cur_->id;
+            data_batches_[kernel::R32(header + 4) & 0x0fffffffu] = cur_->id;
+            if ((kernel::R32(header) & 0x70000) == 0x50000) {
+                uint32_t parent = kernel::R32(header + 20);
+                if (parent) resource_batches_[parent] = cur_->id;
+            }
+        }
+#endif
         HeaderCopy now{};
         // vertex buffer, index buffer and palette headers are 12 bytes: reading 20 can run off the end of the heap
         uint32_t type = kernel::R32(header) & 0x70000;   // 0 vertex, 0x10000 index, 0x30000 palette
@@ -586,6 +668,17 @@ private:
         cur_->cmds.push_back(c);
         pending_headers_.clear();
     }
+#ifdef NGB_DIRECT3D
+    void VerifyPreparedHeader(uint32_t header) {
+        if (!header) return;
+        auto it = sent_headers_.find(header);
+        uint32_t type = kernel::R32(header) & 0x70000;
+        size_t bytes = type < 0x20000 || type == 0x30000 ? 12 : 20;
+        if (it == sent_headers_.end() ||
+            std::memcmp(it->second.w, kernel::HostPtr(header), bytes))
+            ngb_stop("native mesh recorder missed resource change", header);
+    }
+#endif
 
     // the game's side of the call, when it changed
     void SendPeek(const State& s) {
@@ -634,9 +727,15 @@ private:
 
 #ifdef NGB_DIRECT3D
     template<size_t I>
-    void SendFixedRange(const uint8_t* now) {
+    void SendFixedRange(const uint8_t* now, uint32_t changed) {
         constexpr Range r = kStateRanges[I];
         const auto* previous = reinterpret_cast<const uint8_t*>(&sent_) + r.off;
+        if (!(changed & (1u << I))) {
+            static const bool verify = std::getenv("NGB_NATIVE_MESH_VERIFY") != nullptr;
+            if (verify && std::memcmp(previous, now + r.off, r.len))
+                ngb_stop("native mesh recorder missed state change", I);
+            return;
+        }
         // These fixed-size comparisons fold to direct loads for small fields.
         // Keep the original delta layout on changes, including its group boundaries.
         if (!std::memcmp(previous, now + r.off, r.len)) return;
@@ -644,35 +743,62 @@ private:
         else SendRange(now, r);
     }
     template<size_t... I>
-    void SendFixedRanges(const uint8_t* now, std::index_sequence<I...>) {
-        (SendFixedRange<I>(now), ...);
+    void SendFixedRanges(const uint8_t* now, std::index_sequence<I...>, uint32_t changed) {
+        (SendFixedRange<I>(now, changed), ...);
     }
 #endif
 
     // what changed since the last command, in 64 byte pieces; the headers the call names; the game's side.
     // vertices: how many a non-indexed draw reads (a DrawVerticesUP's to copy)
-    void SendState(const State& s, uint32_t vertices) {
+    void SendState(const State& s, uint32_t vertices, PreparedState changes = {0, ~0u}) {
         title_ = std::this_thread::get_id();
         const uint8_t* now = reinterpret_cast<const uint8_t*>(&s);
+#ifdef NGB_DIRECT3D
+        uint32_t changed = ~0u;
+        if (changes.revision && fixed_source_ == &s && changes.revision == fixed_revision_ + 1)
+            changed = changes.changed;
+        fixed_source_ = changes.revision ? &s : nullptr;
+        fixed_revision_ = changes.revision;
+        // Reusing headers is confined to this batch: resource lifetime maps
+        // must be refreshed for every new batch, and UP bytes on every draw.
+        bool reuse_headers = !(changed & PreparedState::ResourceHeaders) &&
+            header_batch_ == cur_->id && !header_has_up_;
+        static const bool verify_headers = std::getenv("NGB_NATIVE_MESH_VERIFY") != nullptr;
+        if (reuse_headers && verify_headers) {
+            for (uint32_t h : s.textures) VerifyPreparedHeader(h);
+            for (uint32_t h : s.palettes) VerifyPreparedHeader(h);
+            for (const auto& st : s.streams) VerifyPreparedHeader(st.vb);
+            VerifyPreparedHeader(s.rt.header); VerifyPreparedHeader(s.zs.header);
+        }
+        if (!reuse_headers) {
+            header_batch_ = cur_->id;
+            header_has_up_ = false;
+#endif
         for (int i = 0; i < 4; i++) {
             SendHeader(s.textures[size_t(i)]);
             SendHeader(s.palettes[size_t(i)]);
         }
         for (const auto& st : s.streams) {
             if (!st.vb) continue;
-            if (kernel::R32(st.vb) & 0x80000000u)
+            if (kernel::R32(st.vb) & 0x80000000u) {
+#ifdef NGB_DIRECT3D
+                header_has_up_ = true;
+#endif
                 SendUpHeader(st.vb, vertices * st.stride);
-            else
+            } else
                 SendHeader(st.vb);
         }
         SendHeader(s.rt.header);
         SendHeader(s.zs.header);
         FlushHeaders();
+#ifdef NGB_DIRECT3D
+        }
+#endif
         SendPeek(s);
         Cmd c{Op::State};
         size_t first = cur_->bytes.size();
 #ifdef NGB_DIRECT3D
-        SendFixedRanges(now, std::make_index_sequence<kStateRanges.size()>{});
+        SendFixedRanges(now, std::make_index_sequence<kStateRanges.size()>{}, changed);
 #else
         for (const Range& r : kStateRanges) SendRange(now, r);
 #endif
@@ -967,6 +1093,7 @@ private:
             case Op::Gamma: inner_->SetGamma(data); break;
             case Op::VisBegin: inner_->VisibilityBegin(); break;
             case Op::VisEnd: inner_->VisibilityEnd(c.a); break;
+            case Op::Sync: inner_->Sync(c.a, c.b); break;
         }
     }
 
@@ -986,6 +1113,8 @@ private:
     std::thread::id title_, render_;
 #ifdef NGB_DIRECT3D
     const State* constants_source_ = nullptr;
+    const State* fixed_source_ = nullptr;
+    uint64_t fixed_revision_ = 0;
     uint64_t constants_revision_ = 0;
     unsigned same_state_pairs_ = 0, list_pairs_ = 0, merged_strips_ = 0;
     IndexSlot index_slots_[2048]{};
@@ -995,6 +1124,12 @@ private:
 #endif
     State sent_;   // the state as the renderer will have it
     std::unordered_map<uint32_t, HeaderCopy> sent_headers_;
+#ifdef NGB_DIRECT3D
+    uint64_t header_batch_ = 0;
+    bool header_has_up_ = false;
+#endif
+    std::unordered_map<uint32_t, uint64_t> resource_batches_;
+    std::unordered_map<uint32_t, uint64_t> data_batches_;
     std::vector<HeaderSend> pending_headers_;
     Peek sent_peek_;
     bool peek_sent_ = false;
