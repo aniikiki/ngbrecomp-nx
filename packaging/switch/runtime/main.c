@@ -421,7 +421,7 @@ static void guest_worker(void *arg)
     (void)arg;
     /* Retail levels read far beyond the attract-mode slices in RomFS.
      * Mount the user's extracted disc directly, without a second copy or
-     * a persistent SD cache. ngb_boot validates the XBE against this lift. */
+     * a persistent SD cache. ngb_boot checks the XBE's layout for loading. */
     static const char external[]="sdmc:/switch/ngb-runtime/disc";
     struct stat st;
     const char *image="sdmc:/switch/ngb-runtime/disc/default.xbe";

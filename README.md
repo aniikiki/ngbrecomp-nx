@@ -2,7 +2,7 @@
 
 这是原版 Xbox《忍者龙剑传 Black》的非官方 Switch 移植版，基于 [Ninja Gaiden Black Recompiled](https://github.com/gamboozino/ngbrecomp)。游戏通过 Switch 的 Homebrew Menu 启动。
 
-**当前版本：0.57.7。** 游戏音效和过场动画使用 48 kHz 双声道输出，音量由 Switch 系统控制。
+**当前版本：0.57.7-xbe1（预发布版）。** 基于 0.57.7，移除 `default.xbe` 的整文件哈希和固定文件大小限制。游戏音效和过场动画使用 48 kHz 双声道输出，音量由 Switch 系统控制。
 
 ## 首次安装
 
@@ -26,6 +26,8 @@ SD 卡/
 ```
 
 如果启动时提示缺少 `default.xbe`，请检查它是否**直接**位于 `disc/` 下。例如，`disc/Ninja Gaiden Black/default.xbe` 就多了一层目录。
+
+本版允许 XBE 文件头、证书或填充字节存在差异，不再要求文件与开发时使用的文件逐字一致。仍需使用美版零售版游戏数据；移除哈希限制不代表支持其他地区、修订版或修改过游戏代码的版本。无法读取、文件截断或地址布局不支持时，启动画面会显示具体原因。
 
 ## 操作与设置
 

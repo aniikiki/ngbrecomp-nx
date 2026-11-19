@@ -11,7 +11,7 @@ from material_cache import compatibility
 
 root = Path('/work')
 diagnostics = '--diagnostics' in sys.argv
-version = '0.57.7'
+version = '0.57.7-xbe1'
 assert '--seed' in sys.argv, 'supply the validated portable material seed with --seed'
 seed = Path(sys.argv[sys.argv.index('--seed') + 1]).resolve()
 assert seed.is_relative_to(root / 'build')
