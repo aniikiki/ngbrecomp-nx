@@ -44,5 +44,15 @@ int main(int argc, char** argv) {
     gpu::CacheWriter failed; failed.Own(f); failed.Start();
     failed.Append(f, &record, sizeof(record)); failed.Stop();
     assert(failed.Errors());
+    const std::string path = std::string(argv[1]) + ".pipeline";
+    assert(gpu::ReplaceCacheFile(path, "first", 5));
+    assert(gpu::ReplaceCacheFile(path, "second", 6));
+    // Stop between moving the previous cache aside and installing the temp.
+    assert(std::rename(path.c_str(), (path + ".bak").c_str()) == 0);
+    f = gpu::OpenCacheForRead(path);
+    char recovered[7] = {};
+    assert(f && std::fread(recovered, 1, sizeof(recovered), f) == 6);
+    assert(std::strcmp(recovered, "second") == 0 && std::fclose(f) == 0);
+    assert(std::remove(path.c_str()) == 0);
     std::puts("PASS: blocked I/O leaves producers running; ordered records, joined drain, bounded overflow, write errors");
 }

@@ -13,18 +13,21 @@ enum NativeDiagKind {
 #ifdef NGB_NATIVE_DIAG
 extern bool ngb_native_diag_on, ngb_native_diag_sample;
 struct NativeDiagScope {
-    NativeDiagScope* previous = nullptr;
-    unsigned kind, worker = 0;
+    NativeDiagScope* previous;
+    unsigned kind, worker;
     bool linked = false;
-    explicit NativeDiagScope(unsigned kind);
-    ~NativeDiagScope();
+    explicit NativeDiagScope(unsigned k) { if (ngb_native_diag_on) Enter(k); }
+    ~NativeDiagScope() { if (linked) Leave(); }
     NativeDiagScope(const NativeDiagScope&) = delete;
     NativeDiagScope& operator=(const NativeDiagScope&) = delete;
+private:
+    void Enter(unsigned k);
+    void Leave();
 };
 void NativeDiagFrame(unsigned frame);
 void NativeDiagWords(unsigned words);
 struct NativeDiagSwap {
-    uint64_t v[19]{};
+    uint64_t v[19];
     bool on;
     NativeDiagSwap(unsigned frame, unsigned interval);
     void Plan(unsigned periods, unsigned previous, unsigned current, unsigned target, bool retargeted);

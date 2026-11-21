@@ -1,6 +1,7 @@
 /* Guest opens the panel; only the pad owner edits it. The framebuffer owner
  * renders a snapshot. No filesystem reads or writes in the gameplay loop. */
 #include "recomp_settings.h"
+#include "direct/display.h"
 #include "../../../src/launcher_font.h"
 #define PREF_FILE "sdmc:/switch/ngb-runtime/recomp-settings.ini"
 #include "settings_catalog.h"
@@ -171,7 +172,8 @@ static void panel_text(u32 *dst,unsigned stride,int x,int y,const char *s,u32 fg
         const uint8_t *glyph=launcher_font_px+launcher_font_off[c];
         for(unsigned j=0;j<32;j++)for(unsigned i=0;i<w;i++){
             unsigned a=glyph[j*w+i];if(!a)continue;
-            u32 *d=dst+(y+j)*stride+x+i,v=0xff000000;
+            u32 *d=dst+(y+j)*stride+x+i;
+            u32 v=(a+(*d>>24)*(255-a)/255)<<24;
             for(int k=0;k<24;k+=8)v|=((((fg>>k)&255)*a+((*d>>k)&255)*(255-a))/255)<<k;
             *d=v;
         }
@@ -208,10 +210,8 @@ static void draw_exit_panel(Framebuffer *fb,unsigned view){
     u32 bytes,*dst=framebufferBegin(fb,&bytes);ngb_scanout_blit(dst,bytes/4,1280,720);
     exit_contents(dst,bytes/4,view);framebufferEnd(fb);
 }
-static void draw_settings(Framebuffer *fb,unsigned view)
+static void settings_contents(u32 *dst,unsigned stride,unsigned view)
 {
-    u32 bytes,*dst=framebufferBegin(fb,&bytes);unsigned stride=bytes/4;
-    ngb_scanout_blit(dst,stride,1280,720);
     unsigned page=(view>>8)&255,row=view&255,start=0,n=PAGES;
     if(page){while(start<COUNT && settings[start].page!=page-1)start++;n=0;while(start+n<COUNT && settings[start+n].page==page-1)n++;}
     unsigned first=row>=8?row-7:0;
@@ -236,18 +236,33 @@ static void draw_settings(Framebuffer *fb,unsigned view)
     if(page){const Preference *p=settings+start+row;hint=(p->id==7 || p->id==30)?"Takes effect next launch.":p->flags&FIXED?"Fixed by this Switch build.":p->flags&SESSION?"This play session only.":"Changes are saved to the SD card.";}
     panel_text(dst,stride,170,566,view&SAVE_ERROR?"SD card write failed.":hint,0xffbcbab8);
     panel_text(dst,stride,170,610,page==CONTROLS+1?"Left / Right: Change    X: Defaults    B: Back    +: Close":page?"Left / Right: Change      B: Back      +: Close":"Up / Down: Select      +: Close",0xff80c7eb);
+}
+static void draw_settings(Framebuffer *fb,unsigned view){
+    u32 bytes,*dst=framebufferBegin(fb,&bytes);
+    ngb_scanout_blit(dst,bytes/4,1280,720);
+    settings_contents(dst,bytes/4,view);
     framebufferEnd(fb);
 }
 
-static void game_overlay(u32 *dst,unsigned stride){
-    if(atomic_load_explicit(&exit_preview,memory_order_relaxed))exit_contents(dst,stride,0);
+/* Only touched HUD rectangles are cleared, uploaded and blended each frame. */
+static void overlay_region(NgbScreenFrame *frame,u32 *pixels,NgbScreenRect r){
+    if(!frame)return;
+    frame->rects[frame->count++]=r;
+    for(unsigned y=r.y;y<r.y+r.h;y++)memset(pixels+y*NGB_SCREEN_W+r.x,0,r.w*sizeof(*pixels));
+}
+static const NgbScreenRect exit_region={0,215,NGB_SCREEN_W,290};
+static void game_overlay(u32 *dst,unsigned stride,NgbScreenFrame *frame){
+    bool preview=atomic_load_explicit(&exit_preview,memory_order_relaxed);
+    if(preview){overlay_region(frame,dst,exit_region);exit_contents(dst,stride,0);}
     unsigned bow=atomic_load(&aim);
     if(bow && bow_loaded && pref(44) && pref(24) && !ngb_movie_owns_input()){
         int offset=bow==2?0:9;
+        if(!preview)overlay_region(frame,dst,(NgbScreenRect){630+offset,350+offset,20,20});
         for(int y=0;y<20;y++)for(int x=0;x<20;x++){
             u32 px=bow_art[((y*64+32)/20)*64+(x*64+32)/20],a=px>>24;
             if(!a)continue;
-            u32 *d=dst+(360+offset-10+y)*stride+640+offset-10+x,v=0xff000000;
+            u32 *d=dst+(360+offset-10+y)*stride+640+offset-10+x;
+            u32 v=(a+((*d>>24)*(255-a)+127)/255)<<24;
             for(int k=0;k<24;k+=8){
                 unsigned c=((px>>(16-k))&255)+(((*d>>k)&255)*(255-a)+127)/255;
                 v|=(c>255?255:c)<<k;
@@ -255,12 +270,36 @@ static void game_overlay(u32 *dst,unsigned stride){
             *d=v;
         }
     }
-    static u64 then;static unsigned frames;static char fps[20];
+    static u64 then;static unsigned baseline;static char fps[20];
     if(!pref(5)){then=0;return;}
-    u64 now=armGetSystemTick();if(!then){then=now;frames=0;fps[0]=0;}
-    else if(++frames && now-then>=armGetSystemTickFreq()/2){
-        snprintf(fps,sizeof fps,"%u FPS",(unsigned)(frames*armGetSystemTickFreq()/(now-then)));
-        then=now;frames=0;
+    u64 now=armGetSystemTick();
+    unsigned displayed=ngb_scanout_display_count();
+    if(!then){then=now;baseline=displayed;fps[0]=0;}
+    else if(now-then>=armGetSystemTickFreq()/2){
+        snprintf(fps,sizeof fps,"%u FPS",(unsigned)((displayed-baseline)*armGetSystemTickFreq()/(now-then)));
+        then=now;baseline=displayed;
     }
+    if(!fps[0])return;
+    overlay_region(frame,dst,(NgbScreenRect){16,16,240,34});
     panel_text(dst,stride,17,17,fps,0xff000000);panel_text(dst,stride,16,16,fps,~0u);
 }
+
+#ifdef NGB_GPU_PRESENT
+static int present_screen(unsigned view,uint64_t *times){
+    static u32 overlay[NGB_SCREEN_W*NGB_SCREEN_H];
+    NgbScreenFrame frame={0};
+    frame.gpu=ngb_scanout_is_gpu();
+    frame.blank=ngb_scanout_is_blank();
+    frame.standard=ngb_settings_standard_aspect();
+    if(!frame.gpu && !frame.blank)frame.cpu_bgra=ngb_scanout_last_pixels();
+    frame.overlay_rgba=overlay;
+    if(view&EXIT_PANEL){
+        overlay_region(&frame,overlay,exit_region);
+        exit_contents(overlay,NGB_SCREEN_W,view);
+    }else if(view){
+        overlay_region(&frame,overlay,(NgbScreenRect){0,54,NGB_SCREEN_W,615});
+        settings_contents(overlay,NGB_SCREEN_W,view);
+    }else game_overlay(overlay,NGB_SCREEN_W,&frame);
+    return ngb_display_present(&frame,times);
+}
+#endif

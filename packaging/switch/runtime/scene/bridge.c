@@ -275,7 +275,7 @@ static void record_flip(void)
     if(ngb_combat_enabled && ngb_fast_ram){
         uint16_t hp,maxhp;memcpy(&hp,ngb_fast_ram+0x58a566,2);memcpy(&maxhp,ngb_fast_ram+0x58a564,2);
         ngb_combat_guest(scene_flips+1,ngb_fast_ram[0x589758],ngb_fast_ram[0x58975a],ngb_fast_ram[0x589755],
-          hp,maxhp,ngb_scanout_display_count(),work.transfers,work.file_bytes,work.file_ns/1000);
+          hp,maxhp,ngb_scanout_display_count(),work.transfers,work.file_bytes,work.file_ns/1000,ngb_fast_ram);
     }
 #endif
     if (!NGB_DIAG) { scene_flips += 1; return; }

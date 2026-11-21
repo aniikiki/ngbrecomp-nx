@@ -7,10 +7,11 @@
 #define NGB_NATIVE_DIAG
 #include "native_diag.h"
 static uint64_t clock_ns = 1000000;
+static unsigned wall_reads, cpu_reads;
 int ngb_combat_enabled = 1;
 int ngb_combat_active() { return 1; }
-uint64_t ngb_elapsed_ns() { return clock_ns; }
-uint64_t ngb_combat_cpu_us() { return clock_ns/1000; }
+uint64_t ngb_elapsed_ns() { ++wall_reads; return clock_ns; }
+uint64_t ngb_combat_cpu_us() { ++cpu_reads; return clock_ns/1000; }
 struct Row { char kind; std::vector<uint64_t> values; };
 static std::vector<Row> rows;
 void ngb_combat_row(int kind,const uint64_t* values,unsigned count) {
@@ -61,6 +62,11 @@ int main() {
     assert(last('T')[ND_VBLANK_WAIT+2]==30000);
     ngb_combat_enabled=0; NativeDiagFrame(66);
     auto before=rows.size();
+    auto wall_before=wall_reads, cpu_before=cpu_reads;
     { NativeDiagScope disabled(ND_STATE); clock_ns+=100000; }
+    NativeDiagSwap quiet(67,1); quiet.Plan(1,10,11,12,true);
+    quiet.WaitBegin(clock_ns); quiet.WaitEnd();
+    quiet.PresentBegin(); quiet.PresentEnd(); quiet.Finish(12,500);
     NativeDiagFrame(67); assert(rows.size()==before);
+    assert(wall_reads==wall_before && cpu_reads==cpu_before);
 }

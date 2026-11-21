@@ -1,16 +1,53 @@
 #pragma once
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <deque>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
 namespace gpu {
+
+// Some SD filesystems refuse to rename over an existing file. If the game
+// stopped between the two renames, the old complete cache is still in .bak.
+inline FILE* OpenCacheForRead(const std::string& path) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (f || errno != ENOENT || std::rename((path + ".bak").c_str(), path.c_str())) return f;
+    return std::fopen(path.c_str(), "rb");
+}
+
+inline bool ReplaceCacheFile(const std::string& path, const void* data, size_t size) {
+    const std::string tmp = path + ".tmp", backup = path + ".bak";
+    FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (!f) return false;
+    bool complete = std::fwrite(data, 1, size, f) == size;
+    complete = std::fclose(f) == 0 && complete;
+    if (complete && std::rename(tmp.c_str(), path.c_str()) == 0) return true;
+    if (complete && (errno == EEXIST || errno == EACCES)) {
+        // The existing destination is still intact until the temp is closed.
+        // Clear a backup left after a previous successful install only if
+        // there is a destination to take its place.
+        if (FILE* old = std::fopen(path.c_str(), "rb")) {
+            std::fclose(old);
+            std::remove(backup.c_str());
+            if (std::rename(path.c_str(), backup.c_str()) == 0) {
+                if (std::rename(tmp.c_str(), path.c_str()) == 0) {
+                    std::remove(backup.c_str());
+                    return true;
+                }
+                std::rename(backup.c_str(), path.c_str());
+            }
+        }
+    }
+    std::remove(tmp.c_str());
+    return false;
+}
 
 // Copy new cache records into a bounded queue. The consumer never holds the
 // queue lock while accessing the filesystem, including fflush and fclose.

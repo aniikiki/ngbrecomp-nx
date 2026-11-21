@@ -2,6 +2,9 @@
 #include "files.h"
 #include "runtime.h"
 #include "scene.h"
+#if defined(NGB_NATIVE_DIAG) || defined(NGB_COMBAT_PERF)
+#include "combat_perf.h"
+#endif
 #include "vm.h"
 #include "ohci_boot.h"
 #include <strings.h>
@@ -18,6 +21,7 @@ static void store32(uint32_t p, uint32_t n)
 {
     memcpy((void *)ngb_guest_pointer(p, 4), &n, 4);
 }
+#include "disc_reads.inc"
 static int64_t i64(uint32_t p)
 {
     return (int64_t)((uint64_t)u32(p) | (uint64_t)u32(p + 4) << 32);
@@ -39,6 +43,7 @@ static struct { uint32_t object; char name[1024]; } devices[16];
 
 void ngb_devices_reset(void)
 {
+    stop_disc_reads();
     /* The boot VM releases the guest allocations together. */
     memset(devices, 0, sizeof(devices));
 }
@@ -115,7 +120,10 @@ uint32_t ngb_files_dispatch(uint32_t ordinal, const uint32_t *a)
         store32(a[1],status); store32(a[1]+4,0);
         return status;
     }
-    if (ordinal == 187) return ngb_file_close(a[0]);
+    if (ordinal == 187) {
+        if (ngb_pending_disc_reads) cancel_disc_reads(a[0]);
+        return ngb_file_close(a[0]);
+    }
     if (ordinal == 67) {
         char name[1024], target[1024];
         status = name_at(a[0], name);
@@ -215,12 +223,36 @@ uint32_t ngb_files_dispatch(uint32_t ordinal, const uint32_t *a)
         (void)ngb_guest_pointer(ios, 8);
         if (a[2]) ngb_stop("file completion APC not connected",ordinal);
         if (a[1] && !ngb_io_event(a[1],0)) return NGB_FS_INVALID_HANDLE;
-        void *buffer = (void *)ngb_guest_pointer(a[5], a[6]);
         int64_t offset = a[7] ? i64(a[7]) : -2;
-        uint64_t start = ngb_scene_active ? ngb_elapsed_ns() : 0;
+        int timed = ngb_scene_active;
+#ifdef NGB_DIAG
+        timed = timed && NGB_DIAG;
+#endif
+#if defined(NGB_NATIVE_DIAG) || defined(NGB_COMBAT_PERF)
+        timed |= ngb_combat_enabled;
+#endif
+        if (ordinal == 219) {
+            const char *path = ngb_file_async_disc_path(a[0]);
+            if (path && offset >= 0 && a[6]) {
+                (void)ngb_guest_pointer(a[5],a[6]);
+                if (queue_disc_read(path,a,offset,timed)) return NGB_FS_PENDING;
+            }
+            /* A current-position read, or a synchronous fallback under
+             * pressure, observes the cursor left by earlier completions. */
+            if (path) finish_prior_disc_reads(a[0]);
+        }
+        void *buffer = (void *)ngb_guest_pointer(a[5],a[6]);
+        uint64_t start = timed ? ngb_elapsed_ns() : 0;
         status = ordinal == 219 ? ngb_file_read(a[0], buffer, a[6], offset, &done) :
                                   ngb_file_write(a[0], buffer, a[6], offset, &done);
-        if (start) ngb_scene_file_time(done, ngb_elapsed_ns() - start);
+        if (start) {
+            uint64_t ns = ngb_elapsed_ns() - start;
+            if (ngb_scene_active) ngb_scene_file_time(done, ns);
+#ifdef NGB_NATIVE_DIAG
+            if (ngb_combat_enabled)
+                ngb_combat_file(ordinal == 236, ordinal == 236 && ngb_file_is_cache_archive(a[0]), done, ns);
+#endif
+        }
         if (ordinal == 219 && status == NGB_FS_UNSUPPORTED) {
             snprintf(message, sizeof(message), "Disc read unavailable file=%s offset=%lld bytes=%u",
                      ngb_file_basename(a[0]), (long long)offset, a[6]);
@@ -234,10 +266,12 @@ uint32_t ngb_files_dispatch(uint32_t ordinal, const uint32_t *a)
         ios = a[1];
         if (!ios) return 0xc000000du;
         (void)ngb_guest_pointer(ios, 8);
+        if (ordinal == 226 && a[4] == 14) finish_prior_disc_reads(a[0]);
         void *buffer = (void *)ngb_guest_pointer(a[2], a[3]);
         errno = 0;
         if (ordinal == 211) status = ngb_file_query(a[0], a[4], buffer, a[3], &done);
         else if (ordinal == 218) status = ngb_file_volume(a[0], a[4], buffer, a[3], &done);
+        else if (a[4] == 4) status = ngb_file_set_basic(a[0], buffer, a[3]);
         else if (a[4] == 13) status = a[3] >= 1 ? ngb_file_disposition(a[0], *(const uint8_t *)buffer) : 0xc0000004u;
         else if (a[4] == 14 && a[3] >= 8) status = ngb_file_position(a[0], i64(a[2]));
         else if (a[4] == 19 || a[4] == 20) status = a[3] >= 8 ? ngb_file_resize(a[0], i64(a[2]), a[4] == 19) : 0xc0000004u;

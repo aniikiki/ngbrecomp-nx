@@ -4,18 +4,32 @@
 #include <stdint.h>
 #define NGB_FS_UNSUPPORTED 0xc0000002u
 #define NGB_FS_INVALID_HANDLE 0xc0000008u
+#define NGB_FS_PENDING 0x103u
+#define NGB_FS_TIMEOUT 0x102u
 #define NGB_FILE_MAX_BYTES (1024u * 1024u)
 #define NGB_DATA_MAX_BYTES (32u * 1024u * 1024u)
 int ngb_files_init(const char *disc_root, const char *data_root);
+/* The retail loader can read its AFS archives in place on an extracted disc. */
+extern int ngb_disc_archives_direct;
 void ngb_files_close_all(void);
 uint32_t ngb_file_open(const char *path, uint32_t root, uint32_t access,
                        uint32_t share, uint32_t disposition, uint32_t options,
                        uint32_t *handle, uint32_t *information);
 uint32_t ngb_file_disposition(uint32_t handle, int pending);
+uint32_t ngb_file_set_basic(uint32_t handle, const void *buffer, uint32_t length);
 uint32_t ngb_file_wait_status(uint32_t handle);
 uint32_t ngb_file_flush(uint32_t handle);
 uint32_t ngb_file_close(uint32_t handle);
 const char *ngb_file_basename(uint32_t handle);
+const char *ngb_file_async_disc_path(uint32_t handle);
+void ngb_file_disc_submitted(uint32_t handle);
+void ngb_file_disc_completed(uint32_t handle, int64_t offset, uint32_t received, uint32_t status);
+uint32_t ngb_disc_stream_read(FILE *file, void *buffer, uint32_t length,
+                              int64_t offset, uint32_t *received);
+void ngb_file_disc_textures(const char *name, uint64_t offset, const void *buffer, uint32_t length);
+#ifdef NGB_NATIVE_DIAG
+int ngb_file_is_cache_archive(uint32_t handle);
+#endif
 uint32_t ngb_file_read(uint32_t handle, void *buffer, uint32_t length,
                        int64_t offset, uint32_t *received);
 uint32_t ngb_file_write(uint32_t handle, const void *buffer, uint32_t length,

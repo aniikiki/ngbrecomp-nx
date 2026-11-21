@@ -544,17 +544,21 @@ void NativePoll() {
 }
 
 bool NativeCall(int fn, Call c) {
+#ifdef NGB_NATIVE_DIAG
     unsigned diag_kind = ND_OTHER;
-    if (fn <= D3DF_D3DDevice_SetTextureStageStateNotInline ||
-        (fn >= D3DF_D3DDevice_SetTransform && fn <= D3DF_D3DDevice_SetPalette) ||
-        fn == D3DF_D3DDevice_SetStreamSource || fn == D3DF_D3DDevice_SetRenderTarget ||
-        fn == D3DF_D3DDevice_SetScissors || fn == D3DF_D3DDevice_SetScreenSpaceOffset) diag_kind = ND_STATE;
-    else if (fn >= D3DF_D3DDevice_LoadVertexShader && fn <= D3DF_D3DDevice_SetPixelShaderConstant) diag_kind = ND_SHADER;
-    else if (fn == D3DF_D3DDevice_CreateVertexBuffer2 ||
-             (fn >= D3DF_D3D_DestroyResource && fn <= D3DF_D3DResource_GetType)) diag_kind = ND_RESOURCE;
-    else if ((fn >= D3DF_D3DDevice_DrawVerticesUP && fn <= D3DF_D3DDevice_End) ||
-             fn == D3DF_D3DDevice_RunPushBuffer) diag_kind = ND_DRAW;
+    if (ngb_native_diag_on) {
+        if (fn <= D3DF_D3DDevice_SetTextureStageStateNotInline ||
+            (fn >= D3DF_D3DDevice_SetTransform && fn <= D3DF_D3DDevice_SetPalette) ||
+            fn == D3DF_D3DDevice_SetStreamSource || fn == D3DF_D3DDevice_SetRenderTarget ||
+            fn == D3DF_D3DDevice_SetScissors || fn == D3DF_D3DDevice_SetScreenSpaceOffset) diag_kind = ND_STATE;
+        else if (fn >= D3DF_D3DDevice_LoadVertexShader && fn <= D3DF_D3DDevice_SetPixelShaderConstant) diag_kind = ND_SHADER;
+        else if (fn == D3DF_D3DDevice_CreateVertexBuffer2 ||
+                 (fn >= D3DF_D3D_DestroyResource && fn <= D3DF_D3DResource_GetType)) diag_kind = ND_RESOURCE;
+        else if ((fn >= D3DF_D3DDevice_DrawVerticesUP && fn <= D3DF_D3DDevice_End) ||
+                 fn == D3DF_D3DDevice_RunPushBuffer) diag_kind = ND_DRAW;
+    }
     NativeDiagScope diag(diag_kind);
+#endif
     struct Scope { uint32_t saved = native_current_fn; ~Scope() { native_current_fn = saved; } } scope;
     native_current_fn = d3d_funcs[fn].va;
     ++native_calls[fn];
@@ -624,6 +628,10 @@ bool NativeCall(int fn, Call c) {
         uint32_t h = NativeHeader(0x140) | 1;
         auto vs = ReadVertexShader(c.a(0), c.a(1)); vs->handle = h; g_vs[h] = vs;
         W32(h & ~1u, 1); W32((h & ~1u) + 4, 1); W32(c.a(2), h);
+        // NGB reads handle + 7 (object + 8) to pack its shadow programs into
+        // GPU instruction memory. Without the XDK's length, every program
+        // lands at slot 135 and only its first instruction survives loading.
+        W32((h & ~1u) + 8, uint32_t(vs->program.size() / 4));
         ret = 16; returns = true; translate = false; break;
     }
     case D3DF_D3DDevice_CreatePixelShader: {

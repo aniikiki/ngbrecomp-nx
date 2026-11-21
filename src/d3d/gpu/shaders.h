@@ -25,6 +25,8 @@ enum : uint8_t {
     kTexLinear = 16, // a screen quad's texture filtered linearly: weighted by alpha above 1x (QuadSnap, #83)
 };
 
+enum class CombatPixel : uint8_t { None, Additive, History };
+
 struct PixelKey {
     uint32_t programmable = 0;
     // combiners, straight from D3DPIXELSHADERDEF
@@ -38,7 +40,9 @@ struct PixelKey {
     uint32_t proj = 0;       // fixed function: bit per stage sampled at coordinates divided by w
     // a screen quad (QuadHlsl); a point sprite, stage 3 at the point's own coordinates after the stages before it
     // (#51). Halves of what was one uint32_t quad: the key's size and bytes as the shader cache has them.
-    uint16_t quad = 0, sprite = 0;
+    uint8_t quad = 0;
+    CombatPixel combat = CombatPixel::None;  // zero in the old little-endian keys
+    uint8_t sprite = 0, skip_alpha_test = 0;  // zero in existing shader recipes
     bool operator==(const PixelKey& o) const;
 };
 
@@ -50,6 +54,7 @@ PixelKey MakePixelKey(const State& s, const TexInfo tex[4]);
 // decode: VertexDecode per register, 4 bits each, for elements the input assembler hands over raw
 std::string VertexProgramHlsl(const std::vector<uint32_t>& program, uint16_t regs, uint64_t decode = 0);
 // fixed function vertex state a shader is built for
+constexpr uint32_t kCombatClipPlanes = 1u << 31;  // FixedKey::light, native UT geometry
 struct FixedKey {
     uint32_t light = 0;    // bit 0 lighting, 1 specular, 2 local viewer, 3 normalize, then D3DMCS 2 bits each from bit 8:
                            // diffuse, specular, ambient, emissive (material when the vertex lacks that colour)

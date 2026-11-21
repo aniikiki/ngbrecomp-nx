@@ -227,7 +227,39 @@ std::shared_ptr<gpu::VertexShader> ReadVertexShader(uint32_t decl, uint32_t func
     return vs;
 }
 
-void Draw(uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices, bool prepared = false) {
+// These are the game's history-quad and particle submission sites. The history
+// texture is allocated by the game and can move when a scene is reloaded.
+#ifdef NGB_DIRECT3D
+static bool CombatEffectsEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NGB_NATIVE_UT");
+        return !value || std::strcmp(value, "0") != 0;
+    }();
+    return enabled && ngb_d3d_native_enabled();
+}
+
+static gpu::CombatEffect CombatEffectUP(Call c) {
+    using gpu::CombatEffect;
+    if (!CombatEffectsEnabled()) return CombatEffect::None;
+    const uint32_t site = R32(c.r[ESP]);
+    if (site == 0x0031877b || site == 0x00318bf6)
+        return (R32(0xc0611c) & 4) ? CombatEffect::Transparent : CombatEffect::None;
+    if (site != 0x00324d8a && site != 0x00324f0a && site != 0x00324fe9)
+        return CombatEffect::None;
+    if (!(R32(0xc0611c) & 4)) return CombatEffect::None;
+    const uint32_t history = R32(0xbb57e0);
+    if (!history || c.a(2) != 0xbb5708 || c.a(0) != 6 || c.a(1) != 4 || c.a(3) != 28)
+        return CombatEffect::None;
+    const uint32_t tex = R32(R32(kDevicePtr) + 0xf88);
+    if (tex == history) return CombatEffect::HistoryComposite;
+    if (tex && g_state.rt.data && R32(history + 4) == g_state.rt.data)
+        return CombatEffect::HistoryCapture;
+    return CombatEffect::None;
+}
+#endif
+
+void Draw(uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices, bool prepared = false,
+          gpu::CombatEffect effect = gpu::CombatEffect::None) {
 #ifdef NGB_DIRECT3D
     if (!g_backend) return;
     bool measure = ngb_direct_detail_frame != 0;
@@ -262,11 +294,11 @@ void Draw(uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices,
 #ifdef NGB_DIRECT3D
         if (prepared) {
             g_backend->DrawPrepared(g_state, prim, start, count, indices,
-                                    {++native_mesh_revision, native_mesh_changed});
+                                    {++native_mesh_revision, native_mesh_changed}, effect);
             native_mesh_changed = 0;
         } else
 #endif
-            g_backend->Draw(g_state, prim, start, count, indices);
+            g_backend->Draw(g_state, prim, start, count, indices, nullptr, effect);
     }
 #ifdef NGB_DIRECT3D
     if (ngb_d3d_native_enabled()) ++native_draws;
@@ -276,7 +308,7 @@ void Draw(uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices,
 
 // A pushed index list (RunPushBuffer): BEGIN (0x17FC) with the primitive, then 16-bit index
 // pairs (0x1800) or 32-bit indices (0x1808), END (BEGIN 0). Anything else is reported once.
-void RunPushBuffer(uint32_t pb, bool prepared = false) {
+void RunPushBuffer(uint32_t pb, bool prepared = false, gpu::CombatEffect effect = gpu::CombatEffect::None) {
     uint32_t data = R32(pb + 4) | 0x80000000u, size = R32(pb + 0xC);
 #ifdef NGB_DIRECT3D
     if (ngb_d3d_native_enabled()) {
@@ -315,7 +347,7 @@ void RunPushBuffer(uint32_t pb, bool prepared = false) {
                 prim = v[0];
                 idx.clear();
             } else if (prim) {
-                Draw(prim, 0, uint32_t(idx.size()), reinterpret_cast<const uint8_t*>(idx.data()), prepared);
+                Draw(prim, 0, uint32_t(idx.size()), reinterpret_cast<const uint8_t*>(idx.data()), prepared, effect);
                 prim = 0;
             }
         } else if (method == 0x1800) {
@@ -341,7 +373,7 @@ void RunPushBuffer(uint32_t pb, bool prepared = false) {
         o += 4 + 4 * count;
     }
     // a buffer that ends without END still draws what it began
-    if (prim && !idx.empty()) Draw(prim, 0, uint32_t(idx.size()), reinterpret_cast<const uint8_t*>(idx.data()), prepared);
+    if (prim && !idx.empty()) Draw(prim, 0, uint32_t(idx.size()), reinterpret_cast<const uint8_t*>(idx.data()), prepared, effect);
 }
 
 // The hooked functions Before does nothing for, found at their first call: those skip g_lock. Taken and
@@ -646,7 +678,11 @@ bool Before(int fn, Call c) {
         W32(guest_header, 0x80000001u);
         W32(guest_header + 4, data);
         g_state.streams[0] = {guest_header, stride};
-        Draw(prim, 0, count, nullptr);
+        gpu::CombatEffect effect = gpu::CombatEffect::None;
+#ifdef NGB_DIRECT3D
+        effect = CombatEffectUP(c);
+#endif
+        Draw(prim, 0, count, nullptr, false, effect);
         g_state.streams[0] = saved;
         break;
     }

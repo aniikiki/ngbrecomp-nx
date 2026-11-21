@@ -10,7 +10,7 @@ import tempfile
 
 root = Path(__file__).resolve().parents[4]
 source = (root / 'src/d3d/hle.cpp').read_text()
-start = source.index('void RunPushBuffer(uint32_t pb) {')
+start = source.index('void RunPushBuffer(uint32_t pb,')
 parser = source[start:source.index('\n}', start) + 2]
 code = r'''
 #include <cstdint>
@@ -20,6 +20,7 @@ code = r'''
 #include <iterator>
 #include <stdexcept>
 #include <vector>
+#include "gpu/prepared.h"
 #define NGB_DIRECT3D 1
 static std::vector<uint8_t> header(20), payload;
 static bool ngb_d3d_native_enabled() { return true; }
@@ -31,7 +32,8 @@ static void* HostPtr(uint32_t a, size_t n=4) {
 }
 static uint32_t R32(uint32_t a) { uint32_t v; std::memcpy(&v, HostPtr(a), 4); return v; }
 static std::vector<uint32_t> draws;
-static void Draw(uint32_t prim, uint32_t start, uint32_t count, const uint8_t* data) {
+static void Draw(uint32_t prim, uint32_t start, uint32_t count, const uint8_t* data, bool prepared, gpu::CombatEffect effect) {
+    if (prepared != (effect == gpu::CombatEffect::Transparent)) throw std::runtime_error("lost effect role");
     draws.insert(draws.end(), {prim,start,count});
     for (unsigned i=0;i<count;++i) { uint16_t v; std::memcpy(&v,data+i*2,2); draws.push_back(v); }
 }
@@ -50,7 +52,7 @@ int main(int argc, char** argv) {
     const std::vector<uint32_t> expected={6,0,5,3,7,11,13,17};
     for (uint32_t footer : {0u,0x3fc38002u,0xffffffffu,0x20000u,0x12340001u}) {
         setup({0x417fc,6,0x40081800,0x00070003,0x000d000b,0x41808,17,0x417fc,0,footer});
-        RunPushBuffer(0x80001000); if(draws!=expected)return 1;
+        RunPushBuffer(0x80001000,true,gpu::CombatEffect::Transparent); if(draws!=expected)return 1;
         setup({footer}); RunPushBuffer(0x80001000); if(!draws.empty())return 2;
     }
     setup({0x417fc,6,0x40081800,0x00070003,0});
@@ -75,5 +77,5 @@ int main(int argc, char** argv) {
 with tempfile.TemporaryDirectory(prefix='ngb-push-') as temp:
     cpp = Path(temp) / 'test.cpp'; cpp.write_text(code)
     exe = Path(temp) / 'test'
-    subprocess.run(['c++', '-std=c++17', '-O2', str(cpp), '-o', str(exe)], check=True)
+    subprocess.run(['c++', '-std=c++17', '-O2', '-I', str(root/'src/d3d'), str(cpp), '-o', str(exe)], check=True)
     subprocess.run([str(exe), *sys.argv[1:]], check=True)

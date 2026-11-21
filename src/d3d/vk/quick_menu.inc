@@ -139,9 +139,13 @@ void VulkanBackend::QuickMenu(Image& dst) {
     d_.vkCmdBeginRendering(cmd_, &ri);
     /* The Xbox front buffer has non-square display pixels. Match the final
      * display aspect, so bottles, weapons and arrows retain their proportions. */
+#ifdef NGB_GPU_PRESENT
+    float aspect = ngb_settings_standard_aspect() ? 4.0f / 3 : 16.0f / 9;
+#else
     int mode = ngb_pc_setting(7);
     float aspect = mode == 0 ? 4.0f / 3 : mode == 2 ? 16.0f / 10 : mode == 3 ? 64.0f / 27 : mode == 4 ? 32.0f / 9
                  : 16.0f / 9;
+#endif
     float sx = float(dst.w) / (720 * aspect), sy = float(dst.h) / 720;
     float scale = percent / 100.0f;
     sx *= scale; sy *= scale;

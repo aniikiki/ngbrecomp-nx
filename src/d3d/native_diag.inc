@@ -19,31 +19,31 @@ uint64_t NativeDiagCpuDelta(uint64_t before, uint64_t after) {
 }
 }
 
-// Called at the actual context switch, even when diagnostics are disabled, so
-// an activation during a different guest worker starts with the right stack.
+// During an opted-in boot, track switches between capture windows too so a
+// later activation starts on the right guest worker's stack.
 extern "C" void ngb_native_diag_switch(unsigned next, uint64_t now) {
     if (ngb_native_diag_on) NativeDiagCharge(now);
     nd_worker = next;
 }
-NativeDiagScope::NativeDiagScope(unsigned k) : kind(k) {
-    if (!ngb_native_diag_on) return;
+void NativeDiagScope::Enter(unsigned k) {
     ++nd_calls[k];
     // Keep the nesting across frame boundaries: a background VBlank waiter can
     // stay suspended over several presents. Only sampled frames time hot calls.
     if (!ngb_native_diag_sample && k < ND_PRESENT) return;
     NativeDiagCharge(ngb_elapsed_ns());
+    kind = k;
     worker = nd_worker; previous = nd_stack[worker]; nd_stack[worker] = this; linked = true;
 }
-NativeDiagScope::~NativeDiagScope() {
-    if (!linked) return;
+void NativeDiagScope::Leave() {
     NativeDiagCharge(ngb_elapsed_ns());
     nd_stack[worker] = previous;
 }
 void NativeDiagWords(unsigned words) { if (ngb_native_diag_on) nd_words += words; }
 void NativeDiagFrame(unsigned frame) {
     const bool on = ngb_combat_enabled && ngb_combat_active();
-    uint64_t now = (on || ngb_native_diag_on) ? ngb_elapsed_ns() : 0;
-    uint64_t cpu = (on || ngb_native_diag_on) ? ngb_combat_cpu_us() : 0;
+    if (!on && !ngb_native_diag_on) return;
+    uint64_t now = ngb_elapsed_ns();
+    uint64_t cpu = ngb_combat_cpu_us();
     if (ngb_native_diag_on) {
         NativeDiagCharge(now);
         uint64_t n[] = {frame, now/1000, cpu, (now-nd_frame_time)/1000,
@@ -70,6 +70,7 @@ void NativeDiagFrame(unsigned frame) {
 }
 NativeDiagSwap::NativeDiagSwap(unsigned frame, unsigned interval) : on(ngb_native_diag_on) {
     if (!on) return;
+    std::fill(std::begin(v), std::end(v), 0);
     v[0]=frame; v[1]=ngb_elapsed_ns()/1000; v[2]=ngb_combat_cpu_us(); v[3]=interval;
 }
 void NativeDiagSwap::Plan(unsigned periods,unsigned previous,unsigned current,unsigned target,bool retargeted) {
@@ -87,8 +88,8 @@ void NativeDiagSwap::WaitEnd() {
 void NativeDiagSwap::PresentBegin() { if (on) v[13]=ngb_elapsed_ns()/1000; }
 void NativeDiagSwap::PresentEnd() { if (on) v[14]=ngb_elapsed_ns()/1000-v[13]; }
 void NativeDiagSwap::Finish(unsigned blank,unsigned draws) {
-    nd_draws = draws;
     if (!on) return;
+    nd_draws = draws;
     v[15]=ngb_elapsed_ns()/1000-v[1]; v[16]=NativeDiagCpuDelta(v[2],ngb_combat_cpu_us());
     v[17]=blank; v[18]=draws;
     ngb_combat_row('V',v,sizeof v/sizeof *v);

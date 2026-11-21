@@ -9,6 +9,41 @@
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "line %d: %s\n", __LINE__, #x); exit(1); } } while (0)
 static uint32_t u32(const void *p) { uint32_t n; memcpy(&n, p, 4); return n; }
 static uint64_t u64(const void *p) { uint64_t n; memcpy(&n, p, 8); return n; }
+
+static void test_save_slot_cleanup(void)
+{
+    uint32_t slot, subdir, file, reader, other, info, bytes;
+    unsigned char basic[40] = {0};
+    basic[32] = 0x80;
+    CHECK(!ngb_file_open("E:\\slot", 0, 0x110101, 7, 3, 0x4021, &slot, &info));
+    CHECK(!ngb_file_open("nested", slot, 1, 7, 2, 0x21, &subdir, &info));
+    CHECK(!ngb_file_open("save000.dat", subdir, 0x40000000, 7, 2, 0x60, &file, &info));
+    CHECK(!ngb_file_write(file, "old", 3, 0, &bytes) && bytes == 3);
+    CHECK(!ngb_file_close(file) && !ngb_file_close(subdir));
+    CHECK(ngb_file_disposition(slot, 1) == 0xc0000101u);
+
+    /* Retail XDeleteSaveGame requests different backup opens for a file
+     * and a subdirectory. It marks each object and closes it in that order. */
+    CHECK(!ngb_file_open("nested", slot, 0x110101, 7, 1, 0x4001, &subdir, &info));
+    CHECK(!ngb_file_open("SAVE000.DAT", subdir, 0x110100, 7, 1, 0x4040, &file, &info));
+    CHECK(ngb_file_write(file, "bad", 3, 0, &bytes) == 0xc0000022u && !bytes);
+    CHECK(!ngb_file_set_basic(file, basic, sizeof(basic)));
+    CHECK(ngb_file_set_basic(file, basic, 39) == 0xc0000004u);
+    CHECK(!ngb_file_disposition(file, 1) && !ngb_file_close(file));
+    CHECK(!ngb_file_open("nested", slot, 1, 7, 1, 0x21, &reader, &info));
+    CHECK(ngb_file_set_basic(reader, basic, sizeof(basic)) == 0xc0000022u);
+    CHECK(!ngb_file_set_basic(subdir, basic, sizeof(basic)));
+    CHECK(!ngb_file_disposition(subdir, 1) && !ngb_file_close(subdir));
+    CHECK(ngb_file_open("later", reader, 3, 7, 2, 0x21, &other, &info) == 0xc0000056u);
+    CHECK(ngb_file_open("E:\\slot\\nested\\later", 0, 3, 7, 2, 0x60, &other, &info) == 0xc0000056u);
+    CHECK(!ngb_file_close(reader));
+    CHECK(ngb_file_open("nested", slot, 1, 7, 1, 0x21, &other, &info) == 0xc0000034u);
+    CHECK(!ngb_file_disposition(slot, 1) && !ngb_file_close(slot));
+    CHECK(!ngb_file_open("E:\\", 0, 0x110101, 7, 1, 0x4021, &slot, &info));
+    CHECK(ngb_file_disposition(slot, 1) == 0xc0000022u);
+    CHECK(!ngb_file_close(slot));
+}
+
 int main(void)
 {
     char temp[] = "/tmp/ngb-files-XXXXXX", disc[1024], data[1024], path[1200];
@@ -19,7 +54,15 @@ int main(void)
     snprintf(path, sizeof(path), "%s/Mixed.bin", disc);
     FILE *f = fopen(path, "wb"); CHECK(f);
     CHECK(fwrite("0123456789", 1, 10, f) == 10 && fclose(f) == 0);
+    /* Even an empty bootstrap catalog represents a sparse disc. Check a
+     * remount in both directions before exercising the ordinary file API. */
+    snprintf(path, sizeof(path), "%s/.ngb-disc", disc);
+    f = fopen(path, "wb"); CHECK(f && !fclose(f));
+    CHECK(!ngb_files_init(disc, data) && !ngb_disc_archives_direct);
+    CHECK(!unlink(path));
     CHECK(ngb_files_init(disc, data) == 0);
+    CHECK(ngb_disc_archives_direct);
+    test_save_slot_cleanup();
     uint32_t dir, file, info, count;
     unsigned char buffer[64];
     CHECK(ngb_file_open("\\Device\\Harddisk0\\partition1\\", 0, 0x100001, 3, 1, 0x800021, &dir, &info) == 0);
@@ -157,6 +200,7 @@ int main(void)
     snprintf(path,sizeof(path),"%s/hdd/partition5/level.afs",data);
     f=fopen(path,"wb"); CHECK(f && !ftruncate(fileno(f),40*1024*1024) && !fclose(f));
     CHECK(!ngb_files_init(disc,data));
+    CHECK(ngb_disc_archives_direct);
     CHECK(!ngb_file_open("E:\\",0,0x100001,3,1,0x800021,&dir,&info));
     CHECK(!ngb_file_volume(dir,3,buffer,24,&count) && u64(buffer+8)>1024);
     CHECK(!ngb_file_open("E:\\new.bin",0,0xc0000000,3,1,0x60,&file,&info));
@@ -187,7 +231,8 @@ int main(void)
     ngb_files_close_all(); CHECK(unlink(path) == 0);
     snprintf(path, sizeof(path), "%s/hdd/partition0-header.bin", data);
     f = fopen(path, "wb"); CHECK(f); CHECK(fputs("short", f) >= 0 && fclose(f) == 0);
-    CHECK(ngb_files_init(disc, data) != 0); CHECK(unlink(path) == 0);
+    CHECK(ngb_files_init(disc, data) != 0 && !ngb_disc_archives_direct);
+    CHECK(unlink(path) == 0);
     snprintf(path, sizeof(path), "%s/hdd/cache-partition5.bin", data); CHECK(unlink(path) == 0);
     snprintf(path, sizeof(path), "%s/hdd/partition1/cache.bin", data); CHECK(unlink(path) == 0);
     snprintf(path, sizeof(path), "%s/hdd/partition1/new.bin", data); CHECK(unlink(path) == 0);

@@ -19,10 +19,15 @@ static FILE *replay_csv;
 static FILE *material_csv;
 static FILE *mesh_csv;
 static FILE *effects_csv;
+static FILE *load_csv;
+static const char *replay_input_path;
 static unsigned replay_draws;
 static uint64_t replay_cpu_previous;
 static unsigned replay_battle_frames, replay_story_frames, replay_damaged, replay_finished;
 static unsigned replay_game_frames;
+static unsigned replay_frame_limit, replay_trace_start;
+static unsigned replay_mission_rows = 5, replay_mission_column;
+static int replay_specific_mission, replay_trace_battle;
 #ifdef NGB_NATIVE_CONTRACT_TEST
 unsigned ngb_native_test_callback_hits;
 void __real_ngb_graphics_callback(uint32_t, uint32_t);
@@ -49,6 +54,10 @@ int __wrap_d3d_hook(int fn)
     if(elapsed>100000000) fprintf(stderr,"[API-WAIT] fn=%d ns=%llu\n",fn,(unsigned long long)elapsed);
     if ((fn>=69 && fn<=72) || fn==84) ++replay_draws;
     if (fn==85) {
+        if (load_csv) fprintf(load_csv,"%u,%u,%u,%u,%.3f,%.3f,%d,%u,%u,%u\n",
+            replay_game_frames + 1, ram[0x589758], ram[0x58975a], MEM16(0xdb9c6e),
+            MEMF(0xd21698), MEMF(0xd2169c), (int32_t)MEM32(0x8cda5c),
+            MEM32(0x8c5734), MEM8(0x8ce038), MEM32(0xd21734));
         uint64_t material[4];
         ngb_d3d_material_stats(material);
         uint64_t mesh[8]; ngb_d3d_mesh_stats(mesh);
@@ -62,6 +71,16 @@ int __wrap_d3d_hook(int fn)
             (unsigned long long)material[0],(unsigned long long)material[1],
             (unsigned long long)material[2],(unsigned long long)material[3]);
         ++replay_game_frames;
+        if (replay_trace_battle && ram[0x58975a] == 3 && MEM16(0x58a564) && replay_draws >= 250) {
+            extern volatile int ngb_trace_request;
+            ngb_trace_request = 1;
+            replay_trace_battle = 0;
+        }
+        if (replay_trace_start && replay_game_frames >= replay_trace_start) {
+            extern volatile int ngb_trace_request;
+            ngb_trace_request = 1;
+            replay_trace_start = 0;
+        }
         if(effects_csv && ram[0x589758]==23 && MEM16(0x58a564)==2400)
             fprintf(effects_csv,"%u,%llu,%u,%u,%u,%u,%u,%u\n",replay_game_frames,
                 (unsigned long long)(ngb_elapsed_ns()/1000),MEM16(0x4968b0),MEM16(0x5895e2),
@@ -81,7 +100,8 @@ int __wrap_d3d_hook(int fn)
             if(wrote)for(unsigned i=0;i<24;++i)MEM8(0x7f1a94+i)=1;
         }
         if (getenv("NGB_REPLAY_NEWGAME") && MEM16(0x58a564) && replay_draws >= 250) ++replay_story_frames;
-        if (ram[0x589758] == 23 && MEM16(0x58a564) == 2400 && replay_draws >= 250) {
+        if ((replay_specific_mission ? ram[0x58975a] == 3 && MEM16(0x58a564) != 0 :
+             ram[0x589758] == 23 && MEM16(0x58a564) == 2400) && replay_draws >= 250) {
             ++replay_battle_frames;
             if (MEM16(0x58a566) < 2400 && MEM16(0x58a566)) replay_damaged = 1;
         }
@@ -101,15 +121,18 @@ static unsigned replay_limit = 120;
 static unsigned replay_second;
 static unsigned replay_buttons;
 static uint64_t replay_menu_ms;
+static unsigned replay_menu_frame;
 static unsigned replay_mission_key;
-static const unsigned mission_keys[][2] = {
-    {3000,2},{3180,0},{5600,256},{5780,0},{8000,2},{8180,0},{8900,2},{9080,0},
-    {9800,2},{9980,0},{10700,2},{10880,0},{11600,2},{11780,0},
-    {15300,256},{15480,0},{18600,256},{18780,0},{22500,256},{22680,0}
-};
+static unsigned mission_keys[40][2], mission_key_count;
+static void mission_tap(unsigned at, unsigned buttons) {
+    mission_keys[mission_key_count][0] = at;
+    mission_keys[mission_key_count++][1] = buttons;
+    mission_keys[mission_key_count][0] = at + (replay_specific_mission ? 67 : 180);
+    mission_keys[mission_key_count++][1] = 0;
+}
 void replay_unlock(uint32_t menu)
 {
-    if (!getenv("NGB_REPLAY_ALMA")) return;
+    if (!getenv("NGB_REPLAY_ALMA") && !replay_input_path) return;
     MEM8(MEM32(menu)+20)=MEM8(MEM32(menu)+21)=1;
     for(unsigned i=0;i<100;i++){MEM8(0xdb95ac+i)|=1;MEM8(0xdb9610+i)=4;}
 }
@@ -129,27 +152,52 @@ void __wrap_ngb_poll_due(uint64_t ticket)
         fprintf(stderr,"[REPLAY] sec=%u va=%08x menu=%u mission=%u mode=%u hp=%u/%u frames=%u\n",
                 replay_second,current_va,menu_cursor,ram[0x589758],ram[0x58975a],MEM16(0x58a566),MEM16(0x58a564),replay_shots);
     }
-    if (!getenv("NGB_REPLAY_ATTRACT") && replay_key < sizeof replay_keys / sizeof *replay_keys && ms >= replay_keys[replay_key][0]) {
+    if (replay_input_path) {
+        // Test-only live controller schedule; an isolated replay can visit a
+        // reported mission without adding another hard-coded menu sequence.
+        static unsigned next_read;
+        if (ms >= next_read) {
+            next_read = ms + 100;
+            FILE *input = fopen(replay_input_path, "r");
+            unsigned at, buttons = 0, b;
+            int x = 0, y = 0, sx, sy;
+            if (input) {
+                while (fscanf(input, "%u %u %d %d", &at, &b, &sx, &sy) == 4)
+                    if (at <= ms) { buttons = b; x = sx; y = sy; }
+                fclose(input);
+            }
+            ngb_ohci_pad_sample(buttons, x, y, 0, 0);
+        }
+    }
+    if (!replay_input_path && !getenv("NGB_REPLAY_ATTRACT") && replay_key < sizeof replay_keys / sizeof *replay_keys && ms >= replay_keys[replay_key][0]) {
         ngb_ohci_pad_sample(replay_keys[replay_key][1],0,0,0,0);
         fprintf(stderr,"[REPLAY] ms=%u key=%u menu=%u\n",ms,replay_keys[replay_key][1],menu_cursor);
         ++replay_key;
     }
-    if (!getenv("NGB_REPLAY_ATTRACT") && ms > 17000 && menu_cursor == UINT32_MAX) {
+    if (!replay_input_path && !getenv("NGB_REPLAY_ATTRACT") && ms > 17000 && menu_cursor == UINT32_MAX) {
         unsigned buttons = ms % 1500 < 180 ? 16 : 0;
         if (buttons != replay_buttons) { ngb_ohci_pad_sample(buttons,0,0,0,0); replay_buttons=buttons; }
     }
-    if (menu_cursor != UINT32_MAX && (getenv("NGB_REPLAY_ALMA") || getenv("NGB_REPLAY_NEWGAME"))) {
-        if (!replay_menu_ms) { replay_menu_ms=ms;ngb_ohci_pad_sample(0,0,0,0,0); }
+    if (!replay_input_path && menu_cursor != UINT32_MAX && (getenv("NGB_REPLAY_ALMA") || getenv("NGB_REPLAY_NEWGAME"))) {
+        if (!replay_menu_ms) {
+            replay_menu_ms=ms;
+            replay_menu_frame=replay_game_frames;
+            ngb_ohci_pad_sample(0,0,0,0,0);
+        }
         unsigned t=ms-replay_menu_ms;
+        // The original menu polls and repeats buttons in game frames. Four
+        // flips per tap also select one cell when the software renderer slows.
+        if(replay_specific_mission && !getenv("NGB_REPLAY_NEWGAME"))
+            t=(replay_game_frames-replay_menu_frame)*1000ull/60;
         if (getenv("NGB_REPLAY_NEWGAME")) {
             unsigned buttons = t >= 3000 && t < 3180 ? 1 : t >= 5600 && t % 1500 < 180 ? 256 : 0;
             if (buttons != replay_buttons) { ngb_ohci_pad_sample(buttons,0,0,0,0); replay_buttons=buttons; }
-        } else if(replay_mission_key<sizeof mission_keys/sizeof *mission_keys && t>=mission_keys[replay_mission_key][0]) {
+        } else if(replay_mission_key<mission_key_count && t>=mission_keys[replay_mission_key][0]) {
             ngb_ohci_pad_sample(mission_keys[replay_mission_key][1],0,0,0,0);
             fprintf(stderr,"[MISSION-KEY] t=%u key=%u menu=%u\n",t,mission_keys[replay_mission_key][1],menu_cursor);
             ++replay_mission_key;
         }
-        if(t>45000 && (t<110000 || (getenv("NGB_REPLAY_EFFECTS") && !replay_battle_frames)) &&
+        if(t>45000 && (t<110000 || ((getenv("NGB_REPLAY_EFFECTS") || replay_specific_mission) && !replay_battle_frames)) &&
             !(getenv("NGB_REPLAY_EFFECTS") && replay_battle_frames)) {
             unsigned buttons=t%1500<180?256:0;
             if(buttons!=replay_buttons){ngb_ohci_pad_sample(buttons,0,0,0,0);replay_buttons=buttons;}
@@ -177,10 +225,11 @@ void __wrap_ngb_poll_due(uint64_t ticket)
             last_phase=phase;
         }
     }
-    if (ms >= replay_limit * 1000) {
+    if (ms >= replay_limit * 1000 || (replay_frame_limit && replay_game_frames >= replay_frame_limit)) {
         ngb_d3d_native_report();
         replay_finished = !getenv("NGB_REPLAY_ALMA") || (replay_battle_frames >= 120 && replay_damaged);
         if (getenv("NGB_REPLAY_NEWGAME")) replay_finished = replay_story_frames >= 120;
+        if (replay_frame_limit && replay_game_frames < replay_frame_limit) replay_finished = 0;
         fprintf(stderr, "[REPLAY-%s] battle_frames=%u story_frames=%u damage_seen=%u captures=%u\n",
                 replay_finished ? "PASS" : "FAIL", replay_battle_frames, replay_story_frames, replay_damaged, replay_shots);
         ngb_stop("native replay time limit", ms);
@@ -212,6 +261,31 @@ int main(int argc, char **argv)
     if (snprintf(image, sizeof(image), "%s/default.xbe", argv[1]) >= (int)sizeof(image)) return 2;
     if (ngb_files_init(argv[1], argv[2])) return 2;
     const char *limit = getenv("NGB_REPLAY_SECONDS"); if (limit) replay_limit = strtoul(limit,NULL,10);
+    const char *frames = getenv("NGB_REPLAY_FRAMES"); if (frames) replay_frame_limit = strtoul(frames,NULL,10);
+    const char *trace = getenv("NGB_REPLAY_TRACE_START"); if (trace) replay_trace_start = strtoul(trace,NULL,10);
+    replay_input_path = getenv("NGB_REPLAY_INPUT");
+    const char *row = getenv("NGB_REPLAY_MISSION_ROW"), *column = getenv("NGB_REPLAY_MISSION_COLUMN");
+    replay_specific_mission = row || column;
+    if (row) replay_mission_rows = strtoul(row, NULL, 10);
+    if (column) replay_mission_column = strtoul(column, NULL, 10);
+    if (replay_mission_rows > 9 || replay_mission_column > 4) return 2;
+    replay_trace_battle = getenv("NGB_REPLAY_TRACE_BATTLE") != NULL;
+    mission_tap(3000, 2); mission_tap(5600, 256);
+    unsigned first = replay_specific_mission ? 11000 : 8000;
+    unsigned interval = replay_specific_mission ? 2200 : 900;
+    for (unsigned i = 0; i < replay_mission_rows; ++i) mission_tap(first + interval * i, 2);
+    unsigned next = first + interval * replay_mission_rows;
+    for (unsigned i = 0; i < replay_mission_column; ++i) mission_tap(next + interval * i, 8);
+    next += interval * replay_mission_column;
+    if (next < 15300) next = 15300;
+    mission_tap(next, 256); mission_tap(next + 3300, 256); mission_tap(next + 7200, 256);
+    if (getenv("NGB_REPLAY_LOAD_TRACE")) {
+        load_csv = fopen("load.csv", "w");
+        if (load_csv) {
+            setvbuf(load_csv, NULL, _IOLBF, 0);
+            fprintf(load_csv,"frame,mission,mode,mission_override,cpu_load,gpu_load,quality,shadow_enabled,player_slot,load_flags\n");
+        }
+    }
     replay_csv=fopen("frames.csv","w");
     material_csv=fopen("material.csv","w");
     mesh_csv=fopen("mesh.csv","w");
@@ -225,14 +299,19 @@ int main(int argc, char **argv)
     ngb_ohci_pad_present(1);
 #ifdef NGB_NATIVE_DIAG
     pthread_t logger;
-    ngb_combat_enabled = combat_open("native-perf.csv");
-    if (!ngb_combat_enabled || pthread_create(&logger,NULL,replay_log_thread,NULL)) return 2;
+    if (combat_requested("alma-perf.flag")) {
+        ngb_combat_enabled = combat_open("native-perf.csv");
+        if (!ngb_combat_enabled || pthread_create(&logger,NULL,replay_log_thread,NULL)) return 2;
+    }
 #endif
     int result=ngb_boot(image, stdout);
 #ifdef NGB_NATIVE_DIAG
-    atomic_store(&replay_log_done,1); pthread_join(logger,NULL); fclose(cp_file);
+    if (ngb_combat_enabled) {
+        atomic_store(&replay_log_done,1); pthread_join(logger,NULL); fclose(cp_file);
+    }
 #endif
     if(replay_csv)fclose(replay_csv);
     if(effects_csv)fclose(effects_csv);
+    if(load_csv)fclose(load_csv);
     return replay_finished ? 0 : result ? result : 1;
 }

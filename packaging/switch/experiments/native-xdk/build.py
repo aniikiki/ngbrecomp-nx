@@ -11,6 +11,7 @@ import shlex
 import subprocess as sp
 import sys
 from material_cache import compatibility
+from disc_archives import link_disc_archives
 
 root = Path('/work')
 base = root / 'build/switch-runtime'
@@ -74,9 +75,10 @@ elif sys.argv[1] == 'host':
     link = [x for x in link if not x.startswith('-Wl,--wrap=')]
     link.insert(1, '-no-pie')
     link[1:1] = ['-Wl,--wrap=ngb_poll_due', '-Wl,--wrap=ngb_scanout_direct', '-Wl,--wrap=d3d_hook']
-    if checks: link.insert(1, '-Wl,--wrap=ngb_graphics_callback')
+    if checks: link[1:1] = ['-Wl,--wrap=ngb_graphics_callback', '-Wl,--wrap=volkLoadDeviceTable']
     manifest = {}
-    for line in (base / 'history/0.56.25/linked-inputs.txt').read_text().splitlines():
+    # The retained guest inputs must survive cleanup of old release packages.
+    for line in (out / 'retained-inputs.txt').read_text().splitlines():
         digest, name = line.split()
         path = base / name
         assert hashlib.sha256(path.read_bytes()).hexdigest() == digest, path
@@ -87,6 +89,8 @@ elif sys.argv[1] == 'host':
             name = Path(value).stem + '.c.o'
             link[i] = str(out / name if not control and name in ('recomp_0028.c.o','recomp_0044.c.o','recomp_0045.c.o') else manifest[name])
     link[1:1] = [str(full / 'entry.o'), str(full / 'gates.o'), str(base / 'native-regs/checkpoint.o')]
+    if not control:
+        link_disc_archives(root, out, link)
     def compile_source(name, source=None, flags=()):
         if name == 'ohci_boot.c':
             # Host collector only: accept Xbox letter names directly, without
@@ -104,6 +108,9 @@ elif sys.argv[1] == 'host':
                 source = (root / 'src/d3d/vk/backend.cpp').read_text()
                 at = source.index('void VulkanBackend::Prewarm() {')
                 before, warm = source[:at], source[at:]
+                needle = '                if (m) { modules_[r.key] = m; ++made; }'
+                assert warm.count(needle) == 1
+                warm = warm.replace(needle, "                if (m) { modules_[r.key] = m; ++made; CacheRecord('S', r.key, d, 9); }")
                 needle = '            if (!m) continue;  // Leave first use free to retry.'
                 assert warm.count(needle) == 1
                 warm = warm.replace(needle, needle + '\n            CacheModule(r.key, hlsl, vertex);')
@@ -112,6 +119,9 @@ elif sys.argv[1] == 'host':
                 warm = warm.replace(needle, needle + "\n                    CacheRecord('K', 0, &k, sizeof(k));")
                 source = before + warm
         if diagnostics:
+            if name == 'vk/backend.cpp':
+                from story_gpu import instrument
+                source = instrument(source if source is not None else (root / 'src/d3d/vk/backend.cpp').read_text())
             flags = [*flags, '-DNGB_NATIVE_DIAG', '-DNGB_COMBAT_PERF', '-include', str(runtime / 'combat_perf.h')]
         matches = [c.copy() for c in commands if c[-1].endswith('/' + name)]
         assert len(matches) == 1, (name, len(matches))
@@ -130,7 +140,7 @@ elif sys.argv[1] == 'host':
         return str(obj)
     driver = (experiment / 'replay.c').read_text()
     if diagnostics:
-        (sources / 'native_combat_perf.inc').write_text((runtime / 'combat_perf.inc').read_text().replace('#SESSION,0.56.25,','#SESSION,0.57.7,'))
+        (sources / 'native_combat_perf.inc').write_text((runtime / 'combat_perf.inc').read_text().replace('#SESSION,0.56.25,','#SESSION,0.57.24,'))
     runtime_source = (runtime / 'runtime.c').read_text().replace('RECOMP_TLS RecompRegs g_regs;', 'RecompRegs g_regs;')
     runtime_source = runtime_source.replace('        ngb_menu_draw(cursor);', '        extern void replay_unlock(uint32_t); replay_unlock(g_ebx);\n        ngb_menu_draw(cursor);')
     (sources / 'native-runtime.inc').write_text(runtime_source)
@@ -140,7 +150,7 @@ elif sys.argv[1] == 'host':
     link[link.index(str(base / 'core-perf/exact-runtime_test.c.o'))] = obj
     # Replace object inputs already present in the old link, or precede archives.
     for name, source, flags in [
-        ('files.c', None, ()), ('identity.c', None, ()), ('opening_movie.c', None, ()),
+        ('files.c', None, ()), ('files_bridge.c', None, ()), ('identity.c', None, ()), ('opening_movie.c', None, ()),
         ('ohci_boot.c', None, ()), ('pgraph_boot.c', None, ('-Wno-unused-variable',)),
         ('nv2a_boot.c', None, ()),
         ('scanout.c', None, ()),
@@ -148,7 +158,7 @@ elif sys.argv[1] == 'host':
         ('contiguous.c', (full / 'contiguous.c').read_text(), ()),
         ('direct/hooks.c', None, ('-include', str(runtime / 'switch_guest_regs.h'))),
         ('hle.cpp', None, test_flags),
-        ('threaded.cpp', None, ()),
+        ('threaded.cpp', None, ()), ('gpu/shaders.cpp', None, ()),
         ('direct/platform.cpp', None, ()),
         ('scene/bridge.c', None, ()), ('vk/backend.cpp', None, ('-DNGB_RIGID_CLIP',)),
     ]:
@@ -160,6 +170,14 @@ elif sys.argv[1] == 'host':
             link[old[0]] = obj
         else:
             link.insert(1, obj)
+    if checks:
+        cmd = next(c.copy() for c in commands if c[-1].endswith('/vk/backend.cpp'))
+        obj = out / 'test_submission.o'
+        cmd[cmd.index('-o') + 1] = str(obj)
+        cmd[cmd.index('-MF') + 1] = str(obj) + '.d'
+        cmd[-1] = str(experiment / 'test_submission.cpp')
+        sp.run(cmd, cwd=host, check=True)
+        link.insert(1, str(obj))
     executable = out / ('replay-control' if control else 'replay-checks' if checks else 'replay-diag' if diagnostics else 'replay')
     link[link.index('-o') + 1] = str(executable)
     (out / 'link.json').write_text(json.dumps(link, indent=2) + '\n')
@@ -176,9 +194,12 @@ elif sys.argv[1] == 'host':
     inputs += [root / 'src/d3d' / n for n in ('native_diag.h','native_diag.inc','native_pacing.h')]
     inputs += [root / 'src/d3d/vk/cache_writer.h']
     inputs += [root / 'src/d3d' / n for n in ('native_mesh.inc','native_simple.inc','gpu/prepared.h','gpu/backend.h')]
-    inputs += [runtime / 'direct' / n for n in ('native_mesh.inc','native_model.inc')]
-    inputs += [runtime / n for n in ('workers.inc','combat_perf.h','combat_perf.inc')]
-    inputs += list(experiment.glob('*.py')) + [experiment / n for n in ('replay.c','native_contract.inc','native_lifetime_contract.inc','native_header_contract.inc','test_pacing.cpp','test_combat_writer.c','test_material.cpp','test_mesh.cpp','test_simple.cpp')]
+    inputs += [runtime / 'direct' / n for n in ('native_mesh.inc','native_model.inc','disc_archives.S')]
+    inputs += [runtime / n for n in ('workers.inc','combat_perf.h','combat_perf.inc','files.c','files.h','files_bridge.c','files_bridge.h','disc_reads.inc','ohci_boot.c')]
+    if diagnostics:
+        inputs += [experiment / 'story_gpu.inc']
+    inputs += list(experiment.glob('*.py')) + [experiment / n for n in ('replay.c','native_contract.inc','native_lifetime_contract.inc','native_header_contract.inc','native_effect_contract.inc','test_pacing.cpp','test_combat_writer.c','test_material.cpp','test_mesh.cpp','test_simple.cpp')]
+    inputs += [experiment / n for n in ('native_submission_contract.inc','native_shader_contract.inc','test_submission.cpp')]
     metadata = {**compatibility(), 'record_prewarm': record_prewarm,
                 'binary_sha256': hashlib.sha256(executable.read_bytes()).hexdigest(),
                 'sources': {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in inputs}}

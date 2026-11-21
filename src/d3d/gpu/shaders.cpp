@@ -751,6 +751,9 @@ std::string FixedVertexHlsl(uint16_t regs, bool pretransformed, uint64_t decode,
     s += VsInputs(regs, decode);
     s += kVsPrologue;
     auto v = [&](int r, const char* def) { return (regs >> r) & 1 ? F("i.v%d", r) : std::string(def); };
+    bool clip_effect = !pretransformed && (f.light & kCombatClipPlanes);
+    if (clip_effect) s.insert(s.find("    float4 pos : SV_Position;"),
+                              "    float4 clipLo : SV_ClipDistance0;\n    float4 clipHi : SV_ClipDistance1;\n");
     bool lit = !pretransformed && (f.light & 1);
     if (pretransformed) {
         s += "    float4 rhw = " + v(0, "float4(0,0,0,1)") + ";\n";
@@ -859,10 +862,11 @@ std::string FixedVertexHlsl(uint16_t regs, bool pretransformed, uint64_t decode,
     o.tc2 = oT2;
     o.tc3 = oT3;
     o.fogamt = fogfactor(abs(cp.z));
-    return o;
-}
 )";
-    return s;
+    if (clip_effect)
+        s += "    float4 axes = float4(oT0.xy, oT0.x + oT0.y, oT0.x - oT0.y);\n"
+             "    o.clipLo = axes - uvc[0];\n    o.clipHi = uvc[1] - axes;\n";
+    return s + "    return o;\n}\n";
 }
 
 int IdViewMode() {
@@ -925,13 +929,39 @@ std::string PixelHlsl(const PixelKey& k) {
                "    return r;\n"
                "}\n", i, i, i, i, i, i, i, i, i, i, lod.c_str(), i, i);
     }
+    if (k.combat == CombatPixel::Additive) s += "[earlydepthstencil]\n";
     s += F("float4 main(VOut i, bool front : SV_IsFrontFace) : SV_Target {\n");
     s += "    float4 tc0 = i.tc0, tc1 = i.tc1, tc2 = i.tc2, tc3 = i.tc3;\n";
     s += k.two_sided ? "    float4 v0 = front ? i.d0 : i.b0, v1 = front ? i.d1 : i.b1;\n" : "    float4 v0 = i.d0, v1 = i.d1;\n";
     s += "    if (misc.w == 0) v1 = float4(0, 0, 0, 1);\n";
     s += "    float4 fogin = float4(fogcolor.rgb, saturate(i.fogamt));\n";
     std::string body;
-    if (k.programmable) {
+    // The game's trail, textured additive blades and untextured streaks. These
+    // use one sampler at most. Recognize the operations actually consumed; XDK
+    // leaves old values in unused argument slots between consecutive materials.
+    const auto& f = k.ff[0];
+    const auto& fade = k.ff[1];
+    bool history = k.combat == CombatPixel::History;
+    bool capture = history && f[0] == 3 && f[2] == 2;
+    bool tinted = f[0] == 4 && f[1] == 2 && f[2] <= 1;
+    bool textured = k.tex[0].kind == kTex2D && !k.tex[0].shadow && !k.tex[0].flags &&
+                    (capture || tinted) && f[4] == 4 && f[5] == 2 && f[6] <= 1;
+    bool vertex_colour = !k.tex[0].kind && f[0] == 2 && f[1] == 0 && f[4] == 2 && f[5] == 0;
+    bool use_fade = fade[0] == 3 && fade[2] == 1 && fade[4] == 4 && fade[5] == 3 && fade[6] == 1 &&
+                    fade[8] != 5 && k.ff[2][0] <= 1;
+    if (k.combat != CombatPixel::None && !k.programmable && k.skip_alpha_test && !k.alphakill &&
+        !k.proj && !k.sprite && !g_shader_hooks && (textured || vertex_colour) && f[8] != 5 &&
+        (fade[0] <= 1 || use_fade)) {
+        if (textured) {
+            std::string uv = k.quad ? "(qsnap.x > 0 ? clamp(tc0.xy, uvc[0].xy, uvc[0].zw) : tc0.xy)" : "tc0.xy";
+            if (k.tex[0].rect) uv += " / texsize[0].xy";
+            body += "float4 tap = tex0.Sample(smp0, " + uv + " + texsize[0].zw);\n";
+            body += capture ? "float4 layer = saturate(float4(tap.rgb, tap.a * v0.a));\n"
+                            : "float4 layer = saturate(tap * v0);\n";
+        } else body += "float4 layer = saturate(v0);\n";
+        if (use_fade) body += "layer.a = saturate(layer.a * tfactor.a);\n";
+        body += "float4 outc = float4(lerp(fogin.rgb, saturate(layer.rgb + v1.rgb), fogin.a), layer.a);\n";
+    } else if (k.programmable) {
         for (int i = 0; i < 4; i++) {
             body += TexFetch(k, i);
             body += Hooks().Fetched(k.tex[i], i);
@@ -1061,7 +1091,8 @@ std::string PixelHlsl(const PixelKey& k) {
         body += "cur.rgb = saturate(cur.rgb + v1.rgb);\n";
         body += "float4 outc = float4(lerp(fogin.rgb, cur.rgb, fogin.a), cur.a);\n";
     }
-    body += "alphatest(outc.a);\n" + Hooks().Output();
+    if (!k.skip_alpha_test) body += "alphatest(outc.a);\n";
+    body += Hooks().Output();
     // NGB_D3D_IDVIEW=1 (debugging): an opaque 3D surface tinted by its draw's colour (qsnap.z: 1 + a palette
     // index), its own shading kept -- two surfaces fighting over pixels show as two colours speckling
     // mode 2: the draw's number exactly, in red (low byte) and green (high byte, times 16), blue 200
@@ -1073,6 +1104,9 @@ std::string PixelHlsl(const PixelKey& k) {
                 "  float3 hue = saturate(abs(frac(h + float3(0, 2.0/3, 1.0/3)) * 6 - 3) - 1);\n"
                 "  float l = dot(outc.rgb, float3(0.3, 0.59, 0.11));\n"
                 "  outc.rgb = hue * (0.35 + 0.9 * l); }\n";
+    // Source-alpha additive blending leaves all four UNORM destination channels
+    // unchanged at zero. The effect pipeline has read-only depth and stencil.
+    if (k.combat == CombatPixel::Additive) body += "if (outc.a == 0.0) discard;\n";
     body += "return outc;\n}\n";
     s += body;
     return k.quad ? QuadHlsl(std::move(s)) : s;

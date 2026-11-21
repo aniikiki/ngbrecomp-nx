@@ -1,5 +1,8 @@
 #pragma once
 #include <stdint.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
 #define NGB_SCAN_W 720u
 #define NGB_SCAN_H 480u
 void ngb_scanout_reset(void);
@@ -15,6 +18,10 @@ void ngb_scanout_refresh(uint32_t phys);
 uint32_t *ngb_scanout_movie_buffer(void);
 void ngb_scanout_publish_movie(void);
 
-#ifndef __SWITCH__
+void ngb_scanout_publish_gpu(void);
+int ngb_scanout_is_gpu(void);
+int ngb_scanout_is_blank(void);
 const uint32_t *ngb_scanout_last_pixels(void);
+#ifdef __cplusplus
+}
 #endif

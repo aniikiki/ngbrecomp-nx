@@ -19,8 +19,7 @@ void ngb_kernel_log(const char*);
 [[noreturn]] void ngb_stop(const char*, uint32_t);
 }
 
-// The guest worker owns the standalone Vulkan queue. The Switch frontend
-// supplies input and diagnostics separately from the desktop overlays.
+// The standalone renderer owns the device and shares its graphics queue with the Switch frontend.
 extern "C" {
 #ifdef NGB_PLAYER_BUILD
 #include "../recomp_settings.h"
@@ -222,3 +221,8 @@ extern "C" void ngb_direct_stats(void)
         (unsigned long long)(counters.geometry_bytes >> 20), (unsigned long long)(counters.reused_bytes >> 20));
     ngb_kernel_log(line);
 }
+
+#include "display_device.h"
+#ifdef NGB_GPU_PRESENT
+#include "presenter.inc"
+#endif

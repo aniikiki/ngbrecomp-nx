@@ -1362,6 +1362,7 @@ int ngb_boot(const char *path, FILE *log)
         }
     }
     note("[RESULT] status=%d reason=%s", stopped_status, stopped_reason);
+    ngb_devices_reset(); /* Join disc I/O before releasing the renderer or guest RAM. */
     ngb_scene_close();
     for (unsigned i=0;i<128;++i) free(fibers[i].stack);
     memset(fibers,0,sizeof(fibers));
@@ -1369,7 +1370,6 @@ int ngb_boot(const char *path, FILE *log)
     reset_workers();
     memset(events,0,sizeof(events));
     event_serial=0;
-    ngb_devices_reset();
     ngb_menu_gpu_close();
     ngb_contiguous_reset();
     free(ram); ram = NULL; g_xbox_mem_offset = 0;

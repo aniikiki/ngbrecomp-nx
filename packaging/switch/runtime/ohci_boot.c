@@ -1,4 +1,7 @@
 #include "mission_perf.h"
+#ifdef NGB_NATIVE_DIAG
+#include "combat_perf.h"
+#endif
 #include "services.h"
 /* Register subset for MCPX USB startup and root-hub interrupts. All device
  * state belongs to the guest worker except the sampled pad presence flag. */
@@ -266,6 +269,15 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
         ngb_settings_open();
         memset(out+2,0,18);
         return 20;
+    }
+#endif
+#ifdef NGB_NATIVE_DIAG
+    if (ngb_combat_enabled) {
+        static bool menu_confirm_held;
+        bool down=out[4] || (out[2]&16) || out[6];
+        if (down && !menu_confirm_held && atomic_load(&menu_input) && last_cursor==0)
+            ngb_combat_new_game_press();
+        menu_confirm_held=down;
     }
 #endif
     /* Use the game state on the guest worker, after loading system.dat.

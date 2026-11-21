@@ -55,10 +55,10 @@ public:
                        uint32_t stencil) = 0;
     // indices: the title's 16 bit indices, null for non indexed draws, then start is the first vertex
     virtual void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices,
-                      const IndexBounds* bounds = nullptr) = 0;
+                      const IndexBounds* bounds = nullptr, CombatEffect effect = CombatEffect::None) = 0;
     virtual void DrawPrepared(const State& s, uint32_t prim, uint32_t start, uint32_t count,
-                              const uint8_t* indices, PreparedState) {
-        Draw(s, prim, start, count, indices);
+                              const uint8_t* indices, PreparedState, CombatEffect effect = CombatEffect::None) {
+        Draw(s, prim, start, count, indices, nullptr, effect);
     }
     // src_rects: count D3DRECTs, dst_points: count POINTs (2 x int32), either null
     virtual void Copy(const Surface& src, const Surface& dst, uint32_t count, const uint8_t* src_rects,
@@ -88,6 +88,14 @@ public:
     // (guest address) once known, as the GPU would
     virtual void VisibilityBegin() {}
     virtual void VisibilityEnd(uint32_t /*report_va*/) {}
+
+    // Called synchronously once this frame no longer reads guest input. A
+    // backend may still be waiting to reuse GPU resources or publish its image.
+    // This is only frame pacing progress, never a resource fence or a readback.
+    virtual void Present(const Surface& front, void (*consumed)(void*), void* context) {
+        Present(front);
+        if (consumed) consumed(context);
+    }
 
 private:
     uint32_t fence_ = 0;

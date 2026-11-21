@@ -81,6 +81,17 @@ static bool PaceOn() {   // (read late: on Android env.txt is applied after the 
     static const bool on = std::getenv("NV2A_PACE_LOG") != nullptr;
     return on;
 }
+static bool OverlapPresent() {
+#ifdef NGB_DIRECT3D
+    static const bool enabled = [] {
+        const char* e = std::getenv("NGB_D3D_PRESENT_OVERLAP");
+        return !e || std::strcmp(e, "0") != 0;
+    }();
+    return enabled && ngb_d3d_native_enabled();
+#else
+    return false;
+#endif
+}
 #define g_pace_on PaceOn()
 static uint64_t PaceNowUs() {
     return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -91,6 +102,7 @@ enum class Op : uint8_t { State, Headers, Peek, Draw, Clear, Copy, Present, Flus
 
 struct Cmd {
     Op op;
+    CombatEffect effect = CombatEffect::None;
     uint32_t a = 0, b = 0, c = 0, d = 0;
     float f = 0;
     uint32_t data = 0, size = 0;   // bytes in Batch::bytes
@@ -291,15 +303,15 @@ public:
 
     bool Init(uint32_t width, uint32_t height) override { return inner_->Init(width, height); }
 
-    void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices, const IndexBounds*) override {
-        RecordDraw(s, prim, start, count, indices, {0, ~0u});
+    void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices, const IndexBounds*, CombatEffect effect) override {
+        RecordDraw(s, prim, start, count, indices, {0, ~0u}, effect);
     }
     void DrawPrepared(const State& s, uint32_t prim, uint32_t start, uint32_t count,
-                      const uint8_t* indices, PreparedState changes) override {
-        RecordDraw(s, prim, start, count, indices, changes);
+                      const uint8_t* indices, PreparedState changes, CombatEffect effect) override {
+        RecordDraw(s, prim, start, count, indices, changes, effect);
     }
     void RecordDraw(const State& s, uint32_t prim, uint32_t start, uint32_t count,
-                    const uint8_t* indices, PreparedState changes) {
+                    const uint8_t* indices, PreparedState changes, CombatEffect effect) {
         std::lock_guard lock(cap_);
 #ifdef NGB_DIRECT3D
         const size_t before = cur_->cmds.size();
@@ -309,7 +321,7 @@ public:
         if (before == cur_->cmds.size() && before && cur_->cmds.back().op == Op::Draw) {
             ++same_state_pairs_;
             Cmd& prev = cur_->cmds.back();
-            if (prim == 6 && prev.a == prim && indices && prev.d == 1 && prev.b == start &&
+            if (prev.effect == effect && prim == 6 && prev.a == prim && indices && prev.d == 1 && prev.b == start &&
                 TryJoinStrips(s, prev, indices, count)) {
                 ++merged_strips_;
                 return;
@@ -321,6 +333,7 @@ public:
         }
 #endif
         Cmd c{Op::Draw};
+        c.effect = effect;
         c.a = prim;
         c.b = start;
         c.c = count;
@@ -408,7 +421,7 @@ public:
         NativeDiagScope diag(ND_FRAME_WAIT);
         uint64_t id = frame_wait_;
         frame_wait_ = 0;
-        if (thread_ && id) Wait(id);
+        if (thread_ && id) Wait(id, true, OverlapPresent());
     }
 
     // A native API fence names a recorded batch. Reaching it means all guest
@@ -885,8 +898,9 @@ private:
     // tried for the sound skipping with the drawing behind, #126) made play stutter and answer late, the title
     // waiting for the CPU back every frame. A wait that goes on for kStallLogSeconds is logged, then every so
     // often: a frozen game's log says which frame the render thread is held on.
-    void Wait(uint64_t id, bool hand_over = true) {
-        if (!id || done_.load() >= id) return;
+    void Wait(uint64_t id, bool hand_over = true, bool frame_reads = false) {
+        auto progress = [&] { return frame_reads ? present_consumed_.load(std::memory_order_acquire) : done_.load(); };
+        if (!id || progress() >= id) return;
         if (hand_over && id > submitted_.load()) {   // the batch being recorded: handed over
             std::lock_guard lock(cap_);
             id = Submit();
@@ -902,7 +916,7 @@ private:
             std::unique_lock lock(m_);
             auto since = std::chrono::steady_clock::now();
             int logged = 0;
-            while (!done_cv_.wait_for(lock, std::chrono::seconds(1), [&] { return done_.load() >= id || exited_; })) {
+            while (!done_cv_.wait_for(lock, std::chrono::seconds(1), [&] { return progress() >= id || exited_; })) {
                 int s = int(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - since).count());
                 if (s >= kStallLogSeconds * (logged + 1)) {
                     logged++;
@@ -1074,11 +1088,11 @@ private:
 #ifdef NGB_DIRECT3D
                 if (c.d == 2) {
                     const auto& snapshot = *b.index_snapshots[c.size];
-                    inner_->Draw(state_, c.a, c.b, c.c, snapshot.bytes.data(), &snapshot.bounds);
+                    inner_->Draw(state_, c.a, c.b, c.c, snapshot.bytes.data(), &snapshot.bounds, c.effect);
                     break;
                 }
 #endif
-                inner_->Draw(state_, c.a, c.b, c.c, c.d ? data : nullptr);
+                inner_->Draw(state_, c.a, c.b, c.c, c.d ? data : nullptr, nullptr, c.effect);
                 break;
             case Op::Clear: inner_->Clear(state_, c.a, c.size ? data : nullptr, c.b, c.c, c.f, c.d); break;
             case Op::Copy:
@@ -1087,7 +1101,17 @@ private:
                 break;
             case Op::Present:
                 inner_->UseQuick(b.quick[size_t(c.quick)]);
-                inner_->Present(c.s1);
+                if (OverlapPresent()) {
+                    struct Ready { Recorded* owner; uint64_t id; } ready{this, b.id};
+                    inner_->Present(c.s1, [](void* context) {
+                        auto& r = *static_cast<Ready*>(context);
+                        {
+                            std::lock_guard lock(r.owner->m_);
+                            r.owner->present_consumed_.store(r.id, std::memory_order_release);
+                        }
+                        r.owner->done_cv_.notify_all();
+                    }, &ready);
+                } else inner_->Present(c.s1);
                 break;
             case Op::Flush: inner_->Flush(); break;
             case Op::Gamma: inner_->SetGamma(data); break;
@@ -1146,6 +1170,7 @@ private:
     std::deque<Batch*> queue_;
     std::vector<Batch*> free_;
     std::atomic<uint64_t> done_{0};
+    std::atomic<uint64_t> present_consumed_{0};
     bool stop_ = false, exited_ = false;
 };
 

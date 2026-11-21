@@ -26,7 +26,7 @@ public:
             R32(d.data)==0x12340000u+slot;
         ++probe.seen;
     }
-    void Draw(const gpu::State&,uint32_t,uint32_t,uint32_t,const uint8_t*,const gpu::IndexBounds*) override {}
+    void Draw(const gpu::State&,uint32_t,uint32_t,uint32_t,const uint8_t*,const gpu::IndexBounds*,gpu::CombatEffect) override {}
     void Copy(const gpu::Surface&,const gpu::Surface&,uint32_t,const uint8_t*,const uint8_t*) override {}
     void Present(const gpu::Surface&) override {}
     void Sync(uint32_t,uint32_t) override {}

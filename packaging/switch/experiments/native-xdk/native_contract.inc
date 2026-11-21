@@ -2,6 +2,9 @@
 extern "C" unsigned ngb_native_test_callback_hits;
 #include "native_lifetime_contract.inc"
 #include "native_header_contract.inc"
+#include "native_effect_contract.inc"
+#include "native_submission_contract.inc"
+#include "native_shader_contract.inc"
 
 extern "C" void ngb_d3d_native_test(void) {
     auto require = [](bool okay, uint32_t detail) {
@@ -22,12 +25,19 @@ extern "C" void ngb_d3d_native_test(void) {
     std::memcpy(saved_states.data(),HostPtr(kRenderState,sizeof saved_states),sizeof saved_states);
     uint32_t encoded_a=R32(kSimpleEncode+4),encoded_b=R32(kSimpleEncode+8);
     W32(kSimpleEncode+4,0x403fc);W32(kSimpleEncode+8,0x403fc);
+    native_simple_ready = false; // this fixture deliberately changes the otherwise immutable table
     NativeSimple(0x3fc,0x13579bdf);
     require(R32(kRenderState+4)==0x13579bdf && R32(kRenderState+8)==0x13579bdf &&
             g_state.simple[0x3fc/4]==0x13579bdf,19);
     W32(kSimpleEncode+4,encoded_a);W32(kSimpleEncode+8,encoded_b);
+    native_simple_ready = false;
     std::memcpy(HostPtr(kRenderState,sizeof saved_states),saved_states.data(),sizeof saved_states);
     g_state.simple=saved_simple;
+    NativeShaderContract();
+    NativeEffectContract();
+    NativeCombatContract();
+    NativeShadowContract();
+    auto submission_resources = NativeSubmissionContract();
 
     // NGB inlines palette unbinding: changing the guest fields must take effect
     // even though no SetPalette hook runs. Rebinding must not decrement twice.
@@ -126,8 +136,11 @@ extern "C" void ngb_d3d_native_test(void) {
     call(D3DF_D3DDevice_SetPalette, 0, 0, {palette});
     W32(palette, R32(palette) - 0x80000); W32(kNativeDevice + 0xf98, 0);
     NativeDestroyDevice(); require(!native_push && !R32(kDevicePtr) && !g_backend, 13);
+    NativeRelease(submission_resources[0]); NativeRelease(submission_resources[1]);
+    ngb_graphics_pool_free(submission_resources[2]);
     NativeLifetimeContract(scratch);
     NativeHeaderContract();
+    NativePresentContract();
     ngb_graphics_pool_free(scratch);
     std::fprintf(stderr, "[CONTRACT-PASS] palette-inline parent-lifetime colour-linear colour-swizzled colour-565 depth-stencil fences visibility callback viewport reset destroy\n");
 }

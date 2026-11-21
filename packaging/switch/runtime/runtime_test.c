@@ -1092,6 +1092,76 @@ static void check_waiter_selection(void)
     memcpy(workers, saved, sizeof(saved));
 }
 
+/* Exercise both event and file-handle completion through the retail kernel
+ * entry points. Only the scheduler is allowed to publish into guest RAM. */
+static void check_overlapped_reads(void)
+{
+    uint32_t file, information;
+    CHECK(!ngb_file_open("D:\\default.xbe",0,0x80100080,3,1,0x48,&file,&information));
+    invoke(189,(uint32_t[]){0x6820,0,1,1},4);
+    uint32_t event=read32(0x6820);
+    uint32_t args[]={file,event,0,0,0x6830,0x6840,4,0x6850};
+    write32(0x6850,0); write32(0x6854,0);
+    write32(0x6840,0xcccccccc); write32(0x6844,0xaaaaaaaa);
+    invoke(219,args,8);
+    CHECK(g_eax==NGB_FS_PENDING && read32(0x6830)==NGB_FS_PENDING && !read32(0x6834));
+    CHECK(read32(0x6840)==0xcccccccc && !events[event&127].signalled);
+    CHECK(ngb_file_wait_status(file)==NGB_FS_TIMEOUT);
+    invoke(233,(uint32_t[]){file,0,0x6850},3);
+    CHECK(g_eax==NGB_FS_TIMEOUT);
+    invoke(233,(uint32_t[]){event,0,0},3);
+    CHECK(!g_eax && !read32(0x6830) && read32(0x6834)==4 && read32(0x6840)==0x48454258);
+    CHECK(!events[event&127].signalled && !ngb_file_wait_status(file));
+    /* Back-to-back requests on one handle, a short final read, then EOF. */
+    args[1]=0; write32(0x6850,4571134); write32(0x6840,0xa5a5a5a5);
+    invoke(219,args,8); CHECK(g_eax==NGB_FS_PENDING);
+    args[4]=0x6860; args[5]=0x6870; write32(0x6850,4571136); write32(0x6870,0x12345678);
+    invoke(219,args,8); CHECK(g_eax==NGB_FS_PENDING);
+    while (read32(0x6860)==NGB_FS_PENDING) ngb_io_yield();
+    invoke(234,(uint32_t[]){file,1,0,0},4);
+    CHECK(!g_eax && !read32(0x6830) && read32(0x6834)==2 && MEM16(0x6842)==0xa5a5);
+    CHECK(read32(0x6860)==0xc0000011u && !read32(0x6864) && read32(0x6870)==0x12345678);
+    /* Request without an event, waiting directly on the file. */
+    write32(0x6850,0); invoke(219,args,8); CHECK(g_eax==NGB_FS_PENDING);
+    invoke(234,(uint32_t[]){file,1,0,0},4);
+    CHECK(!g_eax && !read32(0x6860) && read32(0x6870)==0x48454258);
+    /* An explicit seek follows pending I/O on this handle. The next
+     * current-position read must use the sought offset. */
+    invoke(219,args,8); CHECK(g_eax==NGB_FS_PENDING);
+    write32(0x6880,2); write32(0x6884,0);
+    invoke(226,(uint32_t[]){file,0x6890,0x6880,8,14},5);
+    CHECK(!g_eax && !read32(0x6860));
+    args[7]=0; args[6]=2; invoke(219,args,8);
+    CHECK(!g_eax && read32(0x6864)==2 && MEM16(0x6870)==0x4845);
+    args[7]=0x6850; args[6]=4; args[1]=event;
+    invoke(219,args,8); CHECK(g_eax==NGB_FS_PENDING);
+    invoke(187,&event,1); CHECK(!g_eax);
+    invoke(189,(uint32_t[]){0x6820,0,1,0},4);
+    CHECK(!g_eax && read32(0x6820)!=event);
+    event=read32(0x6820);
+    while (ngb_pending_disc_reads) ngb_io_yield();
+    CHECK(!events[event&127].signalled && !read32(0x6860));
+    /* Close can race with the native reader. Once it returns the old request
+     * must never write into storage reused by a new handle. */
+    args[1]=event;
+    invoke(219,args,8); CHECK(g_eax==NGB_FS_PENDING);
+    invoke(187,&file,1); CHECK(!g_eax);
+    CHECK(read32(0x6860)==0 || read32(0x6860)==0xc0000120u);
+    CHECK(events[event&127].signalled);
+    uint32_t replacement;
+    CHECK(!ngb_file_open("D:\\default.xbe",0,0x80100080,3,1,0x48,&replacement,&information));
+    CHECK(replacement!=file);
+    write32(0x6870,0xabcdef01);
+    while (ngb_pending_disc_reads) ngb_io_yield();
+    CHECK(read32(0x6870)==0xabcdef01 && !ngb_file_wait_status(replacement));
+    args[0]=replacement; args[1]=0;
+    invoke(219,args,8); CHECK(g_eax==NGB_FS_PENDING);
+    ngb_devices_reset();
+    CHECK(!ngb_pending_disc_reads && read32(0x6870)==0xabcdef01);
+    invoke(187,&event,1); CHECK(!g_eax);
+    invoke(187,&replacement,1); CHECK(!g_eax);
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 4 && (!strcmp(argv[1], "--start-button") || !strcmp(argv[1], "--usb-reset") || !strcmp(argv[1], "--usb-slow") || !strcmp(argv[1], "--graphics-vblank") || !strcmp(argv[1], "--fifo-trace"))) {
@@ -1231,6 +1301,7 @@ int main(int argc, char **argv)
     invoke(187, &file, 1); CHECK(g_eax == 0);
     invoke(219, read_args, 8);
     CHECK(g_eax == NGB_FS_INVALID_HANDLE && read32(0x6734) == 0);
+    check_overlapped_reads();
     const char drive[] = "\\??\\z:";
     const char target[] = "\\Device\\Harddisk0\\Partition5";
     CHECK(ngb_file_link("\\??\\Z:", target) == 0);

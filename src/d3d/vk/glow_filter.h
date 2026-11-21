@@ -76,7 +76,7 @@ void VulkanBackend::InvalidateContinuousGlow(uint32_t data) {
     for (auto& r:continuous_record_) if (r.data==(data&0x7FFFFFFFu)) r.frame=~0u;
 }
 
-int VulkanBackend::ContinuousGlowStage(const State& s,const Assembled& a,uint32_t count) {
+int VulkanBackend::GlowStage(const State& s,const Assembled& a,uint32_t count) {
     if (!s.ps || s.rs[kRsZEnable] || s.rs[kRsStencilEnable] || SimpleState(s,kMBlendEnable) ||
         SimpleState(s,kMColorWriteEnable)!=0x01010101 || SimpleState(s,kMAlphaTestEnable)) return -1;
     uint32_t w,h;SurfaceSize(s.rt,w,h);
@@ -95,11 +95,7 @@ int VulkanBackend::ContinuousGlowStage(const State& s,const Assembled& a,uint32_
     if (w==256 && h==128 && src.width==256 && src.height==256 && fingerprint==blur) stage=1;
     if (w==128 && h==128 && src.width==256 && src.height==128 && fingerprint==blur) stage=2;
     if (stage<0) return -1;
-    if (stage) {
-        const auto& previous=continuous_record_[stage-1];
-        if (previous.frame!=presents_ || previous.data!=(src.data&0x7FFFFFFFu) ||
-            s.rs[kRsPsTextureModes]!=0x8421) return -1;
-    }
+    if (stage && s.rs[kRsPsTextureModes]!=0x8421) return -1;
     // Match the coordinates, axis and offsets too. Similar-sized water,
     // shadow and unrelated screen quads must retain their original shaders.
     for (int tap=0;tap<(stage?4:1);++tap) {
@@ -132,6 +128,17 @@ int VulkanBackend::ContinuousGlowStage(const State& s,const Assembled& a,uint32_
             if (!std::isfinite(uv[0]) || !std::isfinite(uv[1]) || std::abs(uv[0]-u)>epsilon ||
                 std::abs(uv[1]-vv)>epsilon) return -1;
         }
+    }
+    return stage;
+}
+
+int VulkanBackend::ContinuousGlowStage(const State& s,const Assembled& a,uint32_t count) {
+    int stage = GlowStage(s, a, count);
+    if (stage > 0) {
+        TextureDesc src;
+        if (!Describe(s.textures[0], src)) return -1;
+        const auto& previous = continuous_record_[stage - 1];
+        if (previous.frame != presents_ || previous.data != (src.data & 0x7fffffffu)) return -1;
     }
     return stage;
 }

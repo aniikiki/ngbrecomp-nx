@@ -22,6 +22,7 @@ static NgbExchange snapshots = NGB_EXCHANGE_INIT;
 static atomic_uint generation, display_count;
 static atomic_int last_snapshot = -1;
 static atomic_int ready, blank, visible;
+static atomic_int gpu_picture;
 static uint32_t display_pitch;
 static unsigned peak_brightness, fade_steps;
 static uint64_t fade_start;
@@ -35,6 +36,7 @@ void ngb_scanout_reset(void)
     atomic_store(&visible, 0);
     atomic_store(&ready, 0);
     atomic_store(&blank, 0);
+    atomic_store(&gpu_picture, 0);
 }
 void ngb_scanout_blank(int enabled)
 {
@@ -66,6 +68,7 @@ static void publish_snapshot(void)
     }
     last_snapshot = snapshots.writer;
     ngb_publish(&snapshots);
+    atomic_store(&gpu_picture, 0);
     if (first_picture) atomic_store(&visible,1);
     atomic_fetch_add(&generation, 1);
 }
@@ -79,12 +82,21 @@ void ngb_scanout_direct(const void *bgra)
 }
 #endif
 
-#ifndef __SWITCH__
+void ngb_scanout_publish_gpu(void)
+{
+    atomic_store(&gpu_picture, 1);
+    atomic_store(&visible, 1);
+    atomic_fetch_add(&generation, 1);
+    atomic_store(&ready, 1);
+}
+
+int ngb_scanout_is_gpu(void) { return atomic_load(&gpu_picture); }
+int ngb_scanout_is_blank(void) { return atomic_load(&blank); }
+
 const uint32_t *ngb_scanout_last_pixels(void)
 {
     return ngb_scanout_ready() ? frames[ngb_latest(&snapshots)][0] : NULL;
 }
-#endif
 
 void ngb_scanout_refresh(uint32_t phys)
 {
@@ -111,7 +123,7 @@ void ngb_scanout_refresh(uint32_t phys)
     const unsigned char *src = ngb_scene_active ? ngb_contiguous_pointer_raw(0x80000000u+phys,(size_t)n) :
                                                  ngb_contiguous_pointer(0x80000000u+phys,(size_t)n);
     if (!src) ngb_stop("unmapped scanout",phys);
-    if (last_snapshot >= 0) {
+    if (last_snapshot >= 0 && !ngb_scanout_is_gpu()) {
         unsigned y=0;
         while (y<NGB_SCAN_H && !memcmp(frames[last_snapshot][y],src+y*pitch,NGB_SCAN_W*4)) ++y;
         if (y==NGB_SCAN_H) return;

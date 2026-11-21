@@ -1,6 +1,6 @@
 /* Xbox names/32-bit handles above POSIX files, following kernel_path.c and
  * kernel_bridge.c's guest layouts. Disc files are read-only. Data writes are
- * bounded for bring-up; asynchronous completion remains unsupported. */
+ * bounded for bring-up. The bridge dispatches overlapped disc reads. */
 #define _POSIX_C_SOURCE 200809L
 #include "files.h"
 #include <stdio.h>
@@ -21,13 +21,22 @@
 #define DENIED 0xc0000022u
 #define TOO_SMALL 0xc0000023u
 #define INVALID 0xc000000du
+#define DELETE_PENDING 0xc0000056u
+#define DIRECTORY_NOT_EMPTY 0xc0000101u
+#define FILE_DELETE_ACCESS 0x00010000u
+#define FILE_WRITE_ATTRIBUTES 0x00000100u
+#define FILE_DIRECTORY_FILE 0x00000001u
+#define FILE_NON_DIRECTORY_FILE 0x00000040u
+#define FILE_OPEN_FOR_BACKUP_INTENT 0x00004000u
+#define FILE_WRITE_THROUGH 0x00000002u
 static char disc[PATH_CAP], data[PATH_CAP];
 static struct {
-    uint32_t token, access, share;
+    uint32_t token, access, share, options;
     FILE *file;
     DIR *directory;
     char path[PATH_CAP], pattern[256];
-    int readonly;
+    int readonly, volume_root;
+    int disc_async, read_unsignalled;
     int packed;
     int raw_disk;
     int dismounted;
@@ -63,6 +72,7 @@ static unsigned data_files;
 struct disc_entry { char path[160]; uint32_t size, count; struct {uint32_t start,length;} ranges[8]; };
 static struct disc_entry catalog[1024];
 static size_t catalog_count;
+int ngb_disc_archives_direct;
 static unsigned char disk_header[4096];
 static char disk_header_path[PATH_CAP];
 static int disk_header_saved;
@@ -77,6 +87,7 @@ static uint32_t error_status(void)
     case EISDIR: return 0xc00000bau;
     case EACCES: case EPERM: case EROFS: return DENIED;
     case EEXIST: return 0xc0000035u;
+    case ENOTEMPTY: return DIRECTORY_NOT_EMPTY;
     case EMFILE: case ENFILE: return 0xc000011fu;
     default: return 0xc0000001u;
     }
@@ -97,13 +108,17 @@ static int append(char *out, const char *component)
     memcpy(out + n, component, m + 1);
     return 1;
 }
-static int load_catalog(void)
+static int load_catalog(int *extracted_disc)
 {
     char path[PATH_CAP];
     if (!copy_path(path,sizeof(path),disc) || !append(path,".ngb-disc")) return -1;
     catalog_count=0;
     FILE *f=fopen(path,"rb");
-    if (!f) return errno==ENOENT ? 0 : -1;
+    if (!f) {
+        if (errno != ENOENT) return -1;
+        *extracted_disc = 1;
+        return 0;
+    }
     unsigned char raw[sizeof(struct disc_entry)];
     size_t n;
     int failed=0;
@@ -191,6 +206,7 @@ static int scan_data(const char *path, unsigned depth)
 }
 void ngb_files_close_all(void)
 {
+    ngb_disc_archives_direct = 0;
     for (unsigned i = 0; i < FILE_SLOTS; ++i) {
         if (handles[i].token) ngb_file_close(handles[i].token);
     }
@@ -208,10 +224,11 @@ FILE *ngb_open_disc_movie(const char *leaf)
 
 int ngb_files_init(const char *disc_root, const char *data_root)
 {
+    int extracted_disc = 0;
     ngb_files_close_all();
     if (!copy_path(disc, sizeof(disc), disc_root) || !copy_path(data, sizeof(data), data_root)) return -1;
     struct stat st;
-    if (plain_stat(disc, &st) || !S_ISDIR(st.st_mode) || load_catalog() || directory(data)) return -1;
+    if (plain_stat(disc, &st) || !S_ISDIR(st.st_mode) || load_catalog(&extracted_disc) || directory(data)) return -1;
     char path[PATH_CAP];
     if (!copy_path(path, sizeof(path), data) || !append(path, "hdd") || directory(path)) return -1;
     cache_bytes = data_bytes = 0; cache_files = data_files = 0;
@@ -243,7 +260,9 @@ int ngb_files_init(const char *disc_root, const char *data_root)
         if (failed) return -1;
         disk_header_saved = 1;
     } else if (errno != ENOENT) return -1;
-    return scan_data(data, 0);
+    if (scan_data(data, 0)) return -1;
+    ngb_disc_archives_direct = extracted_disc;
+    return 0;
 }
 
 static uint32_t write_disk_header(unsigned i, const void *buffer, uint32_t length,
@@ -300,12 +319,13 @@ static int cache_formatted(unsigned partition)
     uint64_t fat = (clusters * (clusters < 0xfff0 ? 2 : 4) + 4095) & ~4095ull;
     return (uint64_t)st.st_size >= 4096 + fat + cluster;
 }
-static uint32_t resolve(const char *guest, uint32_t root, char out[PATH_CAP], int *readonly)
+static uint32_t resolve(const char *guest, uint32_t root, char out[PATH_CAP], int *readonly, int *volume_root)
 {
     char normalized[PATH_CAP];
     if (!copy_path(normalized, sizeof(normalized), guest)) return BAD_NAME;
     for (char *p = normalized; *p; ++p) if (*p == '\\') *p = '/';
     char *tail = normalized;
+    *volume_root = 1;
     /* ObDosDevicesDirectory() is a pseudo-handle to the drive namespace. */
     if (root == 0xfffffffdu) {
         if (!tail[0] || tail[1] != ':' || tail[2] != '/') return BAD_NAME;
@@ -317,6 +337,7 @@ static uint32_t resolve(const char *guest, uint32_t root, char out[PATH_CAP], in
         if (*tail == '/' || strchr(tail, ':')) return BAD_NAME;
         copy_path(out, PATH_CAP, handles[i].path);
         *readonly = handles[i].readonly;
+        *volume_root = handles[i].volume_root;
     } else {
         if (tail[0] && tail[1] == ':') {
             char absolute[PATH_CAP] = "/?" "?/";
@@ -369,6 +390,7 @@ static uint32_t resolve(const char *guest, uint32_t root, char out[PATH_CAP], in
         if (slash) *slash = 0;
         if (!strcmp(tail, "..") || strchr(tail, ':')) return DENIED;
         if (*tail && strcmp(tail, ".")) {
+            *volume_root = 0;
             char component[PATH_CAP];
             copy_path(component, sizeof(component), tail);
             DIR *parent = opendir(out);
@@ -493,13 +515,17 @@ uint32_t ngb_file_open(const char *path, uint32_t root, uint32_t access,
         *handle = handles[slot].token; *information = 1;
         return 0;
     }
-    char native[PATH_CAP]; int readonly = 1;
-    uint32_t status = resolve(path, root, native, &readonly);
+    char native[PATH_CAP]; int readonly = 1, volume_root;
+    uint32_t status = resolve(path, root, native, &readonly, &volume_root);
     if (status) return status;
     if (readonly && (access & (0x40000000u | 0x10000000u | 6u))) return DENIED;
-    /* Backup intent does not elevate access in our private virtual volumes. */
-    int delete_open=disposition==1 && options==0x4040 && access==0x10000;
-    if (readonly && (access & 0x10000)) return DENIED;
+    /* XDeleteSaveGame opens each child relative to the slot directory. Its
+     * DELETE handles also request SYNCHRONIZE, WRITE_ATTRIBUTES and, for a
+     * directory, LIST_DIRECTORY. Backup intent does not grant any access. */
+    int delete_open = disposition == 1 && (access & FILE_DELETE_ACCESS) &&
+        (options == (FILE_OPEN_FOR_BACKUP_INTENT | FILE_NON_DIRECTORY_FILE) ||
+         options == (FILE_OPEN_FOR_BACKUP_INTENT | FILE_DIRECTORY_FILE));
+    if (readonly && (access & FILE_DELETE_ACCESS)) return DENIED;
     if ((!(options & 0x30) && !delete_open && !(disposition == 1 && !(access & 0x50000006u) && (options & ~0x800u) == 0x48)) ||
         (options & ~(0x00804800u | 0x7fu))) return NGB_FS_UNSUPPORTED;
     struct stat st;
@@ -510,6 +536,19 @@ uint32_t ngb_file_open(const char *path, uint32_t root, uint32_t access,
     if (disposition != 1 && disposition != 2 && disposition != 3 && !overwrite) return NGB_FS_UNSUPPORTED;
     if (overwrite && (readonly || !(access & 0x50000002u))) return DENIED;
     if (overwrite && ((options & 1) || (exists && S_ISDIR(st.st_mode)))) return INVALID;
+    for (unsigned i = 0; i < FILE_SLOTS; ++i) {
+        if (!handles[i].token) continue;
+        if ((handles[i].delete_mark || handles[i].delete_committed) &&
+            (handles[i].directory ? prefix(native, handles[i].path) : !strcmp(native, handles[i].path)))
+            return DELETE_PENDING;
+        if (strcmp(handles[i].path, native)) continue;
+        if (((access & 0x90000001u) && !(handles[i].share & 1)) ||
+            ((handles[i].access & 0x90000001u) && !(share & 1)) ||
+            ((access & 0x50000006u) && !(handles[i].share & 2)) ||
+            ((handles[i].access & 0x50000006u) && !(share & 2)) ||
+            ((access & FILE_DELETE_ACCESS) && !(handles[i].share & 4)) ||
+            ((handles[i].access & FILE_DELETE_ACCESS) && !(share & 4))) return 0xc0000043u;
+    }
     if (!exists) {
         if (disposition == 1) return NOT_FOUND;
         if (readonly) return DENIED;
@@ -525,15 +564,6 @@ uint32_t ngb_file_open(const char *path, uint32_t root, uint32_t access,
     if ((options & 1) && !isdir) return 0xc0000103u;
     if ((options & 0x40) && isdir) return 0xc00000bau;
     if (!isdir && !created && !S_ISREG(st.st_mode)) return DENIED;
-    for (unsigned i = 0; i < FILE_SLOTS; ++i) if (handles[i].token && !strcmp(handles[i].path, native)) {
-        if (handles[i].delete_mark || handles[i].delete_committed) return 0xc0000056u;
-        if (((access & 0x90000001u) && !(handles[i].share & 1)) ||
-            ((handles[i].access & 0x90000001u) && !(share & 1)) ||
-            ((access & 0x50000006u) && !(handles[i].share & 2)) ||
-            ((handles[i].access & 0x50000006u) && !(share & 2)) ||
-            ((access & 0x10000u) && !(handles[i].share & 4)) ||
-            ((handles[i].access & 0x10000u) && !(share & 4))) return 0xc0000043u;
-    }
     unsigned slot;
     for (slot = 0; slot < FILE_SLOTS && handles[slot].token; ++slot) {}
     if (slot == FILE_SLOTS) return 0xc000011fu;
@@ -550,17 +580,38 @@ uint32_t ngb_file_open(const char *path, uint32_t root, uint32_t access,
     if (!handles[slot].packed && !handles[slot].file && !handles[slot].directory) return error_status();
     handles[slot].token = new_token(slot);
     handles[slot].file_limit = write_limit(native);
+    handles[slot].options = options;
+    handles[slot].disc_async = readonly && !isdir && !handles[slot].packed &&
+                               !(options & 0x30) && (access & 0x90000001u);
+    handles[slot].volume_root = volume_root;
     handles[slot].readonly = readonly; handles[slot].access = access; handles[slot].share = share;
     copy_path(handles[slot].path, sizeof(handles[slot].path), native);
     *handle = handles[slot].token; *information = created ? 2 : overwrite ? 3 : 1;
     return 0;
 }
-/* All guest file operations complete synchronously before returning to XAPI. */
+const char *ngb_file_async_disc_path(uint32_t handle)
+{
+    int i = index_for(handle);
+    return i >= 0 && handles[i].disc_async ? handles[i].path : NULL;
+}
+void ngb_file_disc_submitted(uint32_t handle)
+{
+    int i = index_for(handle);
+    if (i >= 0) handles[i].read_unsignalled = 1;
+}
+void ngb_file_disc_completed(uint32_t handle, int64_t offset, uint32_t received, uint32_t status)
+{
+    int i = index_for(handle);
+    if (i < 0) return;
+    if (!status || received || status == 0xc0000011u) handles[i].logical_position = offset + received;
+    handles[i].read_unsignalled = 0;
+}
 uint32_t ngb_file_wait_status(uint32_t handle)
 {
     int i=object_index(handle);
     if(i<0)return NGB_FS_INVALID_HANDLE;
-    return handles[i].link_id?0xc0000024u:0; /* STATUS_OBJECT_TYPE_MISMATCH */
+    if (handles[i].link_id) return 0xc0000024u; /* STATUS_OBJECT_TYPE_MISMATCH */
+    return handles[i].read_unsignalled ? NGB_FS_TIMEOUT : 0;
 }
 uint32_t ngb_file_flush(uint32_t handle)
 {
@@ -576,32 +627,76 @@ uint32_t ngb_file_close(uint32_t handle)
 {
     int i = object_index(handle);
     if (i < 0) return NGB_FS_INVALID_HANDLE;
+    int isdir = handles[i].directory != NULL;
     int rc = handles[i].link_id || handles[i].raw_disk == 1 ? 0 : handles[i].file ? fclose(handles[i].file) : handles[i].directory ? closedir(handles[i].directory) : 0;
+    uint32_t status = rc ? error_status() : 0;
     if (handles[i].delete_mark || handles[i].delete_committed) {
         int another=0;
         for (unsigned j=0;j<FILE_SLOTS;j++)
             if ((int)j!=i && handles[j].token && !strcmp(handles[i].path,handles[j].path)) {
                 handles[j].delete_committed=1; another=1;
             }
-        if (!another) {
+        if (!another && isdir) {
+            if (rmdir(handles[i].path)) status = error_status();
+        } else if (!another) {
             struct stat st;
-            if (plain_stat(handles[i].path,&st) || unlink(handles[i].path)) rc=-1;
+            if (plain_stat(handles[i].path,&st) || unlink(handles[i].path)) status=error_status();
             else { USED(handles[i].path)-=(uint64_t)st.st_size; --FILE_COUNT(handles[i].path); }
         }
     }
     memset(&handles[i], 0, sizeof(handles[i]));
-    return rc ? error_status() : 0;
+    return status;
 }
-/* FileDispositionInformation: preserve access through already-open handles
- * until the last close, including teardown. Only private regular files can
- * be removed; raw volumes, directories and DVD data never reach unlink. */
+/* Inspect the directory without consuming the guest's enumeration cursor. */
+static uint32_t check_empty_directory(const char *path)
+{
+    DIR *dir = opendir(path);
+    if (!dir) return error_status();
+    uint32_t status = 0;
+    errno = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir))) {
+        if (strcmp(entry->d_name, ".") && strcmp(entry->d_name, "..")) {
+            status = DIRECTORY_NOT_EMPTY;
+            break;
+        }
+    }
+    if (!entry && errno) status = error_status();
+    if (closedir(dir) && !status) status = error_status();
+    return status;
+}
+
+/* FileDispositionInformation marks a file or an empty directory for removal
+ * once all its handles close. The title itself enumerates and removes children. */
 uint32_t ngb_file_disposition(uint32_t handle, int pending)
 {
     int i=index_for(handle);
     if (i<0) return NGB_FS_INVALID_HANDLE;
-    if (handles[i].readonly || handles[i].raw_disk || !handles[i].file ||
-        !(handles[i].access&0x10000)) return DENIED;
+    if (handles[i].readonly || handles[i].raw_disk || handles[i].volume_root ||
+        !(handles[i].access & FILE_DELETE_ACCESS)) return DENIED;
+    if (pending && handles[i].directory) {
+        uint32_t status = check_empty_directory(handles[i].path);
+        if (status) return status;
+    }
     handles[i].delete_mark=!!pending;
+    return 0;
+}
+
+uint32_t ngb_file_set_basic(uint32_t handle, const void *buffer, uint32_t length)
+{
+    int i = index_for(handle);
+    if (i < 0) return NGB_FS_INVALID_HANDLE;
+    if (length < 40) return 0xc0000004u;
+    if (handles[i].readonly || handles[i].raw_disk ||
+        !(handles[i].access & (0x50000000u | FILE_WRITE_ATTRIBUTES))) return DENIED;
+    /* XDeleteSaveGame clears the read-only attribute with zero timestamps
+     * before disposition. All entries on our writable volumes already have
+     * normal attributes. Directory type belongs to the object itself. */
+    uint32_t attributes;
+    memcpy(&attributes, (const unsigned char *)buffer + 32, sizeof(attributes));
+    static const unsigned char zero_times[32] = {0};
+    if (memcmp(buffer, zero_times, sizeof(zero_times)) ||
+        (attributes != 0 && attributes != 0x80)) return NGB_FS_UNSUPPORTED;
     return 0;
 }
 const char *ngb_file_basename(uint32_t handle)
@@ -615,6 +710,25 @@ const char *ngb_file_basename(uint32_t handle)
 #ifdef NGB_TEXTURE_PRELOAD
 extern void ngb_texture_read(const char*,uint64_t,const uint8_t*,unsigned);
 #endif
+void ngb_file_disc_textures(const char *name, uint64_t offset, const void *buffer, uint32_t length)
+{
+#ifdef NGB_TEXTURE_PRELOAD
+    const char *ext = strrchr(name, '.');
+    if (length && ext && !strcasecmp(ext, ".afs")) ngb_texture_read(name,offset,buffer,length);
+#else
+    (void)name; (void)offset; (void)buffer; (void)length;
+#endif
+}
+uint32_t ngb_disc_stream_read(FILE *file, void *buffer, uint32_t length,
+                              int64_t offset, uint32_t *received)
+{
+    *received = 0;
+    if (!file || fseeko(file, offset, SEEK_SET)) return error_status();
+    clearerr(file);
+    *received = (uint32_t)fread(buffer, 1, length, file);
+    if (ferror(file)) return error_status();
+    return length && !*received ? 0xc0000011u : 0;
+}
 uint32_t ngb_file_read(uint32_t handle, void *buffer, uint32_t length,
                        int64_t offset, uint32_t *received)
 {
@@ -635,6 +749,13 @@ uint32_t ngb_file_read(uint32_t handle, void *buffer, uint32_t length,
     if (!handles[i].packed && !handles[i].file) return 0xc00000bau;
     if (!(handles[i].access & 0x90000001u)) return DENIED;
     if (offset < -2 || offset == -1) return INVALID;
+    if (handles[i].disc_async) {
+        if (offset == -2) offset = handles[i].logical_position;
+        uint32_t status = ngb_disc_stream_read(handles[i].file,buffer,length,offset,received);
+        ngb_file_disc_completed(handle,offset,*received,status);
+        if (!status) ngb_file_disc_textures(ngb_file_basename(handle),offset,buffer,*received);
+        return status;
+    }
     if (handles[i].raw_disk) {
         int64_t start = offset == -2 ? ftello(handles[i].file) : offset;
         if (start < 0) return error_status();
@@ -686,6 +807,13 @@ uint32_t ngb_file_read(uint32_t handle, void *buffer, uint32_t length,
     }
     return length && !*received ? 0xc0000011u : 0;
 }
+#ifdef NGB_NATIVE_DIAG
+int ngb_file_is_cache_archive(uint32_t handle)
+{
+    int i = index_for(handle);
+    return i >= 0 && !handles[i].raw_disk && handles[i].file_limit == CACHE_BYTES;
+}
+#endif
 uint32_t ngb_file_write(uint32_t handle, const void *buffer, uint32_t length,
                         int64_t offset, uint32_t *written)
 {
@@ -715,7 +843,12 @@ uint32_t ngb_file_write(uint32_t handle, const void *buffer, uint32_t length,
     clearerr(f);
     *written = (uint32_t)fwrite(buffer, 1, length, f);
     int failed = *written != length || ferror(f);
-    if (fflush(f) || fsync(fileno(f))) failed = 1;
+    /* A synchronous Xbox handle waits for the write to complete. Only a
+     * write-through handle or an explicit flush requests a media barrier.
+     * Drain stdio on every write so other handles see the data immediately. */
+    if (fflush(f)) failed = 1;
+    else if ((handles[i].raw_disk || (handles[i].options & FILE_WRITE_THROUGH)) &&
+             fsync(fileno(f))) failed = 1;
     if (!fstat(fileno(f), &after) && after.st_size > before.st_size)
         USED(handles[i].path) += (uint64_t)(after.st_size - before.st_size);
     return failed ? 0xc0000001u : 0;
@@ -750,7 +883,7 @@ uint32_t ngb_file_position(uint32_t handle, int64_t position)
     int i = index_for(handle);
     if (i < 0) return NGB_FS_INVALID_HANDLE;
     if (position < 0 || (!handles[i].packed && !handles[i].file)) return INVALID;
-    if (handles[i].readonly && disc_entry_for(handles[i].path)) {
+    if (handles[i].packed || handles[i].disc_async) {
         handles[i].logical_position=position;
         return 0;
     }
@@ -780,7 +913,7 @@ uint32_t ngb_file_query(uint32_t handle, uint32_t kind, void *buffer,
         put32(info + 16, 1); info[20] = handles[i].delete_mark || handles[i].delete_committed; info[21] = handles[i].directory != NULL;
     } else if (kind == 14) {
         if (!entry && !handles[i].file) return INVALID;
-        size = 8; off_t offset = entry ? handles[i].logical_position : ftello(handles[i].file);
+        size = 8; off_t offset = entry || handles[i].disc_async ? handles[i].logical_position : ftello(handles[i].file);
         if (offset < 0) return error_status();
         put64(info, (uint64_t)offset);
     } else if (kind == 4 || kind == 34) {

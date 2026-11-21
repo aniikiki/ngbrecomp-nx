@@ -1,6 +1,9 @@
 /* Included by runtime.c: a single host CPU runs the guest threads in turn.
  * Each suspended call chain has its own host stack and emulated registers. */
 #include "../../../src/host_context.h"
+#ifdef NGB_NATIVE_DIAG
+#include "combat_perf.h"
+#endif
 
 #define WORKER_LIMIT 16
 #define WORKER_HOST_STACK (1024u * 1024u)
@@ -57,6 +60,8 @@ static int event_wait_pending(const struct worker *w, uint64_t now)
     if (atomic_load_explicit(&cancel, memory_order_relaxed) ||
         (startup_deadline && now >= startup_deadline / 100)) return 0;
     if (w->wait_named) {
+        if ((w->wait_key >> 28) == 6)
+            return ngb_file_wait_status(w->wait_key) == NGB_FS_TIMEOUT;
         const struct named_event *event = &events[w->wait_key & 127];
         return event->token == w->wait_key && !event->signalled;
     }
@@ -87,6 +92,7 @@ static unsigned next_worker(uint64_t now)
 
 static void yield_worker(void)
 {
+    if (ngb_pending_disc_reads) ngb_disc_reads_poll();
     if (!interrupt_enabled || delivering_callback || thread_count <= 1 || MEM8(g_fs_base + 0x24) >= 2)
         return;
     uint64_t switch_time = now_ns();
@@ -98,7 +104,7 @@ static void yield_worker(void)
     old->va = current_va;
 #ifdef NGB_NATIVE_DIAG
     extern void ngb_native_diag_switch(unsigned, uint64_t);
-    ngb_native_diag_switch(next, switch_time - start_ns);
+    if (ngb_combat_enabled) ngb_native_diag_switch(next, switch_time - start_ns);
 #endif
     running_worker = next;
     g_regs = dest->regs;
@@ -122,6 +128,13 @@ static void idle_if_all_waiting(void)
     uint64_t start = ngb_scene_active ? ngb_elapsed_ns() : 0;
     nanosleep(&nap, NULL);
     if (start) ngb_scene_idle_time(ngb_elapsed_ns() - start);
+}
+
+void ngb_io_yield(void)
+{
+    yield_worker();
+    poll_runtime(true);
+    idle_if_all_waiting();
 }
 
 static void worker_entry(void)
@@ -263,7 +276,13 @@ static int other_handle_wait(uint32_t ordinal)
         }
         --worker_object(object)->references;
     }else if((handle>>28)==6){
-        status=ngb_file_wait_status(handle);
+        uint64_t end=nt_wait_deadline(arg(argc-1));
+        while ((status=ngb_file_wait_status(handle))==NGB_FS_TIMEOUT && now_ns()/100<end) {
+            struct worker *self=&workers[running_worker];
+            self->wait_key=handle; self->wait_until=end; self->wait_named=1; self->waiting=1;
+            ngb_io_yield();
+            self->waiting=0;
+        }
     }
     g_eax=status;g_esp+=4*(argc+1);return 1;
 }

@@ -3,6 +3,7 @@
 #include "audio_output.h"
 #include "frontend_input.h"
 #include "scanout.h"
+#include "direct/display.h"
 #include "files.h"
 #include "ohci_boot.h"
 #include <string.h>
@@ -441,6 +442,15 @@ static void guest_worker(void *arg)
 }
 
 /* Retained build version: 0.51.0-rc1 */
+static Result open_framebuffer(Framebuffer *surface){
+    Result rc=framebufferCreate(surface,nwindowGetDefault(),NGB_SCREEN_W,NGB_SCREEN_H,PIXEL_FORMAT_RGBA_8888,2);
+    if(R_SUCCEEDED(rc)){
+        rc=framebufferMakeLinear(surface);
+        if(R_FAILED(rc))framebufferClose(surface);
+    }
+    return rc;
+}
+
 int main(int argc,char **argv)
 {
 #ifdef NGB_PLAYER_BUILD
@@ -465,7 +475,7 @@ int main(int argc,char **argv)
     struct stat flag;
 #if defined(NGB_PLAYER_BUILD) && defined(NGB_DIRECT3D)
 #ifdef NGB_COMBAT_PERF
-    if(stat("sdmc:/switch/ngb-runtime/alma-perf.flag",&flag)==0 && S_ISREG(flag.st_mode)){
+    if(combat_requested("sdmc:/switch/ngb-runtime/alma-perf.flag")){
         mkdir("sdmc:/switch/ngb-runtime/logs",0777);
         ngb_combat_enabled=combat_open("sdmc:/switch/ngb-runtime/logs/alma-perf.csv") && combat_start_writer();
     }
@@ -487,6 +497,14 @@ int main(int argc,char **argv)
         boot_log = fopen(current_log, "w");
         if (!boot_log) ngb_diagnostics_enabled=0;
     }
+#ifdef NGB_GPU_PRESENT
+    bool log_display=ngb_diagnostics_enabled;
+#ifdef NGB_COMBAT_PERF
+    log_display|=ngb_combat_enabled;
+#endif
+    /* The driver records whether VI accepted its native GPU buffers. */
+    if(log_display)setenv("MESA_LOG_FILE","sdmc:/switch/ngb-runtime/logs/nxvk-display.log",0);
+#endif
 #ifdef NGB_DIRECT3D
     if (boot_log) { fprintf(boot_log, "[CONFIG] kickoff_kib=%u\n", NGB_DIRECT_KICKOFF_KIB); fflush(boot_log); }
 #endif
@@ -496,12 +514,8 @@ int main(int argc,char **argv)
     if (R_SUCCEEDED(rc)) {
         if (!load_splash()) { startup_error="Loading artwork missing. Replace the game application."; rc=1; }
         else {
-            rc=framebufferCreate(&surface,nwindowGetDefault(),1280,720,PIXEL_FORMAT_RGBA_8888,2);
-            if (R_SUCCEEDED(rc)) {
-                rc=framebufferMakeLinear(&surface);
-                if (R_FAILED(rc)) framebufferClose(&surface);
-                else { surface_open=true; show_loading(&surface,0); }
-            }
+            rc=open_framebuffer(&surface);
+            if (R_SUCCEEDED(rc)) { surface_open=true; show_loading(&surface,0); }
         }
     }
     Thread worker, input;
@@ -535,10 +549,33 @@ int main(int argc,char **argv)
     unsigned displayed = 0, pulse = 0;
     u64 next_pulse = armGetSystemTick();
     bool viewing = false, exiting = false, reported = false;
+#ifdef NGB_PLAYER_BUILD
+    unsigned previous_panel=0,previous_revision=0;
+#endif
+#ifdef NGB_GPU_PRESENT
+    bool gpu_window=false,display_failed=false;
+#endif
     while (appletMainLoop()) {
         if (!input_started) poll_input(&pad);
         bool done=atomic_load(&finished);
         bool failed=!started || (done && (boot_status==NGB_BOOT_ERROR || boot_status==NGB_BOOT_UNSUPPORTED));
+#ifdef NGB_GPU_PRESENT
+        if(!failed && !done && !exiting && !gpu_window && surface_open &&
+           ngb_scanout_visible() && ngb_display_pending()){
+            framebufferClose(&surface);
+            surface_open=false;
+            gpu_window=ngb_display_open(nwindowGetDefault());
+            previous_panel=0;displayed=~0u;
+        }
+        if(!failed && !gpu_window && !surface_open && !display_failed){
+            rc=open_framebuffer(&surface);
+            surface_open=R_SUCCEEDED(rc);
+            if(!surface_open){
+                startup_error="Unable to open the display";display_failed=true;ngb_request_stop();
+            }
+        }
+        failed|=display_failed;
+#endif
         if (failed && !reported) {
             reported=true;
             atomic_store(&game_view,false);
@@ -546,6 +583,9 @@ int main(int argc,char **argv)
             mkdir("sdmc:/switch/ngb-runtime/logs",0777);
             FILE *err=fopen("sdmc:/switch/ngb-runtime/logs/error.log","a");
             if (err) { fprintf(err,"[ERROR] %s (rc=%08x)\n",why,rc); fclose(err); }
+#ifdef NGB_GPU_PRESENT
+            if (gpu_window) {ngb_display_close();gpu_window=false;}
+#endif
             if (surface_open) { framebufferClose(&surface); surface_open=false; }
             consoleInit(NULL); console_open=true;
             printf("Ninja Gaiden Black\n\n%s\n\nPress + to return.\n",why);
@@ -562,11 +602,17 @@ int main(int argc,char **argv)
         if (exiting && (!started || done)) break;
         if (done && !failed) break;
 #ifdef NGB_PLAYER_BUILD
-        static unsigned previous_panel,previous_revision;
         unsigned view=atomic_load(&panel);
         if (view && !failed && !exiting) {
             unsigned changes=atomic_load(&revision);
             if (previous_panel!=view || previous_revision!=changes) {
+#ifdef NGB_GPU_PRESENT
+                if(gpu_window){
+                    int shown=present_screen(view,NULL);
+                    if(shown<0){ngb_display_close();gpu_window=false;previous_panel=0;displayed=~0u;}
+                    if(shown<=0){svcSleepThread(1000000);continue;}
+                }else
+#endif
                 if(view&EXIT_PANEL) draw_exit_panel(&surface,view); else draw_settings(&surface,view);
             }
             previous_panel=view;previous_revision=changes;
@@ -587,18 +633,35 @@ int main(int argc,char **argv)
 #endif
                 uint64_t ma=measure_display?ngb_elapsed_ns():0;
 #endif
-                u32 stride; u32 *dst=framebufferBegin(&surface,&stride);
 #if defined(NGB_PLAYER_BUILD) && defined(NGB_DIRECT3D)
-                uint64_t mb=measure_display?ngb_elapsed_ns():0;
+                uint64_t mb=ma,mc=ma;
 #endif
-                ngb_scanout_blit(dst,stride/4,1280,720);
+#ifdef NGB_GPU_PRESENT
+                if(gpu_window){
+                    uint64_t times[3];
+                    int shown=present_screen(0,measure_display?times:NULL);
+                    if(shown<0){ngb_display_close();gpu_window=false;displayed=~0u;}
+                    if(shown<=0){svcSleepThread(1000000);continue;}
+                    if(measure_display){
+                        mc=ngb_elapsed_ns()-times[2]*1000;
+                        mb=ma+times[0]*1000;
+                    }
+                }else
+#endif
+                {
+                    u32 stride; u32 *dst=framebufferBegin(&surface,&stride);
+#if defined(NGB_PLAYER_BUILD) && defined(NGB_DIRECT3D)
+                    mb=measure_display?ngb_elapsed_ns():0;
+#endif
+                    ngb_scanout_blit(dst,stride/4,1280,720);
 #ifdef NGB_PLAYER_BUILD
-                game_overlay(dst,stride/4);
+                    game_overlay(dst,stride/4,NULL);
 #endif
 #if defined(NGB_PLAYER_BUILD) && defined(NGB_DIRECT3D)
-                uint64_t mc=measure_display?ngb_elapsed_ns():0;
+                    mc=measure_display?ngb_elapsed_ns():0;
 #endif
-                framebufferEnd(&surface);
+                    framebufferEnd(&surface);
+                }
 #if defined(NGB_PLAYER_BUILD) && defined(NGB_DIRECT3D)
 #ifdef NGB_COMBAT_PERF
                 if(combat_display){uint64_t end=ngb_elapsed_ns();uint64_t v[]={next,end/1000,(mb-ma)/1000,(mc-mb)/1000,(end-mc)/1000};ngb_combat_row('D',v,5);}
@@ -618,12 +681,15 @@ int main(int argc,char **argv)
                 }
             }
 #endif
-        } else if (!failed && !viewing && armGetSystemTick()>=next_pulse) {
+        } else if (!failed && !viewing && surface_open && armGetSystemTick()>=next_pulse) {
             show_loading(&surface,++pulse);
             next_pulse=armGetSystemTick()+armGetSystemTickFreq()/4;
         }
         svcSleepThread(4000000);
     }
+#ifdef NGB_GPU_PRESENT
+    if (gpu_window) ngb_display_close();
+#endif
     atomic_store(&input_stop, true);
     if (input_started) { threadWaitForExit(&input); threadClose(&input); }
     ngb_request_stop();

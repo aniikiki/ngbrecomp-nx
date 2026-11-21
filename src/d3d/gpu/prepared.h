@@ -2,6 +2,7 @@
 #include <cstdint>
 
 namespace gpu {
+enum class CombatEffect : uint8_t { None, HistoryCapture, HistoryComposite, Transparent };
 // Indices match the recorder's fixed StateRanges; assertions at that boundary
 // protect this contract. A missing revision always requires a full comparison.
 struct PreparedState {

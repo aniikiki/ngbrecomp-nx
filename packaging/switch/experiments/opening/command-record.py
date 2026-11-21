@@ -18,6 +18,7 @@ def transform(t):
     once('c.quick = int32_t(cur_->quick.size());','c.b = uint32_t(cur_->quick.size());')
     once('b.quick[size_t(c.quick)]','b.quick[c.b]')
     once('Present(c.s1)','Present(b.surfaces[c.d])')
+    once('Present(c.s1,','Present(b.surfaces[c.d],')
     once('Copy(c.s1, c.s2,','Copy(b.surfaces[c.d], b.surfaces[c.d+1],')
     once('        b->cmds.clear();','        b->surfaces.clear();\n        b->cmds.clear();')
     for arg,shader in [('a','vs'),('b','ps')]:

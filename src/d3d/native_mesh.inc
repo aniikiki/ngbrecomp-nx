@@ -111,12 +111,18 @@ extern "C" void ngb_d3d_mesh_draw(uint32_t address) {
     }
     ++native_mesh_draws;
     uint32_t kind = R32(address + 0x10), data = R32(address + 0x14);
-    if (!kind) RunPushBuffer(data, true);
+    // The game's screen-history controller owns bit 2 while the trail is active.
+    // Its additive mesh layers come through this material boundary before Vulkan.
+    gpu::CombatEffect effect = gpu::CombatEffect::None;
+    if (g_state.simple[gpu::kMBlendEnable / 4] && g_state.simple[gpu::kMSrcBlend / 4] == 0x302 &&
+        g_state.simple[gpu::kMDestBlend / 4] == 1 && CombatEffectsEnabled() && (R32(0xc0611c) & 4))
+        effect = gpu::CombatEffect::Transparent;
+    if (!kind) RunPushBuffer(data, true, effect);
     else {
         uint32_t count = R32(address + 0x18) / 2;
         uint32_t indices = kind == 1 ? R32(data + 4) + 12 :
             R32(R32(R32(address + 4) + 0x18) + 4) + data;
-        if (indices) Draw(6, 0, count, static_cast<const uint8_t*>(HostPtr(indices, size_t(count) * 2)), true);
+        if (indices) Draw(6, 0, count, static_cast<const uint8_t*>(HostPtr(indices, size_t(count) * 2)), true, effect);
     }
 }
 extern "C" void ngb_d3d_mesh_stats(uint64_t out[8]) {

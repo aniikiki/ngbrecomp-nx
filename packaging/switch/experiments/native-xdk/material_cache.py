@@ -9,14 +9,22 @@ import struct
 MAGIC = b'NGBD3DC1'
 ROOT = Path(__file__).resolve().parents[4]
 GENERATOR_INPUTS = ['src/d3d/vk/backend.cpp', 'src/d3d/vk/spirv.cpp', 'src/d3d/vk/spirv.h',
+                    'src/d3d/vk/combat_effects.h', 'src/d3d/vk/glow_filter.h', 'src/d3d/vk/glow_options.h',
                     'src/d3d/gpu/shaders.cpp', 'src/d3d/gpu/shaders.h', 'src/d3d/gpu/state.h',
                     'src/d3d/gpu/vertex.cpp', 'src/d3d/gpu/vertex.h']
 
 
 def compatibility():
     sources = {n: hashlib.sha256((ROOT / n).read_bytes()).hexdigest() for n in GENERATOR_INPUTS}
+    # 0.57.18 changed cache file I/O only. Keep the installed 0.57.17 seed
+    # and SD directory for this exact renderer revision. Any other renderer
+    # change still gets its own epoch; the manifest retains the actual hashes.
+    epoch_sources = sources.copy()
+    backend = 'src/d3d/vk/backend.cpp'
+    if sources[backend] == 'd125a6cd45cfc84f64b900bc0c7a8258922722e9c2812e912efac780085772c2':
+        epoch_sources[backend] = 'd6d10274541fe37750d0610f9c0fe6dff39b4a32ffcf2ae34af64afedf3280db'
     # The version also covers the compiler options in spirv.cpp and raw PipeKey ABI.
-    digest = hashlib.sha256(json.dumps(sources, sort_keys=True).encode()).hexdigest()[:20]
+    digest = hashlib.sha256(json.dumps(epoch_sources, sort_keys=True).encode()).hexdigest()[:20]
     return {'epoch': 'materials-v1-' + digest, 'generator_sources': sources}
 
 
