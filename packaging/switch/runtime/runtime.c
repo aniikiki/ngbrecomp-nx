@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <time.h>
+#include <errno.h>
 #ifdef __SWITCH__
 #include <switch/arm/counter.h>
 #endif
@@ -1194,32 +1195,62 @@ static uint32_t le32(const unsigned char *p)
     return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
 }
 
+static int image_error(const char *format, ...)
+{
+    va_list ap;
+    va_start(ap, format);
+    vsnprintf(stopped_reason, sizeof(stopped_reason), format, ap);
+    va_end(ap);
+    note("[ERROR] %s", stopped_reason);
+    return 0;
+}
+
 static int load_image(const char *path)
 {
     FILE *f = fopen(path, "rb");
-    if (!f) { note("[ERROR] cannot open %s", path); return 0; }
-    unsigned char *xbe = malloc(NGB_IMAGE_BYTES);
-    size_t got = xbe ? fread(xbe, 1, NGB_IMAGE_BYTES, f) : 0;
-    int extra = fgetc(f);
+    if (!f) return image_error("Cannot open default.xbe: %s", strerror(errno));
+    long length;
+    if (fseek(f, 0, SEEK_END) || (length = ftell(f)) < 0 || fseek(f, 0, SEEK_SET)) {
+        fclose(f);
+        return image_error("Cannot read the size of default.xbe.");
+    }
+    /* Disc tools can change the certificate, signature, padding or file
+     * offsets. Read the actual file; no whole-file fingerprint is required.
+     * Bounds and the entry address still have to fit the recompiled game. */
+    if (length < 0x178 || (uint64_t)length > RAM_BYTES) {
+        fclose(f);
+        return image_error("Invalid or truncated default.xbe (%ld bytes).", length);
+    }
+    unsigned char *xbe = malloc((size_t)length);
+    if (!xbe) {
+        fclose(f);
+        return image_error("Not enough memory to read default.xbe.");
+    }
+    size_t got = fread(xbe, 1, (size_t)length, f);
+    int failed = ferror(f);
     fclose(f);
-    uint64_t hash = 0xcbf29ce484222325ull;
-    for (size_t i = 0; i < got; ++i) hash = (hash ^ xbe[i]) * 0x100000001b3ull;
-    if (got != NGB_IMAGE_BYTES || extra != EOF || hash != NGB_IMAGE_FNV) {
-        note("[ERROR] image mismatch: bytes=%zu FNV=%016llx", got, (unsigned long long)hash);
-        free(xbe); return 0;
+    if (got != (size_t)length || failed) {
+        free(xbe);
+        return image_error("Incomplete read of default.xbe (%zu of %ld bytes).", got, length);
     }
     uint32_t base = le32(xbe + 0x104), headers = le32(xbe + 0x108);
     uint32_t count = le32(xbe + 0x11c), table = le32(xbe + 0x120) - base;
     uint32_t entry = le32(xbe + 0x128) ^ 0xa8fc57abu;
-    if (memcmp(xbe, "XBEH", 4) || base != 0x10000 || headers > got ||
-        (uint64_t)table + (uint64_t)count * 56 > got || entry != 0x0032b385) {
-        free(xbe); return 0;
+    if (memcmp(xbe, "XBEH", 4) || headers < 0x178 || headers > got ||
+        (uint64_t)base + headers > RAM_BYTES || !count ||
+        (uint64_t)table + (uint64_t)count * 56 > headers) {
+        free(xbe);
+        return image_error("Invalid default.xbe header or section table.");
+    }
+    if (base != 0x10000 || entry != 0x0032b385) {
+        free(xbe);
+        return image_error("Unsupported XBE address layout. Use Ninja Gaiden Black NTSC-U game data.");
     }
     /* The desktop lift leaves the low guest page backed by zeroed RAM unless
      * RECOMP_TRAP_NULL is selected. The guest D3D resource lookup reads it. */
     trap_null = getenv("RECOMP_TRAP_NULL") != NULL;
     ram = calloc(1, 2u * RAM_BYTES);
-    if (!ram) { free(xbe); return 0; }
+    if (!ram) { free(xbe); return image_error("Not enough memory to load default.xbe."); }
     ngb_contiguous_set_ram(ram);
     ngb_scene_memory(ram, 2u * RAM_BYTES);
     g_xbox_mem_offset = (ptrdiff_t)(uintptr_t)ram;
@@ -1230,7 +1261,8 @@ static int load_image(const char *path)
         const unsigned char *s = xbe + table + i * 56;
         uint32_t va = le32(s+4), vs = le32(s+8), raw = le32(s+12), rs = le32(s+16);
         if ((uint64_t)va + vs > RAM_BYTES || rs > vs || (uint64_t)raw + rs > got) {
-            note("[ERROR] invalid section %u", i); free(xbe); return 0;
+            free(xbe);
+            return image_error("Invalid or truncated default.xbe section %u.", i);
         }
         if (vs) memset(image_resident+va/4096,1,(va+vs-1)/4096-va/4096+1);
         memcpy(ram + va, xbe + raw, rs);
@@ -1243,9 +1275,11 @@ static int load_image(const char *path)
     uint32_t thunks = le32(xbe + 0x158) ^ 0x5b6d40b6u;
     free(xbe);
     for (thunk_count = 0; thunk_count < 512; ++thunk_count) {
+        if ((uint64_t)thunks + thunk_count * 4 + 4 > RAM_BYTES)
+            return image_error("Invalid default.xbe kernel import address.");
         uint32_t ordinal = read32(thunks + thunk_count * 4);
         if (!ordinal) break;
-        if (!(ordinal & 0x80000000u)) return 0;
+        if (!(ordinal & 0x80000000u)) return image_error("Invalid default.xbe kernel import.");
         thunk_ordinals[thunk_count] = ordinal & 0x7fffffffu;
         uint32_t target = THUNK_BASE + thunk_count * 4;
         /* Same retail hardware/version model as upstream kernel_bridge.c.
@@ -1261,7 +1295,7 @@ static int load_image(const char *path)
         if ((ordinal & 0x7fffffff) == 40) target = 0x7050;
         write32(thunks + thunk_count * 4, target);
     }
-    if (thunk_count == 512) return 0;
+    if (thunk_count == 512) return image_error("Unterminated default.xbe kernel import table.");
     note("[LOADER] %u sections, %u kernel imports; code=%08x..%08x", count, thunk_count, g_xbox_code_lo, g_xbox_code_hi);
     return 1;
 }
@@ -1345,11 +1379,9 @@ int ngb_boot(const char *path, FILE *log)
 #else
     note("[BOOT] NGB Switch startup adapter 0.49.0; sampled render timing");
 #endif
-    note("[IMAGE] expected SHA256=%s", NGB_IMAGE_SHA256);
     if (!setjmp(stop_context)) {
         if (!load_image(path)) {
             stopped_status = NGB_BOOT_ERROR;
-            snprintf(stopped_reason, sizeof(stopped_reason), "Unable to load default.xbe. Check that the disc matches Ninja Gaiden Black.");
         } else {
             ngb_vm_init(ram);
             initialize_thread();

@@ -256,12 +256,12 @@ with tempfile.TemporaryDirectory(prefix='ngb-startup-data-') as data:
 with tempfile.TemporaryDirectory(prefix='ngb-startup-') as tmp:
     wrong = Path(tmp) / 'wrong.xbe'
     data = bytearray(xbe.read_bytes())
-    data[0x1000] ^= 1
+    data[0] ^= 1
     wrong.write_bytes(data)
-    run('modified-image', wrong, 2, ['image mismatch', '[RESULT] status=2'], ['[ENTER]'])
+    run('invalid-image-header', wrong, 2, ['Invalid default.xbe header', '[RESULT] status=2'], ['[ENTER]'])
     wrong.write_bytes(b'XBEH')
-    run('truncated-image', wrong, 2, ['image mismatch', '[RESULT] status=2'], ['[ENTER]'])
-    run('missing-image', Path(tmp) / 'absent.xbe', 2, ['cannot open', '[RESULT] status=2'], ['[ENTER]'])
+    run('truncated-image', wrong, 2, ['Invalid or truncated default.xbe', '[RESULT] status=2'], ['[ENTER]'])
+    run('missing-image', Path(tmp) / 'absent.xbe', 2, ['Cannot open default.xbe', '[RESULT] status=2'], ['[ENTER]'])
 # Exercise a Start press on Warnings and let the original Sofdec decoder
 # submit a frame. Use the Switch RomFS for both a fresh and a warm cache.
 with tempfile.TemporaryDirectory(prefix='ngb-movie-') as tmp:

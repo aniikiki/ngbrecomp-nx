@@ -140,7 +140,7 @@ elif sys.argv[1] == 'host':
         return str(obj)
     driver = (experiment / 'replay.c').read_text()
     if diagnostics:
-        (sources / 'native_combat_perf.inc').write_text((runtime / 'combat_perf.inc').read_text().replace('#SESSION,0.56.25,','#SESSION,0.57.24,'))
+        (sources / 'native_combat_perf.inc').write_text((runtime / 'combat_perf.inc').read_text().replace('#SESSION,0.56.25,','#SESSION,0.57.26,'))
     runtime_source = (runtime / 'runtime.c').read_text().replace('RECOMP_TLS RecompRegs g_regs;', 'RecompRegs g_regs;')
     runtime_source = runtime_source.replace('        ngb_menu_draw(cursor);', '        extern void replay_unlock(uint32_t); replay_unlock(g_ebx);\n        ngb_menu_draw(cursor);')
     (sources / 'native-runtime.inc').write_text(runtime_source)
