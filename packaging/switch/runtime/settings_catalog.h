@@ -40,7 +40,7 @@ static const Preference settings[]={
  TOGGLE(CONTROLS,50,"third_x","Invert third-person X",0,0),
  TOGGLE(CONTROLS,51,"third_y","Invert third-person Y",0,0),
  TOGGLE(CONTROLS,52,"soft_reset","Start + Back resets game",1,0),
- {CONTROLS,53,0,FIXED,"prompts","In-game button prompts","Original Xbox"},
+ {CONTROLS,53,0,FIXED,"prompts","In-game button prompts","Xbox icons (Switch X/Y)"},
  BIND(76,16,"ninpo_button","Cast Ninpo (shortcut)"), BIND(77,16,"wind_button","Wind Run (shortcut)"),
  BIND(78,0,"quick_up","Quick: previous category"), BIND(79,1,"quick_down","Quick: next category"),
  BIND(80,2,"quick_left","Quick: previous item"), BIND(81,3,"quick_right","Quick: next item"),

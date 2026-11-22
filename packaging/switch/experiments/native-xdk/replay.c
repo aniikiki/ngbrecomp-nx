@@ -28,6 +28,45 @@ static unsigned replay_game_frames;
 static unsigned replay_frame_limit, replay_trace_start;
 static unsigned replay_mission_rows = 5, replay_mission_column;
 static int replay_specific_mission, replay_trace_battle;
+static int verify_prologue;
+static unsigned opening_captions, previous_caption_age, previous_caption_id = UINT32_MAX;
+static bool caption_order_error;
+static uint64_t prologue_start;
+static atomic_bool prologue_window;
+static atomic_uint prologue_changes;
+
+static void check_prologue(void)
+{
+    if (!ngb_prologue_pixels()) return;
+    uint64_t now = ngb_elapsed_ns();
+    if (!prologue_start) {
+        prologue_start = now;
+        ngb_ohci_pad_sample(0,0,0,0,0);
+    }
+    /* Observe the displayed slot, including restarts between adjacent
+     * frames. A command in the decoder's mailbox may never reach the screen. */
+    if (MEM16(0x8fa9bc) && MEM16(0x8fa9c2) == 6) {
+        unsigned id = MEM16(0x8fa9c4);
+        unsigned age = MEM32(0x8fa9b8);
+        unsigned first = MEM32(0xdb9890) == 0 ? 100 : 0;
+        if (id - first < 3 && (id != previous_caption_id || age < previous_caption_age)) {
+            if (id - first != opening_captions) caption_order_error = true;
+            ++opening_captions;
+        }
+        previous_caption_id = id;
+        previous_caption_age = age;
+    } else previous_caption_id = UINT32_MAX;
+    uint64_t elapsed = now - prologue_start;
+    /* Exclude work queued before the first pictures fade in from black. */
+    if (elapsed > 3000000000ull) atomic_store(&prologue_window, true);
+    if (elapsed < 12000000000ull) return;
+    unsigned changes = atomic_load(&prologue_changes);
+    replay_finished = changes >= 12 && opening_captions == 3 && !caption_order_error;
+    fprintf(stderr,"[PROLOGUE-%s] moving_scanouts=%u opening_captions=%u order_error=%u\n",
+            replay_finished ? "PASS" : "FAIL", changes, opening_captions, caption_order_error);
+    ngb_stop("checked New Game video on the presented surface",changes);
+}
+
 #ifdef NGB_NATIVE_CONTRACT_TEST
 unsigned ngb_native_test_callback_hits;
 void __real_ngb_graphics_callback(uint32_t, uint32_t);
@@ -71,6 +110,7 @@ int __wrap_d3d_hook(int fn)
             (unsigned long long)material[0],(unsigned long long)material[1],
             (unsigned long long)material[2],(unsigned long long)material[3]);
         ++replay_game_frames;
+        if (verify_prologue) check_prologue();
         if (replay_trace_battle && ram[0x58975a] == 3 && MEM16(0x58a564) && replay_draws >= 250) {
             extern volatile int ngb_trace_request;
             ngb_trace_request = 1;
@@ -178,7 +218,7 @@ void __wrap_ngb_poll_due(uint64_t ticket)
         unsigned buttons = ms % 1500 < 180 ? 16 : 0;
         if (buttons != replay_buttons) { ngb_ohci_pad_sample(buttons,0,0,0,0); replay_buttons=buttons; }
     }
-    if (!replay_input_path && menu_cursor != UINT32_MAX && (getenv("NGB_REPLAY_ALMA") || getenv("NGB_REPLAY_NEWGAME"))) {
+    if (!replay_input_path && !prologue_start && menu_cursor != UINT32_MAX && (getenv("NGB_REPLAY_ALMA") || getenv("NGB_REPLAY_NEWGAME"))) {
         if (!replay_menu_ms) {
             replay_menu_ms=ms;
             replay_menu_frame=replay_game_frames;
@@ -229,6 +269,7 @@ void __wrap_ngb_poll_due(uint64_t ticket)
         ngb_d3d_native_report();
         replay_finished = !getenv("NGB_REPLAY_ALMA") || (replay_battle_frames >= 120 && replay_damaged);
         if (getenv("NGB_REPLAY_NEWGAME")) replay_finished = replay_story_frames >= 120;
+        if (verify_prologue) replay_finished = 0; /* Timed out before the movie check. */
         if (replay_frame_limit && replay_game_frames < replay_frame_limit) replay_finished = 0;
         fprintf(stderr, "[REPLAY-%s] battle_frames=%u story_frames=%u damage_seen=%u captures=%u\n",
                 replay_finished ? "PASS" : "FAIL", replay_battle_frames, replay_story_frames, replay_damaged, replay_shots);
@@ -239,6 +280,19 @@ void __real_ngb_scanout_direct(const void *);
 void __wrap_ngb_scanout_direct(const void *pixels)
 {
     __real_ngb_scanout_direct(pixels);
+    if (atomic_load(&prologue_window)) {
+        /* Only sample the movie itself. Changing subtitles on black must fail. */
+        const uint32_t *image = pixels;
+        static uint32_t previous;
+        uint32_t hash = 2166136261u, color = 0;
+        for (unsigned y=96;y<340;y+=13) for (unsigned x=64;x<656;x+=13) {
+            uint32_t rgb = image[y*720+x] & 0xffffffu;
+            hash = (hash ^ rgb) * 16777619u;
+            color |= rgb;
+        }
+        if (color && previous != hash) atomic_fetch_add(&prologue_changes,1);
+        previous = hash;
+    }
     unsigned frame = ++replay_shots;
     unsigned every=getenv("NGB_REPLAY_EFFECTS")?30:120;
     if (frame > 30 && frame != 60 && frame % every) return;
@@ -264,6 +318,7 @@ int main(int argc, char **argv)
     const char *frames = getenv("NGB_REPLAY_FRAMES"); if (frames) replay_frame_limit = strtoul(frames,NULL,10);
     const char *trace = getenv("NGB_REPLAY_TRACE_START"); if (trace) replay_trace_start = strtoul(trace,NULL,10);
     replay_input_path = getenv("NGB_REPLAY_INPUT");
+    verify_prologue = getenv("NGB_REPLAY_PROLOGUE") != NULL;
     const char *row = getenv("NGB_REPLAY_MISSION_ROW"), *column = getenv("NGB_REPLAY_MISSION_COLUMN");
     replay_specific_mission = row || column;
     if (row) replay_mission_rows = strtoul(row, NULL, 10);

@@ -28,9 +28,6 @@ static const char *startup_error;
 static atomic_bool input_stop, game_view, gameplay_controls;
 void ngb_frontend_menu_controls(void) {
     atomic_store(&gameplay_controls,true);
-#ifdef NGB_PLAYER_BUILD
-    atomic_store(&exit_return_boot,false);
-#endif
 }
 #ifndef NGB_PLAYER_BUILD
 static atomic_uint commands;
@@ -380,10 +377,6 @@ static void sample_pad(PadState *pad, bool game_input)
     else if ((held & (HidNpadButton_Minus|HidNpadButton_B))==(HidNpadButton_Minus|HidNpadButton_B))
         held &= ~(HidNpadButton_Minus|HidNpadButton_B);
     if (!game_input && !ngb_movie_owns_input()) held &= ~HidNpadButton_Plus;
-#ifdef NGB_PLAYER_BUILD
-    if(atomic_load(&exit_return_boot) && game_input && !atomic_load(&gameplay_controls))
-        held|=((armGetSystemTick()/(armGetSystemTickFreq()/4))&3)==1?HidNpadButton_Plus:0;
-#endif
     uint16_t buttons=0;
     for (unsigned i=0;i<16;i++) if (held&mapped[i]) buttons|=1u<<i;
 #ifdef NGB_PLAYER_BUILD
@@ -453,12 +446,7 @@ static Result open_framebuffer(Framebuffer *surface){
 
 int main(int argc,char **argv)
 {
-#ifdef NGB_PLAYER_BUILD
-    exit_program_path=(argc && argv[0] && *argv[0])?argv[0]:"sdmc:/switch/ngb-runtime/ngb-startup.nro";
-    atomic_store(&exit_return_boot,argc>1 && !strcmp(argv[1],"--return-to-title"));
-#else
     (void)argc;(void)argv;
-#endif
     launch_tick=armGetSystemTick();
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
     PadState pad;

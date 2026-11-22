@@ -74,10 +74,8 @@ void sub_0030E060(void)
         elif name=='talisman':s=(ROOT.parent/'settings/talisman.c').read_text()
         else:s=(SRC/(name+'.c')).read_text()
         if name=='costume_menu':
-            # The three unused costumes have no retail portraits; reuse the
-            # default Ryu portrait instead of allocating desktop font textures.
             s=s.replace('#include "xbox_memory_layout.h"','extern uint32_t xbox_HeapAlloc(uint32_t,uint32_t);')
-            s=s.replace('ngb_extra_costume_picture(1 + i)','MEM32(GAME_TABLE)').replace('        ngb_sprite_range_dump();','        (void)0;')
+            s='#define NGB_SWITCH_COSTUME_PICTURES 1\n'+s.replace('        ngb_sprite_range_dump();','        (void)0;')
         if name=='cheats':
             s=s.replace('#include "xbox_memory_layout.h"','')
             a=s.index('void ngb_frame_tick(void)');b1=s.index('/* ---- every difficulty',a)

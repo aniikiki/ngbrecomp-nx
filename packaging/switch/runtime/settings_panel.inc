@@ -8,9 +8,8 @@
 #include "../../../src/quick_select.h"
 enum { PANEL=1u<<16,SAVE_ERROR=1u<<17, COUNT=sizeof settings/sizeof settings[0] };
 static atomic_uint panel, revision, aim;
-enum { EXIT_PANEL=1u<<18, EXIT_CONFIRM=1u<<19, EXIT_ERROR=1u<<20 };
-static atomic_bool exit_preview,exit_resume,exit_return_boot;
-static const char *exit_program_path;
+enum { EXIT_PANEL=1u<<18, EXIT_CONFIRM=1u<<19, EXIT_ERROR=1u<<20, EXIT_YES=1u<<21 };
+static atomic_bool exit_preview,exit_resume;
 static atomic_uchar value[85];
 static int launch_aspect,launch_thread;
 static int choices(const Preference *p) {int n=1;for(const char *s=p->choices;*s;s++)n+=*s=='|';return n;}
@@ -38,7 +37,7 @@ static unsigned saved_choice(const Preference *p,unsigned id,unsigned v){return 
 void ngb_switch_toggle_hud(void){if(prefs_save(24,!pref(24)))atomic_fetch_add(&revision,1);}
 int ngb_settings_glow(void){return pref(18);}
 int ngb_settings_standard_aspect(void){return launch_aspect;}
-int ngb_settings_skip_intro(void){return pref(8) || atomic_load(&exit_return_boot);}
+int ngb_settings_skip_intro(void){return pref(8);}
 int ngb_bind_third_person_start(void){return pref(46);}
 float ngb_bind_camera_boost(void){int pct=ngb_switch_setting(47);return pct>100?pct/100.f:1.f;}
 int ngb_movie_active(void){return ngb_movie_owns_input();}
@@ -112,36 +111,53 @@ void ngb_settings_open(void)
 }
 static bool settings_input(PadState *pad)
 {
-    static bool armed,closing;
+    static bool armed,closing,return_on_release;
     unsigned view=atomic_load(&panel);
     if (!view) return false;
     u64 held=padGetButtons(pad), down=padGetButtonsDown(pad);
-    u64 controls=HidNpadButton_A|HidNpadButton_B|HidNpadButton_X|HidNpadButton_Plus|HidNpadButton_Minus;
+    u64 controls=HidNpadButton_A|HidNpadButton_B|HidNpadButton_X|HidNpadButton_Y|HidNpadButton_Plus|HidNpadButton_Minus;
+    if((view&EXIT_PANEL) && !(view&EXIT_ERROR) && armed && !closing && !(held&controls) &&
+       (down&(HidNpadButton_ZL|HidNpadButton_ZR))){
+        armed=false;
+        atomic_store(&panel,0);
+        return false;                  /* let the game switch tabs with this same trigger press */
+    }
     /* Drain the opening and closing presses rather than delivering them to
      * the setting or the game. The guest remains on the selected menu row. */
     ngb_switch_sample_quick(0);
     ngb_ohci_pad_sample(0,0,0,0,0);
     if (closing) {
-        if (!(held&controls)) { armed=closing=false;atomic_store(&panel,0); }
+        if (!(held&controls)) {
+            armed=closing=false;
+            atomic_store(&panel,0);
+            if (return_on_release) {
+                return_on_release=false;
+                ngb_request_main_menu();
+            }
+        }
     } else if (!armed) {
         if (!(held&controls)) armed=true;
     } else if(view&EXIT_PANEL){
         unsigned row=view&3;
-        if(down&HidNpadButton_B){
-            if(view&(EXIT_CONFIRM|EXIT_ERROR))view=EXIT_PANEL|row;else closing=true;
-        }else if(view&EXIT_ERROR){ /* B returns to the choices. */ }
-        else if(!(view&EXIT_CONFIRM) && (down&(HidNpadButton_AnyUp|HidNpadButton_AnyDown))){
-            view=EXIT_PANEL|((row+((down&HidNpadButton_AnyUp)?2:1))%3);
-        }else if(down&HidNpadButton_A){
-            if(!row){atomic_store(&exit_resume,true);closing=true;}
-            else if(!(view&EXIT_CONFIRM))view|=EXIT_CONFIRM;
-            else if(row==1){
-                char args[1024];int n=snprintf(args,sizeof args,"\"%s\" --return-to-title",exit_program_path);
-                struct stat file;
-                if(n<0 || (size_t)n>=sizeof args || stat(exit_program_path,&file) || !S_ISREG(file.st_mode) || !envHasNextLoad() ||
-                   R_FAILED(envSetNextLoad(exit_program_path,args)))view=EXIT_PANEL|EXIT_ERROR|row;
+        bool confirm=(down&(HidNpadButton_A|HidNpadButton_Y))!=0;
+        bool back=(down&(HidNpadButton_B|HidNpadButton_Plus))!=0;
+        if(view&EXIT_ERROR){
+            if(confirm || back)closing=true;
+        }else if(back){
+            if(view&EXIT_CONFIRM)view=EXIT_PANEL|row;else closing=true;
+        }else if(view&EXIT_CONFIRM){
+            if(down&(HidNpadButton_AnyUp|HidNpadButton_AnyDown|HidNpadButton_AnyLeft|HidNpadButton_AnyRight))
+                view^=EXIT_YES;
+            else if(confirm){
+                if(!(view&EXIT_YES))view=EXIT_PANEL|row;
+                else if(row==1){return_on_release=true;closing=true;}
                 else atomic_fetch_or(&commands,EXIT_GAME);
-            }else atomic_fetch_or(&commands,EXIT_GAME);
+            }
+        }else if(down&(HidNpadButton_AnyUp|HidNpadButton_AnyDown)){
+            view=EXIT_PANEL|((row+((down&HidNpadButton_AnyUp)?2:1))%3);
+        }else if(confirm){
+            if(!row){atomic_store(&exit_resume,true);closing=true;}
+            else view|=EXIT_CONFIRM;    /* Start on No, as in the upstream Exit tab. */
         }
         atomic_store(&panel,view);
     } else {
@@ -189,7 +205,7 @@ static void panel_text(u32 *dst,unsigned stride,int x,int y,const char *s,u32 fg
  * press before the original Exit action closes the pause menu. */
 int ngb_switch_exit_report(int tab,uint8_t *report){
     static bool held;
-    bool select=report[4]!=0;
+    bool select=report[4] || report[7]; /* Switch A or physical Y (Xbox X). */
     bool edge=select && !held;held=select;
     atomic_store_explicit(&exit_preview,tab,memory_order_relaxed);
     if(!tab)atomic_store(&exit_resume,false);
@@ -200,16 +216,79 @@ int ngb_switch_exit_report(int tab,uint8_t *report){
     if(atomic_load(&panel)&EXIT_PANEL){memset(report+2,0,18);return 1;}
     return 0;
 }
+void ngb_switch_return_failed(void){
+    atomic_store(&panel,EXIT_PANEL|EXIT_ERROR|1);
+}
+
+/* Blend into either the game's framebuffer or the premultiplied GPU overlay.
+ * The upstream selection bar fades from left to right across the retail menu. */
+static void exit_band(u32 *dst,unsigned stride,int x,int y,int w,int h,u32 rgb,int start,int end){
+    for(int dx=0;dx<w;dx++){
+        unsigned a=start+(end-start)*dx/w;
+        for(int dy=0;dy<h;dy++){
+            u32 *pixel=dst+(y+dy)*stride+x+dx;
+            u32 v=(a+((*pixel>>24)*(255-a)+127)/255)<<24;
+            for(int k=0;k<24;k+=8)
+                v|=((((rgb>>k)&255)*a+((*pixel>>k)&255)*(255-a)+127)/255)<<k;
+            *pixel=v;
+        }
+    }
+}
+
+static int panel_text_width(const char *text){
+    int width=0;
+    for(;*text;text++)width+=launcher_font_w[(unsigned char)*text-32];
+    return width;
+}
+
 static void exit_contents(u32 *dst,unsigned stride,unsigned view){
-    const char *rows[]={"Return to Game","Return to Main Menu","Quit Game"};
+    static const char *const rows[]={"Return to Game","Return to Main Menu","Quit Game"};
+    static const char *const help[]={"Closes this menu.","Back to the main menu. Unsaved progress is lost.",
+                                    "Closes the game. Unsaved progress is lost."};
     unsigned row=view&3;
-    for(unsigned y=215;y<505;y++)for(unsigned x=345;x<935;x++)
-        dst[y*stride+x]=view && y>=277+row*50 && y<320+row*50?0xff424143:0xff211d1d;
-    panel_text(dst,stride,380,227,"EXIT",0xff80c7eb);
-    for(unsigned i=0;i<3;i++)panel_text(dst,stride,388,280+50*i,rows[i],~0u);
-    const char *hint=!view?"A: Choose     Left / Right: Tabs":view&EXIT_ERROR?"Cannot restart here. B: Back":
-       view&EXIT_CONFIRM?"Unsaved progress will be lost. A: Yes   B: No":"Up / Down: Select     A: Confirm     B: Back";
-    panel_text(dst,stride,355,455,hint,0xff80c7eb);
+    int width=ngb_settings_standard_aspect()?960:1280, left=(1280-width)/2;
+    /* Upstream's page starts at (250,118) in the retail 720x480 menu,
+     * to the right of the sword. Leave the game visible behind the rows. */
+    int page=left+250*width/720;
+    for(unsigned i=0;i<3;i++){
+        int y=195+(int)i*46;
+        bool selected=view && i==row;
+        if(selected){
+            int edge=10*width/720;
+            exit_band(dst,stride,page,y,edge,34,0xffe4e6,242,217);
+            exit_band(dst,stride,page+edge,y,440*width/720,34,0xdc646e,217,13);
+        }
+        int x=page+20*width/720;
+        panel_text(dst,stride,x+1,y+2,rows[i],0xff000000);
+        panel_text(dst,stride,x,y+1,rows[i],selected?0xff5aebf5:view?0xffebe6e6:0xffb0a8a8);
+    }
+    if(!view)return;
+    if(!(view&(EXIT_CONFIRM|EXIT_ERROR))){
+        int x=left+695*width/720-panel_text_width(help[row]);
+        panel_text(dst,stride,x+1,350,help[row],0xff000000);
+        panel_text(dst,stride,x,349,help[row],0xffffffff);
+        return;
+    }
+    int w=420*width/720, x0=(1280-w)/2;
+    exit_band(dst,stride,x0,281,w,158,0x040404,235,235);
+    exit_band(dst,stride,x0,284,w,2,0x488aa0,220,220);
+    exit_band(dst,stride,x0,435,w,2,0x488aa0,220,220);
+    const char *question=view&EXIT_ERROR?"The main menu did not open.":row==1?"Return to the Main Menu?":"Quit Game?";
+    panel_text(dst,stride,(1280-panel_text_width(question))/2,308,question,~0u);
+    if(view&EXIT_ERROR){
+        panel_text(dst,stride,(1280-panel_text_width("Back"))/2,375,"Back",~0u);
+        return;
+    }
+    for(unsigned i=0;i<2;i++){
+        int center=x0+w*(i?66:34)/100;
+        bool chosen=i==((view&EXIT_YES)?0u:1u);
+        if(chosen){
+            exit_band(dst,stride,center-w/8,371,w/8,43,0xb56d89,0,175);
+            exit_band(dst,stride,center,371,w/8,43,0xb56d89,175,0);
+        }
+        const char *answer=i?"No":"Yes";
+        panel_text(dst,stride,center-panel_text_width(answer)/2,376,answer,chosen?~0u:0xffa0a0a0);
+    }
 }
 static void draw_exit_panel(Framebuffer *fb,unsigned view){
     u32 bytes,*dst=framebufferBegin(fb,&bytes);ngb_scanout_blit(dst,bytes/4,1280,720);
@@ -255,7 +334,7 @@ static void overlay_region(NgbScreenFrame *frame,u32 *pixels,NgbScreenRect r){
     frame->rects[frame->count++]=r;
     for(unsigned y=r.y;y<r.y+r.h;y++)memset(pixels+y*NGB_SCREEN_W+r.x,0,r.w*sizeof(*pixels));
 }
-static const NgbScreenRect exit_region={0,215,NGB_SCREEN_W,290};
+static const NgbScreenRect exit_region={0,190,NGB_SCREEN_W,250};
 static void game_overlay(u32 *dst,unsigned stride,NgbScreenFrame *frame){
     bool preview=atomic_load_explicit(&exit_preview,memory_order_relaxed);
     if(preview){overlay_region(frame,dst,exit_region);exit_contents(dst,stride,0);}

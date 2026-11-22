@@ -39,7 +39,7 @@ o=p.compile('runtime_test.c',s,['-I'+str(REGS),'-I'+str(RUNTIME),'-include',str(
 p.link[p.link.index(str(p.core/'exact-runtime_test.c.o'))]=o
 for name in ('identity','scanout','files','opening_movie'):
  p.link[p.link.index('CMakeFiles/ngb-runtime-test.dir/'+name+'.c.o')]=str(p.out/(name+'.c.o'))
-prologue_flags=['-DNGB_PROLOGUE_START=ngb_gate_sub_003443D0','-DNGB_PROLOGUE_CAPTION=ngb_gate_sub_00344AD0'] if '--chapter' in sys.argv else []
+prologue_flags=['-DNGB_PROLOGUE_START=ngb_gate_sub_003443D0','-DNGB_PROLOGUE_CAPTION=ngb_gate_sub_00344AD0','-DNGB_PROLOGUE_CLEAR=ngb_gate_sub_00231EB0'] if '--chapter' in sys.argv else []
 for name in ('files','opening_movie','ohci_boot'):
     q=p.compile(name+'.c',(RUNTIME/(name+'.c')).read_text(),prologue_flags if name=='opening_movie' else [])
     if name=='ohci_boot':p.link[next(i for i,v in enumerate(p.link) if v.endswith('/ohci_boot.c.o'))]=q

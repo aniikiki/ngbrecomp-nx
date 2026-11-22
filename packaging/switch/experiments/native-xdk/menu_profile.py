@@ -1,4 +1,4 @@
-"""Route signed front-end autosaves to the native profile writer on both ARM builds."""
+"""Link the retail menu profile and button prompt hooks on both ARM builds."""
 from pathlib import Path
 import subprocess
 
@@ -60,3 +60,18 @@ int ngb_is_menu_profile(void)
     gate = output / 'menu-profile-gate.o'
     subprocess.run([cc[0], '-c', runtime / 'direct/menu_profile.S', '-o', gate], check=True)
     link[1:1] = [str(gate), str(obj)]
+
+
+def link_button_prompts(root, output, link, objcopy):
+    runtime = root / 'packaging/switch/runtime'
+    gate = output / 'button-prompts-gate.o'
+    prompts = output / 'button-prompts.o'
+    subprocess.run([link[0], '-c', runtime / 'direct/button_prompts.S', '-o', gate], check=True)
+    subprocess.run([link[0], '-x', 'c', '-O2', '-c', runtime / 'button_prompts.c', '-o', prompts], check=True)
+    # The generic SPR dispatcher in unit 19 also calls this registration function.
+    i = next(i for i, path in enumerate(link) if path.endswith('recomp_0019.c.o'))
+    retained = output / 'prompts-recomp_0019.c.o'
+    subprocess.run([str(objcopy), '--add-symbol', 'ngb_retail_register_sprites=.text.sub_0021AAC0:0,global,function',
+                    '--weaken-symbol=ngb_reg_sub_0021AAC0', link[i], retained], check=True)
+    link[i] = str(retained)
+    link[1:1] = [str(gate), str(prompts)]

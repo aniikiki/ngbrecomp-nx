@@ -40,6 +40,25 @@ static void check(unsigned on,unsigned earned,unsigned top,unsigned expected){
    for(int i=1;i<=4;i++) assert(MEM8(0x50004+i*8)==(i<=expected) && MEM8(0x50005+i*8)==(i<=expected));
  }
 }
+void ngb_switch_xy_prompts(const uint32_t *);
+static void check_button_prompts(unsigned first,unsigned index){
+ const uint32_t defs=0x80004;
+ uint32_t group[13]={0};
+ group[7]=defs;group[11]=first;group[12]=index+3;
+ uint32_t (*cells)[6]=(uint32_t (*)[6])(ngb_fast_ram+defs);
+ const uint32_t middle=0x3e280000, end=0x3ea80000;
+ const uint32_t original[4][6]={{10},{0,1,middle,3,4,5},{middle,1,end,3,4,5},{20}};
+ const uint32_t swapped[4][6]={{10},{middle,1,end,3,4,5},{0,1,middle,3,4,5},{20}};
+ memcpy(cells+index-1,original,sizeof original);
+ MEM32(defs-4)=(index+1)*24;
+ ngb_switch_xy_prompts(group);
+ assert(!memcmp(cells+index-1,original,sizeof original));
+ MEM32(defs-4)=group[12]*24;
+ ngb_switch_xy_prompts(group);
+ assert(!memcmp(cells+index-1,swapped,sizeof swapped));
+ ngb_switch_xy_prompts(group);
+ assert(!memcmp(cells+index-1,swapped,sizeof swapped));
+}
 int main(void){
  ngb_fast_ram=calloc(1,0x1000000);
  check(0,0,0,0);check(1,0,0,4);check(0,3,2,2);check(1,3,2,4);check(0,3,4,4);check(0,1,1,1);
@@ -48,5 +67,7 @@ int main(void){
    drawn=sprite=0;sub_001EAA10();int j=i-(i<10?2:12);
    assert(esp==0x110004 && drawn==(j>=0) && sprite==(j>=0?0x1d6+j:0));
  }
- puts("PASS: six mission confirm states, save bytes unchanged, 16 technique-icon decisions");
+ check_button_prompts(0,5);
+ check_button_prompts(0x161,0x1ce - 0x161);
+ puts("PASS: six mission confirm states, 16 technique-icon decisions, normal and held X/Y including re-registration");
 }

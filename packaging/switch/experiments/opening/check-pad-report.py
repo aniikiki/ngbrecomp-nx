@@ -14,9 +14,40 @@ with tempfile.TemporaryDirectory() as tmp:
 #include <string.h>
 extern void ngb_ohci_pad_sample(uint16_t,int16_t,int16_t,int16_t,int16_t);
 extern int usb_gamepad_report(int,uint8_t*,int);
+extern unsigned ngb_pad_movie_input(int);
+extern unsigned ngb_movie_skip_edges(void);
 uint8_t ram[0xdb9ad6], *ngb_fast_ram=ram;
 uint64_t ngb_elapsed_ns(void){return 0;}
 int ngb_scanout_ready(void){return 0;}
+static unsigned sample_buttons(unsigned held){
+ uint8_t report[20];
+ ngb_ohci_pad_sample(held,0,0,0,0);
+ assert(usb_gamepad_report(0,report,sizeof report)==20);
+ return report[2] | (report[4]?256:0) | (report[5]?512:0);
+}
+static void check_logo_buttons(void){
+ const unsigned plus=16, a=256, b=512;
+ ram[0x7f1b12]=0;
+ for(unsigned i=0;i<2;i++){
+   unsigned key=i?a:plus;
+   assert(sample_buttons(0)==0);
+   unsigned before=ngb_pad_movie_input(1);
+   assert(sample_buttons(key|b)==b);
+   assert(ngb_pad_movie_input(0)==before+1);
+   assert(sample_buttons(key)==0);
+   assert(sample_buttons(0)==0);
+   assert(sample_buttons(key)==key);
+ }
+ /* A held before the movie is not a skip. A fresh Plus tap, already
+  * released when the decoder polls, skips once. A stays down at the title. */
+ unsigned before=ngb_pad_movie_input(1);
+ assert(sample_buttons(a)==0 && ngb_movie_skip_edges()==before);
+ assert(sample_buttons(a|plus)==0 && sample_buttons(a)==0);
+ assert(ngb_movie_skip_edges()==before+1);
+ ngb_pad_movie_input(0);
+ assert(sample_buttons(a|plus)==plus);
+ assert(sample_buttons(0)==0 && sample_buttons(a)==a && sample_buttons(0)==0);
+}
 int main(void){
  for(unsigned mode=0;mode<4;mode++){
  ram[0x7f1b12]=mode==1||mode==3?1:mode;ram[0xdb9894]=2;ram[0xdb9ad5]=mode==3;
@@ -24,7 +55,10 @@ int main(void){
  for(unsigned mask=0;mask<16;mask++){
   uint8_t report[20];ngb_ohci_pad_sample(mask<<8,1,-2,32000,-32000);
   assert(usb_gamepad_report(0,report,20)==20);
-  for(int i=0;i<4;i++)assert(report[4+i]==((mask & (1u<<(mode==1?(i^1):i)))?255:0));
+  for(int i=0;i<4;i++){
+   unsigned physical=(mode==1 || i>=2)?(i^1):i;
+   assert(report[4+i]==((mask & (1u<<physical))?255:0));
+  }
   const int16_t sticks[]={1,-2,32000,-32000};assert(!memcmp(sticks,report+12,8));
  }
  }
@@ -36,8 +70,9 @@ int main(void){
    usb_gamepad_report(0,r,20);assert(r[7]==255 && !r[6]);
  }
  ngb_ohci_pad_sample(0,0,0,0,0);usb_gamepad_report(0,r,20);assert(!r[7] && !r[6]);
+ check_logo_buttons();
  }
 """)
  subprocess.run(['cc',s,o,'-Wl,--gc-sections','-o',d/'test'],check=True)
  subprocess.run([d/'test'],check=True)
- print('64 face button reports, stick passthrough and 360 held reports across context change passed')
+ print('64 face button reports, sticks, held controls across contexts, and startup logo skip/release passed')

@@ -5,7 +5,7 @@ static struct {
     AVCodecContext *codec;
     AVFrame *frame;
     unsigned used,channels,rate,phase,disabled;
-    uint32_t remaining;
+    uint32_t remaining, output_frames;
     uint8_t bytes[4096+AV_INPUT_BUFFER_PADDING_SIZE];
     int prev[2],have_prev;
 } adx;
@@ -24,12 +24,12 @@ static void movie_audio_samples(void){
         if(!adx.have_prev){memcpy(adx.prev,cur,sizeof cur);adx.have_prev=1;}
         while(adx.phase<48000){
             for(unsigned c=0;c<2;c++)pcm[count*2+c]=adx.prev[c]+(int)((int64_t)(cur[c]-adx.prev[c])*adx.phase/48000);
-            if(++count==512){ngb_pcm_submit(1,pcm,count);count=0;}
+            if(++count==512){ngb_pcm_submit(1,pcm,count);adx.output_frames+=count;count=0;}
             adx.phase+=adx.rate;
         }
         adx.phase-=48000;memcpy(adx.prev,cur,sizeof cur);
     }
-    if(count)ngb_pcm_submit(1,pcm,count);
+    if(count){ngb_pcm_submit(1,pcm,count);adx.output_frames+=count;}
 }
 static void movie_audio_packet(const uint8_t *src,unsigned bytes){
     if(adx.disabled || bytes>4096-adx.used)return;

@@ -5,6 +5,13 @@ enum { GAME_CAP=4096, MOVIE_CAP=65536 };
 static int16_t game_pcm[GAME_CAP][2],movie_pcm[MOVIE_CAP][2];
 typedef struct {int16_t (*pcm)[2];unsigned cap,seen_discard;atomic_uint read,write,discard;} PcmQueue;
 static PcmQueue queues[2]={{.pcm=game_pcm,.cap=GAME_CAP},{.pcm=movie_pcm,.cap=MOVIE_CAP}};
+NgbMoviePcmPosition ngb_pcm_movie_position(void)
+{
+    return (NgbMoviePcmPosition){
+        .read = atomic_load_explicit(&queues[1].read, memory_order_acquire),
+        .written = atomic_load_explicit(&queues[1].write, memory_order_relaxed)
+    };
+}
 void ngb_pcm_submit(unsigned movie,const int16_t *s,unsigned n){
     PcmQueue *q=&queues[movie];unsigned w=atomic_load_explicit(&q->write,memory_order_relaxed);
     unsigned space=q->cap-(w-atomic_load_explicit(&q->read,memory_order_acquire));if(n>space)n=space;

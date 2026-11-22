@@ -883,6 +883,11 @@ static void kernel_call(void)
         g_eax = 0; g_esp += 8;
         return;
     }
+    if (ordinal == 305) { /* RtlTimeToTimeFields */
+        ngb_time_to_fields(arg(0), arg(1));
+        g_esp += 12;
+        return;
+    }
     if (ordinal == 327 || ordinal == 328) {
         /* All XBE sections were loaded from the validated image. Match the
          * upstream reference-count behaviour; do not reread or unmap them. */
@@ -1395,6 +1400,7 @@ int ngb_boot(const char *path, FILE *log)
     }
     ngb_devices_reset(); /* Join disc I/O before releasing the renderer or guest RAM. */
     ngb_scene_close();
+    ngb_select_movie(0); /* Release the decoder if the player quit in the middle of a movie. */
     for (unsigned i=0;i<128;++i) free(fibers[i].stack);
     memset(fibers,0,sizeof(fibers));
     memset(kernel_stack_sizes,0,sizeof(kernel_stack_sizes));

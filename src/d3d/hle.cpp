@@ -1024,6 +1024,22 @@ extern "C" int d3d_hle_native_address(uint32_t address, uint32_t regs[8]) {
         if (d3d_funcs[i].va == address) return NativeCall(i, Call{regs});
     return NativeHelper(address, Call{regs});
 }
+extern "C" void ngb_direct_wait_texture(uint32_t header)
+{
+    if (g_backend) g_backend->WaitResource(header);
+}
+
+extern "C" uint8_t* ngb_direct_lock_prologue_texture(uint32_t header, unsigned width, unsigned height, int* pitch)
+{
+    gpu::TextureDesc d;
+    if (!g_backend || !gpu::Describe(header, d) || d.format != 0x12 || !d.linear ||
+        d.width != width || d.height != height || d.pitch < width * 4) return nullptr;
+    // The worker may still be uploading this slot from an earlier draw.
+    ngb_direct_wait_texture(header);
+    *pitch = int(d.pitch);
+    return static_cast<uint8_t*>(HostPtr(d.data, gpu::TotalSize(d)));
+}
+
 extern "C" void ngb_direct_park_prologue(void)
 {
     ngb_direct_finish_put();

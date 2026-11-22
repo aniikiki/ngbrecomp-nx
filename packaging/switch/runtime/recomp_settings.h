@@ -11,6 +11,7 @@ int ngb_settings_standard_aspect(void);
 int ngb_settings_glow(void);
 int ngb_settings_skip_intro(void);
 int ngb_switch_exit_report(int tab,uint8_t *report);
+void ngb_switch_return_failed(void);
 void ngb_settings_open(void);
 #ifdef __cplusplus
 }

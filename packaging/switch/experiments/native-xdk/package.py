@@ -11,7 +11,7 @@ from material_cache import compatibility
 
 root = Path('/work')
 diagnostics = '--diagnostics' in sys.argv
-version = '0.57.40'
+version = '0.57.48'
 (root / 'build/switch-runtime/history').mkdir(parents=True, exist_ok=True)
 assert '--seed' in sys.argv, 'supply the validated portable material seed with --seed'
 seed = Path(sys.argv[sys.argv.index('--seed') + 1]).resolve()
@@ -45,10 +45,11 @@ replace(" def comp(name,s,flags=[]):", """ def comp(name,s,flags=[]):
    (d/'native_combat_perf.inc').write_text((root/'combat_perf.inc').read_text().replace('#SESSION,0.56.25,','#SESSION,@VERSION@,'))
    s=s.replace('#include \\"combat_perf.inc\\"','#include \\"native_combat_perf.inc\\"')""")
 replace(" regs=[]", " from disc_archives import link_disc_archives\\n disc_hooks=link_disc_archives(Path('/work'),d,link)\\n regs=[]")
-replace(" elf=d/'idx.elf';", """ from menu_profile import link_menu_profile
+replace(" elf=d/'idx.elf';", """ from menu_profile import link_button_prompts, link_menu_profile
  link_menu_profile(Path('/work'),d,link,next(shlex.split(c) for c in commands if c.endswith('/runtime.c')),b,sdk/'devkitA64/bin/aarch64-none-elf-objcopy')
+ link_button_prompts(Path('/work'),d,link,sdk/'devkitA64/bin/aarch64-none-elf-objcopy')
  elf=d/'idx.elf';""")
-replace(" handlers=[n for n in table", " assert all(n in table for n in [*disc_hooks,'ngb_encode_menu_profile','ngb_queue_menu_profile','ngb_retail_profile_encoder'])\\n handlers=[n for n in table")
+replace(" handlers=[n for n in table", " assert all(n in table for n in [*disc_hooks,'ngb_encode_menu_profile','ngb_queue_menu_profile','ngb_retail_profile_encoder','ngb_retail_register_sprites','ngb_switch_xy_prompts'])\\n handlers=[n for n in table")
 replace("  regs.append(obj)", "  if u in (28,44,45): obj=base/'core-perf/native-xdk'/f'recomp_{u:04}.c.o'\\n  regs.append(obj)")
 replace(" assert (out/'linked-inputs.txt').read_bytes()==(base/'core-perf/opening-pixel-link-audit/linked-inputs.txt').read_bytes()", """ reference={Path(line.split()[1]).name:line for line in (base/'core-perf/native-xdk/retained-inputs.txt').read_text().splitlines()}
  actual={Path(line.split()[1]).name:line for line in (out/'linked-inputs.txt').read_text().splitlines()}
@@ -78,12 +79,15 @@ inputs = [root / 'src/d3d/native_device.inc', root / 'src/d3d/native_material.in
 inputs += [root / 'src/d3d' / n for n in ('native_diag.h','native_diag.inc','native_pacing.h')]
 inputs += [root / 'src/d3d' / n for n in ('native_mesh.inc','native_simple.inc','gpu/prepared.h','gpu/backend.h')]
 inputs += [root / 'packaging/switch/runtime/direct' / n for n in ('native_mesh.inc','native_model.inc','display.h','display_device.h','presenter.inc','platform.cpp')]
-inputs += [root / 'packaging/switch/runtime' / n for n in ('runtime.c','direct/hooks.c','direct/output.h','scene/bridge.c')]
+inputs += [root / 'packaging/switch/runtime' / n for n in ('runtime.c','runtime.h','identity.c','services.h','direct/hooks.c','direct/output.h','scene/bridge.c')]
 inputs += [root / 'packaging/switch/runtime' / n for n in ('main.c','settings_panel.inc','settings_catalog.h','recomp_settings.h','scanout.c','scanout.h','combat_perf.h','combat_perf.inc','workers.inc')]
 inputs += [experiment / n for n in ('build.py','package.py','material_cache.py','material_guest.py','story_gpu.py','disc_archives.py')]
+inputs += [root / 'packaging/switch/runtime/button_prompts.c', root / 'packaging/switch/runtime/direct/button_prompts.S']
+inputs += [root / 'src/costume_menu.c', root / 'packaging/switch/runtime/costume_pictures.h', root / 'packaging/switch/settings/link.py']
 inputs += [experiment / 'menu_profile.py', root / 'packaging/switch/runtime/menu_profile.inc',
            root / 'packaging/switch/runtime/direct/menu_profile.S', root / 'packaging/switch/runtime/direct/disc_archives.S']
-inputs += [root / 'packaging/switch/runtime' / n for n in ('files.c','files.h','files_bridge.c','files_bridge.h','disc_reads.inc','disc_names.inc','ohci_boot.c')]
+inputs += [root / 'packaging/switch/runtime' / n for n in ('files.c','files.h','files_bridge.c','files_bridge.h','disc_reads.inc','disc_names.inc','ohci_boot.c','ohci_boot.h','opening_movie.c','prologue_stream.inc')]
+inputs += [root / 'packaging/switch/runtime' / n for n in ('movie_audio.inc','audio_boot.c','audio_output.h','audio_output.inc')]
 if diagnostics:
     inputs += [experiment / 'story_gpu.inc']
     inputs += [root / 'packaging/switch/runtime/direct/acquire_trace.inc']

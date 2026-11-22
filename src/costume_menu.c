@@ -22,7 +22,11 @@
 #define EXTRAS 3
 
 int ngb_pc_setting(int which);                 /* src/ingame_menu.c: 16 All Costumes */
+#ifdef NGB_SWITCH_COSTUME_PICTURES
+#include "costume_pictures.h"
+#else
 uint32_t ngb_extra_costume_picture(int n);     /* src/pause_tab.c: costume n's picture, sprite id; 0 none */
+#endif
 
 static uint32_t s_table;          /* ours: the game's five, then 1-3 */
 static int s_n = 5;               /* how many are offered (set as the menu opens) */
@@ -492,7 +496,11 @@ loc_00177724: ;
     xmm0.f[0] = xmm0.f[0] * MEMF(0x414C90); /* mulss */
     edi = esp + 0x10;
     MEMF(esp + 0x24) = xmm0.f[0]; /* movss */
+#ifdef NGB_SWITCH_COSTUME_PICTURES
+    ngb_queue_costume_picture();
+#else
     PUSH32(esp, 0x0017773Fu); RECOMP_ABI_CALL(0x00221340u, sub_00221340); /* call 0x00221340 */
+#endif
 
 loc_0017773F: ;
     ebx++;

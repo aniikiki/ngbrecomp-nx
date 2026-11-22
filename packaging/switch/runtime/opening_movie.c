@@ -4,6 +4,9 @@
 #include "scene.h"
 #include "files.h"
 #include "ohci_boot.h"
+#ifdef NGB_DIRECT3D
+#include "direct/output.h"
+#endif
 #ifdef NGB_PLAYER_BUILD
 #include "recomp_settings.h"
 #endif
@@ -42,6 +45,18 @@ static uint64_t selected_ns;
 static atomic_bool playing;
 static atomic_uint displayed;
 
+static bool is_startup_logo(const char *name)
+{
+    /* Selected names point into titles[], in either aspect ratio. */
+    return name == titles[0] || name == titles[1];
+}
+
+static void set_movie_input(const char *name)
+{
+    selection_edge = ngb_pad_movie_input(is_startup_logo(name));
+    atomic_store(&owns_input, name != NULL);
+}
+
 void ngb_movie_displayed(void)
 {
     if (atomic_load(&playing)) atomic_fetch_add(&displayed, 1);
@@ -55,10 +70,8 @@ void ngb_select_movie(uint32_t address)
     seq_close();
     selected = NULL;
     guest_prologue=false;
-    atomic_store(&owns_input,false);
-    if (!address) return;
     char path[256];
-    for (unsigned i=0; i<sizeof(path); ++i) {
+    for (unsigned i=0; address && i<sizeof(path); ++i) {
         char c = *(const char *)ngb_guest_pointer(address+i,1);
         path[i] = c == '\\' ? '/' : c;
         if (!c) {
@@ -72,13 +85,12 @@ void ngb_select_movie(uint32_t address)
                 if (guest_prologue) ngb_scene_begin_prologue();
 #endif
                 selected_ns=ngb_elapsed_ns();
-                selection_edge=ngb_movie_skip_edges();
-                atomic_store(&owns_input,true);
                 break;
             }
-            return;
+            break;
         }
     }
+    set_movie_input(selected);
 }
 
 /* This Sofdec file uses one MPEG-1 pack per 2048-byte sector and puts
@@ -249,23 +261,23 @@ uint32_t ngb_movie_status(uint32_t status)
 #endif
         guest_prologue=false;
         selected=NULL;
-        atomic_store(&owns_input,false);
+        set_movie_input(NULL);
         return status;
     }
     if (!selected || (status!=1 && status!=2)) return status;
     const char *name=selected;
     selected=NULL;
 #ifndef __SWITCH__
-    if (getenv("NGB_TEST_ORIGINAL_MOVIE")) { atomic_store(&owns_input,false); return status; }
+    if (getenv("NGB_TEST_ORIGINAL_MOVIE")) { set_movie_input(NULL); return status; }
 #endif
 #ifdef NGB_PLAYER_BUILD
-    if (ngb_settings_skip_intro() && (!strcmp(name,"2_VI_WIDE_B.sfd") || !strcmp(name,"4_VI_STD_B.sfd"))) {
-        atomic_store(&owns_input,false);
+    if (is_startup_logo(name) && (ngb_settings_skip_intro() || ngb_returning_to_main_menu())) {
+        set_movie_input(NULL);
         return 3;
     }
 #endif
     FILE *file=ngb_open_disc_movie(name);
-    if (!file) { atomic_store(&owns_input,false); return status; }
+    if (!file) { set_movie_input(NULL); return status; }
     if (status==1) ngb_kernel_log("Opening movie native playback during guest prep");
     setvbuf(file,NULL,_IOFBF,128*1024);
     Movie movie={.start=ngb_elapsed_ns(),.start_edge=selection_edge};
@@ -273,7 +285,7 @@ uint32_t ngb_movie_status(uint32_t status)
     bool complete=decode_intro(file,&movie);
     if (complete) wait_frame(movie.start+movie.count*movie.period);
     atomic_store(&playing,false);
-    atomic_store(&owns_input,false);
+    set_movie_input(NULL);
     sws_freeContext(movie.colors);
     av_frame_free(&movie.frame);
     avcodec_free_context(&movie.codec);

@@ -27,6 +27,8 @@ void ngb_graphics_wait_until(uint64_t nanoseconds);
 void ngb_scanout_direct(const void *bgra);
 void ngb_direct_close(void);
 void ngb_direct_park_prologue(void);
+void ngb_direct_wait_texture(uint32_t header);
+uint8_t *ngb_direct_lock_prologue_texture(uint32_t header, unsigned width, unsigned height, int *pitch);
 void ngb_prologue_simple_state(uint32_t method, uint32_t value);
 #define NGB_DIRECT_KICKOFF_KIB 256u
 void ngb_direct_finish_put(void);

@@ -5,6 +5,7 @@
 #include <stdarg.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 
 /* The same narrow host primitive used by upstream win32_compat.c. */
 int _strnicmp(const char *a, const char *b, SIZE_T n) { return strncasecmp(a, b, n); }
@@ -45,13 +46,16 @@ uint32_t ngb_equal_string(uint32_t first, uint32_t second, uint32_t nocase)
 uint32_t ngb_query_setting(uint32_t index, uint32_t type, uint32_t value,
                            uint32_t length, uint32_t result)
 {
-    if (index == 0xffff) {
+    if (index == XC_MAX_OS || index == 0xffff) {
         /* XAPI reads bytes 0x36..0x45 for its fallback save signature.
          * Keep the synthetic identity bytes zero, as in the desktop port. */
         uint32_t image[64] = {0};
+        /* XC_MAX_OS returns just the user settings from this same image. */
+        const uint32_t offset = index == XC_MAX_OS ? 0x60 : 0;
+        const uint32_t size = index == XC_MAX_OS ? 0x60 : sizeof(image);
+        if (result) memcpy((void *)ngb_guest_pointer(result, 4), &size, sizeof(size));
+        if (length < size) return 0xc0000023u;
         if (!value) return 0xc000000du;
-        if (result) memcpy((void *)ngb_guest_pointer(result, 4), &(uint32_t){sizeof(image)}, 4);
-        if (length < sizeof(image)) return 0xc0000023u;
         image[0x2c / 4] = 1;            /* Game region */
         image[0x58 / 4] = 0x00400100;   /* Factory AV region */
         image[0x30 / 4] = ~image[0x58 / 4];
@@ -65,7 +69,9 @@ uint32_t ngb_query_setting(uint32_t index, uint32_t type, uint32_t value,
             sum = (uint32_t)sum + (sum >> 32);
         }
         image[0x60 / 4] = ~(uint32_t)sum;
-        memcpy((void *)ngb_guest_pointer(value, sizeof(image)), image, sizeof(image));
+        uint8_t *dest = (void *)ngb_guest_pointer(value, length);
+        memcpy(dest, (const uint8_t *)image + offset, size);
+        memset(dest + size, 0, length - size);
         if (type) memcpy((void *)ngb_guest_pointer(type, 4), &(uint32_t){3}, 4);
         return 0;
     }
@@ -86,6 +92,27 @@ uint32_t ngb_query_setting(uint32_t index, uint32_t type, uint32_t value,
     return xbox_ExQueryNonVolatileSetting(index,
         type ? (void *)ngb_guest_pointer(type, 4) : NULL,
         (void *)ngb_guest_pointer(value, length), length, result_ptr);
+}
+
+void ngb_time_to_fields(uint32_t time_address, uint32_t fields_address)
+{
+    uint64_t ticks;
+    memcpy(&ticks, (const void *)ngb_guest_pointer(time_address, sizeof(ticks)), sizeof(ticks));
+    /* XAPI already applied the Xbox time-zone bias to these 100 ns ticks. */
+    time_t seconds = (int64_t)(ticks / 10000000) - INT64_C(11644473600);
+    struct tm tm;
+    XBOX_TIME_FIELDS fields = {0};
+    if (ticks <= INT64_MAX && gmtime_r(&seconds, &tm)) {
+        fields.Year = tm.tm_year + 1900;
+        fields.Month = tm.tm_mon + 1;
+        fields.Day = tm.tm_mday;
+        fields.Hour = tm.tm_hour;
+        fields.Minute = tm.tm_min;
+        fields.Second = tm.tm_sec;
+        fields.Milliseconds = ticks / 10000 % 1000;
+        fields.Weekday = tm.tm_wday;
+    }
+    memcpy((void *)ngb_guest_pointer(fields_address, sizeof(fields)), &fields, sizeof(fields));
 }
 
 #if !defined(NGB_PLAYER_BUILD) && !defined(NGB_DISPLAY_TEST)

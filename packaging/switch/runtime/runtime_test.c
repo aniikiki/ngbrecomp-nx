@@ -391,6 +391,41 @@ static void invoke(uint32_t ordinal, const uint32_t *args, unsigned count)
     CHECK(g_esp == sp + 4 + count * 4);
 }
 
+static void check_local_time(void)
+{
+    const uint32_t type = 0x6800, size = 0x6804, image = 0x6900, user = 0x6b00;
+    invoke(24, (uint32_t[]){0xffff, 0, image, 256, 0}, 5);
+    CHECK(!g_eax);
+    memset((void *)ngb_guest_pointer(user, 257), 0xa5, 257);
+    write32(type, 0xdeadbeef);
+    invoke(24, (uint32_t[]){0xff, type, user, 95, size}, 5);
+    CHECK(g_eax == 0xc0000023u && read32(size) == 96);
+    CHECK(read32(type) == 0xdeadbeef && MEM8(user) == 0xa5 && MEM8(user + 95) == 0xa5);
+    /* XAPI gives the user-settings query a 256-byte buffer. */
+    invoke(24, (uint32_t[]){0xff, type, user, 256, size}, 5);
+    CHECK(!g_eax && read32(type) == 3 && read32(size) == 96);
+    CHECK(!memcmp(ram + user, ram + image + 0x60, 96));
+    for (unsigned i = 96; i < 256; ++i) CHECK(!MEM8(user + i));
+    CHECK(MEM8(user + 256) == 0xa5);
+
+    const uint32_t time = 0x6808, fields = 0x6820;
+    const uint16_t leap_day[] = {2000, 2, 29, 12, 34, 56, 789, 2};
+    const uint64_t ticks = 125963012967890000ull;
+    memcpy(ram + time, &ticks, sizeof(ticks));
+    MEM8(fields + 16) = 0xa5;
+    invoke(305, (uint32_t[]){time, fields}, 2);
+    CHECK(!memcmp(ram + fields, leap_day, sizeof(leap_day)) && MEM8(fields + 16) == 0xa5);
+
+    /* Run the retail GetLocalTime path used by the Chapter 4 scene. It calls
+     * both kernel services and reorders the fields for the game. */
+    memset(ram + fields, 0xff, 16);
+    ngb_graphics_guest_call(0x00329fcb, &fields, 1);
+    CHECK(MEM16(fields) >= 1601 && MEM16(fields + 2) >= 1 && MEM16(fields + 2) <= 12);
+    CHECK(MEM16(fields + 4) <= 6 && MEM16(fields + 6) >= 1 && MEM16(fields + 6) <= 31);
+    CHECK(MEM16(fields + 8) < 24 && MEM16(fields + 10) < 60 && MEM16(fields + 12) < 60);
+    CHECK(MEM16(fields + 14) < 1000 && MEM8(fields + 16) == 0xa5);
+}
+
 static void check_gpu_startup(void)
 {
     ngb_nv2a_reset();
@@ -985,7 +1020,7 @@ static void check_irql(void)
     ngb_guest_polls = 1023; ngb_poll(); CHECK(read32(timer[0] + 4) == 1);
 }
 
-static void check_warning_input(void)
+static void check_warning_input(int leave_via_logo)
 {
     uint8_t report[20];
     ngb_ohci_pad_sample(0, 0, 0, 0, 0);
@@ -997,7 +1032,10 @@ static void check_warning_input(void)
     ngb_ohci_pad_sample(0, 0, 0, 0, 0);
     ngb_pad_flip();
     CHECK(usb_gamepad_report(0, report, sizeof(report)) == 20 && (report[2] & 16));
-    ngb_warning_file_read("spr.afs", 0);
+    if (leave_via_logo) {
+        ngb_pad_movie_input(1);
+        ngb_pad_movie_input(0);
+    } else ngb_warning_file_read("spr.afs", 0);
     for (unsigned i=0; i<16; ++i) {
         ngb_pad_flip();
         CHECK(usb_gamepad_report(0, report, sizeof(report)) == 20 && !(report[2] & 16));
@@ -1219,6 +1257,7 @@ int main(int argc, char **argv)
     CHECK(g_eax == 0xc0000023u && read32(0x6804) == 256 && MEM8(0x6900) == 0xa5);
     invoke(24, (uint32_t[]){0xffff, 0x6800, 0x6900, 256, 0x6804}, 5);
     CHECK(!g_eax && read32(0x6800) == 3 && read32(0x6958) == 0x00400100 && MEM8(0x6a00) == 0xa5);
+    check_local_time();
     check_usb_startup();
     CHECK(pin_image(0x45eff8,16,0) && pin_image(0x45eff8,16,1));
     CHECK(!pin_image(0x45eff8,16,1) && !pin_image(0x3fff000,16,0));
@@ -1329,7 +1368,8 @@ int main(int argc, char **argv)
     uint32_t first_tick = read32(GUEST_TICK_COUNT);
     start_ns -= 3000000;
     CHECK(read32(GUEST_TICK_COUNT) - first_tick >= 3);
-    check_warning_input();
+    check_warning_input(0);
+    check_warning_input(1);
     check_memory_unit();
     ngb_files_close_all();
     snprintf(cleanup, sizeof(cleanup), "%s/hdd", data);

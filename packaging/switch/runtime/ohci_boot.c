@@ -17,6 +17,9 @@
 #include "usb/ohci.h"
 #include "audio_boot.h"
 #include <stdbool.h>
+#ifdef NGB_REPLAY_PAD_LAYOUT
+#include <stdlib.h>
+#endif
 #ifdef NGB_PLAYER_BUILD
 #include "recomp_settings.h"
 static uint32_t settings_label;
@@ -61,11 +64,17 @@ static uint8_t output_report[6];
 static NgbExchange pad_samples = NGB_EXCHANGE_INIT;
 static uint8_t reports[3][20] = {{0,20},{0,20},{0,20}};
 static uint16_t previous_buttons;
+/* Only the pad sampler writes this mask. Release each consumed key separately. */
+static uint16_t logo_held;
 /* Owned by the guest USB consumer. A held physical button retains the
  * assignment it had at press, even during a temporary game-state change. */
 static uint8_t face_down, face_swapped;
-static atomic_uint start_presses, movie_skip_edges;
-unsigned ngb_movie_skip_edges(void) { return atomic_load(&movie_skip_edges); }
+enum { PAD_START = 1u << 4, PAD_BACK = 1u << 5, MOVIE_SKIP_KEYS = PAD_START | (1u << 8) };
+/* Bit zero gives the startup logo its skip keys. The other bits count press
+ * edges. Claiming the keys and taking the decoder's baseline is one operation. */
+enum { LOGO_OWNS_KEYS = 1u, MOVIE_PRESS = 2u };
+static atomic_uint start_presses, movie_input;
+unsigned ngb_movie_skip_edges(void) { return atomic_load(&movie_input) / MOVIE_PRESS; }
 unsigned ngb_start_press_count(void) { return atomic_load(&start_presses); }
 static atomic_bool menu_input;
 static atomic_uint menu_edges;
@@ -84,6 +93,79 @@ uint64_t ngb_warning_start_time(void) { return atomic_load(&warning_press_ns); }
 static bool warning_armed, warning_done, replay_start;
 static unsigned replay_frames;
 
+#ifdef NGB_PLAYER_BUILD
+/* The UI requests a return after the confirmation button is released.
+ * The guest owns the reset, the title input and their timing. */
+static atomic_bool main_menu_requested;
+static enum { RETURN_IDLE, RETURN_RESET, RETURN_TITLE } return_phase;
+static unsigned return_frames, title_frames;
+static uint8_t return_buttons;
+
+void ngb_request_main_menu(void)
+{
+    atomic_store(&main_menu_requested, true);
+}
+
+int ngb_returning_to_main_menu(void)
+{
+    return return_phase != RETURN_IDLE;
+}
+
+static void finish_menu_return(void)
+{
+    return_phase = RETURN_IDLE;
+    return_buttons = 0;
+}
+
+static void return_menu_flip(void)
+{
+    if (return_phase == RETURN_IDLE) {
+        if (!atomic_load_explicit(&main_menu_requested, memory_order_relaxed)) return;
+        atomic_store(&main_menu_requested, false);
+        return_phase = RETURN_RESET;
+        return_frames = title_frames = 0;
+    }
+    ++return_frames;
+    /* sub_00165930 owns these fields. State 1 is PRESS START; inputs
+     * before the two fade counters have elapsed are ignored by the game. */
+    uint32_t title_state = *(const uint32_t *)(ngb_fast_ram + 0x45A7F8);
+    if (return_phase == RETURN_RESET) {
+        if (return_frames <= 90 && title_state != 1) {
+            return_buttons = PAD_START | PAD_BACK;
+            return;
+        }
+        return_phase = RETURN_TITLE;
+        return_buttons = 0;             /* a released frame before the next Start edge */
+        return;
+    }
+    if (return_frames >= 3600) {
+        finish_menu_return();
+        ngb_switch_return_failed();
+        return;
+    }
+    uint32_t title_ticks = *(const uint32_t *)(ngb_fast_ram + 0x45A7F4);
+    uint32_t input_at = *(const uint32_t *)(ngb_fast_ram + 0x43B688)
+                      + *(const uint32_t *)(ngb_fast_ram + 0x43B694);
+    if (title_state == 1 && title_ticks >= input_at) {
+        return_buttons = title_frames++ % 180 < 4 ? PAD_START : 0;
+    } else {
+        return_buttons = 0;
+        title_frames = 0;
+    }
+}
+#endif
+
+unsigned ngb_pad_movie_input(int startup_logo)
+{
+    if (startup_logo) {
+        /* Selecting the logo ends the warning, including any buffered Start. */
+        warning_done = true;
+        replay_start = false;
+        return atomic_fetch_or(&movie_input, LOGO_OWNS_KEYS) / MOVIE_PRESS;
+    }
+    return atomic_fetch_and(&movie_input, ~(unsigned)LOGO_OWNS_KEYS) / MOVIE_PRESS;
+}
+
 void ngb_warning_file_read(const char *name, int64_t offset)
 {
     if (warning_done) return;
@@ -98,6 +180,7 @@ void ngb_warning_file_read(const char *name, int64_t offset)
 void ngb_menu_draw(uint32_t cursor)
 {
 #ifdef NGB_PLAYER_BUILD
+    if (return_phase != RETURN_IDLE) finish_menu_return();
     if (!settings_label) {
         const char label[]="RECOMP SETTINGS";
         settings_label=ngb_contiguous_allocate(sizeof label,0,UINT32_MAX,4,4);
@@ -173,6 +256,9 @@ void ngb_pad_flip(void)
 {
     MP_ADD(MP_FLIP,0,0);
     sample_menu_frame();
+#ifdef NGB_PLAYER_BUILD
+    return_menu_flip();
+#endif
     if (!warning_armed || warning_done) return;
     if (atomic_exchange(&start_edge, false)) {
         replay_frames = 1;
@@ -188,20 +274,26 @@ void ngb_pad_flip(void)
 void ngb_ohci_pad_sample(uint16_t buttons, int16_t lx, int16_t ly, int16_t rx, int16_t ry)
 {
     uint8_t *pad_report = reports[pad_samples.writer];
-    if ((buttons & ~previous_buttons) & (16u | 256u))
-        atomic_fetch_add(&movie_skip_edges,1);
-    if ((buttons & 16) && !(previous_buttons & 16)) {
-        atomic_fetch_add(&start_presses,1);
+    uint16_t pressed = buttons & ~previous_buttons;
+    previous_buttons = buttons;
+    logo_held &= buttons;
+    if (buttons & MOVIE_SKIP_KEYS) {
+        unsigned state = (pressed & MOVIE_SKIP_KEYS) ? atomic_fetch_add(&movie_input, MOVIE_PRESS)
+                                                    : atomic_load(&movie_input);
+        if (state & LOGO_OWNS_KEYS) logo_held |= buttons & MOVIE_SKIP_KEYS;
+    }
+    buttons &= ~logo_held;
+    if (pressed & PAD_START) atomic_fetch_add(&start_presses,1);
+    if (pressed & buttons & PAD_START) {
         if (ngb_scanout_ready() && !atomic_load(&warning_press_ns))
             atomic_store(&warning_press_ns,ngb_elapsed_ns());
         atomic_store(&start_edge, true);
     }
-    unsigned directions=(buttons & ~previous_buttons) & 15;
+    unsigned directions=pressed & 15;
     if (directions && atomic_load(&menu_input)) {
         atomic_store(&direction_ns,ngb_elapsed_ns());
         atomic_fetch_or(&menu_edges,directions);
     }
-    previous_buttons=buttons;
     pad_report[2]=(uint8_t)buttons;
     for (unsigned i=0;i<8;i++) pad_report[4+i]=(buttons&(1u<<(8+i))) ? 255 : 0;
     const int16_t axes[4]={lx,ly,rx,ry};
@@ -228,18 +320,24 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
 {
     if (pad || max<20) return 0;
     memcpy(out,reports[ngb_latest(&pad_samples)],20);
-    if (atomic_load(&menu_input)) out[2]=(out[2]&~15u)|menu_dpad;
-#ifdef NGB_PLAYER_BUILD
+    bool menu=atomic_load(&menu_input);
+    if (menu) out[2]=(out[2]&~15u)|menu_dpad;
     int pause_state=ngb_fast_ram?ngb_fast_ram[0x7F1B12]:0;
-    int exit_tab=(pause_state==2 || pause_state==3) && ngb_fast_ram[0xDA41D1]==5 &&
+    bool play=pause_state==1 && !ngb_fast_ram[0x7F1B11] && !ngb_fast_ram[0xDB9AD5] &&
+        (ngb_fast_ram[0xDB9894]==2 || ngb_fast_ram[0xDB9894]==3) && !menu;
+#ifdef NGB_PLAYER_BUILD
+    int exit_tab=return_phase==RETURN_IDLE && (pause_state==2 || pause_state==3) && ngb_fast_ram[0xDA41D1]==5 &&
                  exit_draw_ns && ngb_elapsed_ns()-exit_draw_ns<250000000ull;
     if(ngb_switch_exit_report(exit_tab,out))return 20;
-    bool play=ngb_fast_ram && ngb_fast_ram[0x7F1B12]==1 && !ngb_fast_ram[0x7F1B11] &&
-        !ngb_fast_ram[0xDB9AD5] && (ngb_fast_ram[0xDB9894]==2 || ngb_fast_ram[0xDB9894]==3) && !atomic_load(&menu_input);
+    if (return_phase != RETURN_IDLE) {
+        memset(out + 2, 0, 18);
+        out[2] = return_buttons;
+        return 20;
+    }
     atomic_store(&quick_play,play);
     static bool chord_held;
     bool chord=(out[2]&96)==96; /* Minus + left stick: leave Start + Back available. */
-    if(chord && !chord_held && ngb_fast_ram && ngb_fast_ram[0x7F1B12]==1 && !atomic_load(&menu_input)){
+    if(chord && !chord_held && pause_state==1 && !menu){
         chord_held=true;ngb_settings_open();memset(out+2,0,18);return 20;
     }
     chord_held=chord;
@@ -265,10 +363,26 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
             if(ngb_switch_setting((fp?48:50)+i))axis=axis==-32768?32767:-axis;
             v=axis;memcpy(out+16+2*i,&v,2);}
     }
+#endif
+    /* X/Y follow the Xbox button positions everywhere. A/B do so only in
+     * play. Latch the mapping at press so a held button survives transitions. */
+    unsigned held=0;
+    for(unsigned i=0;i<4;i++) if(out[4+i]) held|=1u<<i;
+    unsigned pressed=held & ~face_down;
+    face_swapped=(face_swapped & held) | (pressed & (play ? 15u : 12u));
+    face_down=held;
+#ifdef NGB_REPLAY_PAD_LAYOUT
+    static int replay_xbox=-1;
+    if (replay_xbox<0) replay_xbox=getenv("NGB_REPLAY_XBOX_LAYOUT")!=NULL;
+    if (replay_xbox) face_swapped=0;
+#endif
+    unsigned routed=(held & ~face_swapped) | ((face_swapped&5)<<1) | ((face_swapped&10)>>1);
+    for(unsigned i=0;i<4;i++) out[4+i]=(routed&(1u<<i))?255:0;
+#ifdef NGB_PLAYER_BUILD
     bool confirm=out[4] || (out[2]&16) || out[6];
     bool pressed_confirm=confirm && !settings_confirm_held;
     settings_confirm_held=confirm;
-    if (pressed_confirm && settings_label && atomic_load(&menu_input) && last_cursor==3) {
+    if (pressed_confirm && settings_label && menu && last_cursor==3) {
         ngb_settings_open();
         memset(out+2,0,18);
         return 20;
@@ -278,26 +392,13 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     if (ngb_combat_enabled) {
         static bool menu_confirm_held;
         bool down=out[4] || (out[2]&16) || out[6];
-        if (down && !menu_confirm_held && atomic_load(&menu_input)) {
+        if (down && !menu_confirm_held && menu) {
             if (last_cursor==0) ngb_combat_new_game_press();
             if (last_cursor==2) ngb_combat_mission_press();
         }
         menu_confirm_held=down;
     }
 #endif
-    /* Use the game state on the guest worker, after loading system.dat.
-     * Xbox reports retain their native lettering in the front end and pause
-     * screens. Flip the four analog button bytes only in active play. */
-    unsigned held=0;
-    for(unsigned i=0;i<4;i++) if(out[4+i]) held|=1u<<i;
-    unsigned pressed=held & ~face_down;
-    face_swapped &= held;
-    if (pressed && ngb_fast_ram && ngb_fast_ram[0x7F1B12]==1 && !ngb_fast_ram[0x7F1B11] &&
-        !ngb_fast_ram[0xDB9AD5] && (ngb_fast_ram[0xDB9894]==2 || ngb_fast_ram[0xDB9894]==3) &&
-        !atomic_load(&menu_input)) face_swapped |= pressed;
-    face_down=held;
-    unsigned routed=(held & ~face_swapped) | ((face_swapped&5)<<1) | ((face_swapped&10)>>1);
-    for(unsigned i=0;i<4;i++) out[4+i]=(routed&(1u<<i))?255:0;
     if (replay_start) out[2] |= 16;
     MP_ADD(MP_PAD,0,out[2]|(routed<<8));
     return 20;
@@ -490,6 +591,9 @@ void ngb_ohci_reset(void)
 #ifdef NGB_PLAYER_BUILD
     settings_label=0;
     settings_confirm_held=false;
+    exit_draw_ns=0;
+    atomic_store(&main_menu_requested,false);
+    finish_menu_return();
 #endif
     face_down=face_swapped=0;
     start_reported=false;

@@ -112,7 +112,7 @@ if '--player' in sys.argv:
  (out/'symbols.gz').write_bytes""")
  replace(" def comp(name,s,flags=[]):",""" def comp(name,s,flags=[]):
   if name=='opening_movie.c':
-   flags=[*flags,'-DNGB_PROLOGUE_START=ngb_reg_sub_003443D0','-DNGB_PROLOGUE_CAPTION=ngb_reg_sub_00344AD0']
+   flags=[*flags,'-DNGB_PROLOGUE_START=ngb_reg_sub_003443D0','-DNGB_PROLOGUE_CAPTION=ngb_reg_sub_00344AD0','-DNGB_PROLOGUE_CLEAR=ngb_reg_sub_00231EB0']
    link.insert(1,'-Wl,--wrap=ngb_reg_sub_003443D0,--wrap=ngb_reg_sub_00344AD0')
   if name in ('main.c','scene/bridge.c','vk/backend.cpp','direct/platform.cpp'):
    flags=[*flags,'-DNGB_COMBAT_PERF','-include',str(root/'combat_perf.h')]

@@ -17,7 +17,7 @@ uintptr_t ngb_guest_scalar_fallback(uint32_t a,size_t n){assert(a+n<0x1000000);r
 int xbox_mod_file(const char*a,char*b,size_t c){return 0;}
 typedef uint32_t u32;typedef uint64_t u64;
 typedef struct{u64 held,down;}PadState;typedef int Framebuffer;
-enum{HidNpadButton_A=1,HidNpadButton_B=2,HidNpadButton_Plus=4,HidNpadButton_AnyDown=8,HidNpadButton_AnyUp=16,HidNpadButton_AnyLeft=32,HidNpadButton_AnyRight=64,HidNpadButton_X=128,HidNpadButton_Minus=256};
+enum{HidNpadButton_A=1,HidNpadButton_B=2,HidNpadButton_Plus=4,HidNpadButton_AnyDown=8,HidNpadButton_AnyUp=16,HidNpadButton_AnyLeft=32,HidNpadButton_AnyRight=64,HidNpadButton_X=128,HidNpadButton_Minus=256,HidNpadButton_Y=512,HidNpadButton_ZL=1024,HidNpadButton_ZR=2048};
 #define padGetButtons(p) ((p)->held)
 #define padGetButtonsDown(p) ((p)->down)
 static u32 pixels_out[1280*720];static u64 timer;
@@ -29,9 +29,8 @@ static u32 pixels_out[1280*720];static u64 timer;
 #define ngb_ohci_pad_sample(...) ((void)0)
 #define svcSleepThread(...) ((void)0)
 static atomic_uint commands;
-static bool envHasNextLoad(void){return false;}
-static int envSetNextLoad(const char *path,const char *args){(void)path;(void)args;return 1;}
-#define R_FAILED(rc) ((rc)!=0)
+static unsigned menu_requests;
+void ngb_request_main_menu(void){++menu_requests;}
 #define NGB_GPU_PRESENT 1
 static unsigned displayed;
 unsigned ngb_scanout_display_count(void){return displayed;}
@@ -85,13 +84,43 @@ static void compare_display(unsigned view){
  assert(present_screen(view,NULL)==1);
 }
 static void key(unsigned k){PadState pad={k,k};assert(settings_input(&pad));}
+static void check_exit_choices(void){
+ uint8_t report[20]={0,20};
+ report[7]=255; /* Switch Y, the second confirm button. */
+ assert(ngb_switch_exit_report(1,report) && atomic_load(&panel)==EXIT_PANEL);
+ key(0);key(HidNpadButton_AnyDown);key(HidNpadButton_A);
+ assert(atomic_load(&panel)==(EXIT_PANEL|EXIT_CONFIRM|1));
+ key(HidNpadButton_A);assert(atomic_load(&panel)==(EXIT_PANEL|1)); /* default No */
+ key(HidNpadButton_Y);key(HidNpadButton_AnyRight);key(HidNpadButton_B);
+ assert(atomic_load(&panel)==(EXIT_PANEL|1));
+ key(HidNpadButton_A);key(HidNpadButton_AnyLeft);key(HidNpadButton_Y);
+ assert(!menu_requests && !atomic_load(&commands));
+ key(0);assert(menu_requests==1 && !atomic_load(&panel) && !atomic_load(&commands));
+ ngb_switch_exit_report(0,report);
+ report[4]=255;assert(ngb_switch_exit_report(1,report));key(0);
+ PadState trigger={HidNpadButton_ZL,HidNpadButton_ZL};
+ assert(!settings_input(&trigger) && !atomic_load(&panel));
+ ngb_switch_exit_report(0,report);
+ report[4]=255;assert(ngb_switch_exit_report(1,report));
+ key(0);key(HidNpadButton_A);key(0);
+ assert(!atomic_load(&panel) && ngb_switch_exit_report(1,report) && report[2]==16);
+ ngb_switch_exit_report(0,report);
+ report[4]=255;assert(ngb_switch_exit_report(1,report));
+ key(0);key(HidNpadButton_AnyUp);key(HidNpadButton_A);key(HidNpadButton_A);
+ assert(!atomic_load(&commands)); /* Quit also defaults to No. */
+ key(HidNpadButton_A);key(HidNpadButton_AnyLeft);key(HidNpadButton_A);
+ assert(atomic_exchange(&commands,0)==EXIT_GAME && menu_requests==1);
+ atomic_store(&panel,0);ngb_switch_exit_report(0,report);
+}
 int main(int argc,char**argv){
  assert(argc==2);ngb_fast_ram=calloc(1,0x1000000);prefs_load();assert(ngb_bind_third_person_start());
  FILE *legacy=fopen(PREF_FILE,"w");assert(legacy);fputs("third_person=0\nthird_y=1\n",legacy);assert(!fclose(legacy));
  prefs_load();assert(ngb_bind_third_person_start() && pref(51));
  assert(prefs_save(46,0));prefs_load();assert(!ngb_bind_third_person_start() && pref(51));
  assert(prefs_save(255,0));assert(ngb_bind_third_person_start() && !pref(51));
- assert(pref(24)&&!pref(44));atomic_store(&panel,PANEL);key(0);
+ assert(pref(24)&&!pref(44));atomic_store(&panel,PANEL);
+ key(HidNpadButton_Y);key(HidNpadButton_Y|HidNpadButton_A);
+ assert(atomic_load(&panel)==PANEL);key(0);
  /* Enter each category and scroll every row, including fixed targets and the
   * last controls row. The first/last page navigation must wrap independently. */
  for(unsigned c=0;c<PAGES;c++){
@@ -120,8 +149,11 @@ int main(int argc,char**argv){
  atomic_store(&value[5],1);game_overlay(pixels_out,1280,NULL);
  timer+=500000;displayed+=20;compare_display(0);
  compare_display(EXIT_PANEL|EXIT_CONFIRM|1);
+ compare_display(EXIT_PANEL|EXIT_CONFIRM|EXIT_YES|2);
+ compare_display(EXIT_PANEL|1);
  atomic_store(&exit_preview,true);compare_display(0);atomic_store(&exit_preview,false);
+ check_exit_choices();
  MEM16(0x58a572)=1;assert(!ngb_bow_aiming());MEM16(0x58a572)=0xf8;atomic_store(&value[24],0);assert(!ngb_bow_aiming());atomic_store(&value[24],1);
  ngb_camera_frame();ngb_camera_frame();assert(!ngb_bow_aiming());s_fp_seen=s_frame;MEM8(0x4b7640)=32;assert(!ngb_bow_aiming());
- printf("PASS: %d settings, menu -> persisted bow setting; real game sprite, four bows + Strongbow, HUD, view timeout and no player.\n",(int)COUNT);
+ printf("PASS: %d settings, pause Exit choices and confirmation, persisted bow setting, real game sprite, four bows + Strongbow, HUD, view timeout and no player.\n",(int)COUNT);
 }

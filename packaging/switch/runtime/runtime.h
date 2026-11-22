@@ -13,6 +13,7 @@ void ngb_device_return(uint32_t result);
 void ngb_checkpoint(uint32_t va);
 void ngb_poll(void);
 uint64_t ngb_elapsed_ns(void);
+void ngb_graphics_wait_until(uint64_t nanoseconds);
 void ngb_kernel_log(const char *message);
 void ngb_scene_log_begin(void);
 void ngb_scene_log_end(void);

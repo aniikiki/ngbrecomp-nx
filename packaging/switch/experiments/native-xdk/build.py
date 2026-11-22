@@ -89,21 +89,21 @@ elif sys.argv[1] == 'host':
             name = Path(value).stem + '.c.o'
             link[i] = str(out / name if not control and name in ('recomp_0028.c.o','recomp_0044.c.o','recomp_0045.c.o') else manifest[name])
     link[1:1] = [str(full / 'entry.o'), str(full / 'gates.o'), str(base / 'native-regs/checkpoint.o')]
+    prologue_flags = []
     if not control:
+        # Use the player's Sofdec hooks so New Game exercises the native decoder in replays.
+        start, caption = 'ngb_reg_sub_003443D0', 'ngb_reg_sub_00344AD0'
+        link.insert(1, f'-Wl,--wrap={start},--wrap={caption}')
+        prologue_flags = [f'-DNGB_PROLOGUE_START={start}', f'-DNGB_PROLOGUE_CAPTION={caption}',
+                          '-DNGB_PROLOGUE_CLEAR=ngb_reg_sub_00231EB0']
         link_disc_archives(root, out, link)
-        from menu_profile import link_menu_profile
+        from menu_profile import link_button_prompts, link_menu_profile
         link_menu_profile(root, out, link, next(c for c in commands if c[-1].endswith('/runtime_test.c')), host, 'objcopy')
+        link_button_prompts(root, out, link, 'objcopy')
     def compile_source(name, source=None, flags=()):
         if name == 'ohci_boot.c':
-            # Host collector only: accept Xbox letter names directly, without
-            # the handheld's face-button swap. The Switch source is unchanged.
-            source = '#include <stdlib.h>\n' + (runtime / name).read_text()
-            needle = '    unsigned routed=(held & ~face_swapped)'
-            assert source.count(needle) == 1
-            source = source.replace(needle, '''    static int replay_xbox = -1;
-    if (replay_xbox < 0) replay_xbox = getenv("NGB_REPLAY_XBOX_LAYOUT") != NULL;
-    if (replay_xbox) face_swapped = 0;
-''' + needle)
+            # Some recorded scripts supply Xbox buttons directly.
+            flags = [*flags, '-DNGB_REPLAY_PAD_LAYOUT']
         if name == 'vk/backend.cpp':
             flags = [*flags, '-DNGB_D3D_CACHE_EPOCH="' + compatibility()['epoch'] + '"']
             if record_prewarm:
@@ -152,7 +152,7 @@ elif sys.argv[1] == 'host':
     link[link.index(str(base / 'core-perf/exact-runtime_test.c.o'))] = obj
     # Replace object inputs already present in the old link, or precede archives.
     for name, source, flags in [
-        ('files.c', None, ()), ('files_bridge.c', None, ()), ('identity.c', None, ()), ('opening_movie.c', None, ()),
+        ('files.c', None, ()), ('files_bridge.c', None, ()), ('identity.c', None, ()), ('opening_movie.c', None, prologue_flags),
         ('ohci_boot.c', None, ()), ('pgraph_boot.c', None, ('-Wno-unused-variable',)),
         ('nv2a_boot.c', None, ()),
         ('scanout.c', None, ()),
@@ -196,8 +196,10 @@ elif sys.argv[1] == 'host':
     inputs += [root / 'src/d3d' / n for n in ('native_diag.h','native_diag.inc','native_pacing.h')]
     inputs += [root / 'src/d3d/vk/cache_writer.h']
     inputs += [root / 'src/d3d' / n for n in ('native_mesh.inc','native_simple.inc','gpu/prepared.h','gpu/backend.h')]
-    inputs += [runtime / 'direct' / n for n in ('native_mesh.inc','native_model.inc','disc_archives.S','menu_profile.S')]
-    inputs += [runtime / n for n in ('workers.inc','combat_perf.h','combat_perf.inc','files.c','files.h','files_bridge.c','files_bridge.h','disc_reads.inc','disc_names.inc','ohci_boot.c','menu_profile.inc')]
+    inputs += [runtime / 'direct' / n for n in ('native_mesh.inc','native_model.inc','disc_archives.S','menu_profile.S','button_prompts.S')]
+    inputs += [runtime / 'button_prompts.c']
+    inputs += [runtime / n for n in ('workers.inc','combat_perf.h','combat_perf.inc','files.c','files.h','files_bridge.c','files_bridge.h','disc_reads.inc','disc_names.inc','ohci_boot.c','ohci_boot.h','opening_movie.c','prologue_stream.inc','menu_profile.inc')]
+    inputs += [runtime / n for n in ('movie_audio.inc','audio_output.h','audio_output.inc')]
     if diagnostics:
         inputs += [experiment / 'story_gpu.inc']
     inputs += list(experiment.glob('*.py')) + [experiment / n for n in ('replay.c','native_contract.inc','native_lifetime_contract.inc','native_header_contract.inc','native_effect_contract.inc','test_pacing.cpp','test_combat_writer.c','test_material.cpp','test_mesh.cpp','test_simple.cpp')]

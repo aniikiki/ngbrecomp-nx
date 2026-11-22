@@ -11,6 +11,7 @@ parser.add_argument('output', type=Path, help='new report directory under build/
 parser.add_argument('--control', action='store_true')
 parser.add_argument('--checks', action='store_true')
 parser.add_argument('--newgame', action='store_true')
+parser.add_argument('--prologue', action='store_true', help='verify New Game movie motion and the first three subtitle starts in order')
 parser.add_argument('--attract', action='store_true', help='leave the controller idle for the title battle demo')
 parser.add_argument('--diagnostics', action='store_true')
 parser.add_argument('--binary', type=Path, help='use an archived replay executable under build/')
@@ -33,6 +34,9 @@ parser.add_argument('--material', choices=('0', '1', 'ab'), default='1', help='n
 parser.add_argument('--mesh', choices=('0', '1', 'ab'), default='1')
 parser.add_argument('--mesh-verify', action='store_true', help='verify prepared state and every skipped recorder range')
 args = parser.parse_args()
+if args.prologue:
+    args.newgame = True
+    assert not (args.control or args.checks)
 if args.validation:
     check = ['docker', 'run', '--rm', '--memory=1g', args.image, 'python3', '-c',
              "from pathlib import Path; assert any(Path(p).exists() for p in "
@@ -72,6 +76,8 @@ env = {
 }
 if args.native_glow is not None:
     env['NGB_D3D_NATIVE_GLOW'] = args.native_glow
+if args.prologue:
+    env['NGB_REPLAY_PROLOGUE'] = '1'
 if args.frames:
     assert args.frames > 0
     env['NGB_REPLAY_FRAMES'] = str(args.frames)
@@ -112,7 +118,10 @@ command += [args.image, 'timeout', str(args.seconds + 120),
 with (output / 'log.txt').open('w') as log:
     result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT)
 text = (output / 'log.txt').read_text(errors='replace')
-passed = result.returncode == 0 and ('[CONTRACT-PASS]' if args.checks else '[REPLAY-PASS]') in text
+marker = '[CONTRACT-PASS]' if args.checks else '[REPLAY-PASS]'
+if args.prologue:
+    marker = '[PROLOGUE-PASS]'
+passed = result.returncode == 0 and marker in text
 validation_errors = sum(text.count(marker) for marker in ('Validation Error', 'SYNC-HAZARD', 'VUID-'))
 if args.validation and validation_errors: passed = False
 report = {'passed': passed, 'exit_code': result.returncode, 'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
