@@ -123,6 +123,9 @@ static void sample_menu_frame(void)
 {
     bool active=atomic_load(&menu_input);
     if (active!=menu_drawn) {
+#ifdef NGB_NATIVE_DIAG
+        if (ngb_combat_enabled) ngb_combat_menu_visible(menu_drawn);
+#endif
         atomic_exchange(&menu_edges,0);
         atomic_store(&direction_ns,0);
         atomic_store(&menu_input,menu_drawn);
@@ -275,8 +278,10 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     if (ngb_combat_enabled) {
         static bool menu_confirm_held;
         bool down=out[4] || (out[2]&16) || out[6];
-        if (down && !menu_confirm_held && atomic_load(&menu_input) && last_cursor==0)
-            ngb_combat_new_game_press();
+        if (down && !menu_confirm_held && atomic_load(&menu_input)) {
+            if (last_cursor==0) ngb_combat_new_game_press();
+            if (last_cursor==2) ngb_combat_mission_press();
+        }
         menu_confirm_held=down;
     }
 #endif

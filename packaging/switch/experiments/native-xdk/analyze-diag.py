@@ -10,6 +10,7 @@ import csv
 import json
 from pathlib import Path
 from statistics import mean, median
+from present_timing import gpu_ns_per_unit
 
 
 def load(path):
@@ -19,11 +20,14 @@ def load(path):
             continue
         kind, *values = line
         if kind == '#SESSION':
-            sessions.append(dict(version=values[0], schemas={}, rows=defaultdict(list), lost=Counter(), malformed=0))
+            sessions.append(dict(version=values[0], schemas={}, rows=defaultdict(list), lost=Counter(),
+                                 vsync_errors=[], malformed=0))
         elif sessions:
             s = sessions[-1]
             if kind == '#LOST':
                 s['lost'][values[0]] += int(values[1])
+            elif kind == '#VSYNC_ERROR':
+                s['vsync_errors'].append(int(values[0]))
             elif kind.startswith('#'):
                 s['schemas'][kind[1:]] = values
             elif kind in s['schemas']:
@@ -65,6 +69,50 @@ def verify(s):
         total = sum(value for name, value in t.items() if name.endswith('_ns'))
         assert total <= a['frame_wall_us']*1000 + 999, ('overlapping timers', a, t)
     assert len(r['T']) == sum(a['profiled'] for a in n.values()), 'missing detailed samples'
+    if 'native_filter_enabled' in s['schemas'].get('E', ()):
+        for e in r['E']:
+            assert e['eligible_draws'] == e['opaque_p8_draws'] + e['soft_a8_draws']
+            assert e['native_filter_enabled'] in (0, 1)
+    for window in r.get('O', ()):
+        assert window['min_images'] <= window['requested_images'] <= window['actual_images']
+        assert not window['max_images'] or window['actual_images'] <= window['max_images']
+    if 'A' in s['schemas']:
+        phase_calls = [k for k in s['schemas']['A'] if k.endswith('_calls') and k not in ('omitted_calls','screen_mix_calls')]
+        details = set()
+        for a in r['A']:
+            frame = a['submit_frame']
+            assert frame % 4 == 2 and a['material_detail'] == int(frame % 8 == 6), ('GPU sample cadence', a)
+            assert a['spans'] + a['omitted_calls'] <= sum(a[k] for k in phase_calls), ('GPU span counts', a)
+            assert not a['valid'] or a['spans'] > 0
+            if 'screen_mix_ns' in a:
+                assert a['screen_mix_calls'] <= sum(a[k] for k in phase_calls)
+                assert a['screen_mix_ns'] <= sum(a[k[:-6]+'_ns'] for k in phase_calls)
+            if a['valid'] and a['material_detail']:
+                details.add(frame)
+        material_phases = range(6) if 'pixel_shader' in s['schemas'].get('L', ()) else (1, 2)
+        for m in r['L']:
+            assert m['submit_frame'] in details and m['phase'] in material_phases, ('orphan material group', m)
+            assert 0 < m['spans'] <= m['calls']
+    if 'Y' in s['schemas']:
+        acquired = {h['begin_us'] for h in r['H'] if h['slot_ready'] and h['image_ready']}
+        for y in r['Y']:
+            assert y['begin_us'] in acquired, ('window sample without acquire', y)
+            assert y['valid'] in (0, 1) and (y['valid'] or not y['window_gpu_ns'])
+            if 'source_frame' in y:
+                assert y['begin_us'] <= y['window_submit_us'] <= y['queue_present_end_us']
+                assert not y['source_frame'] or 0 < y['scene_submit_us'] <= y['window_submit_us']
+                if y['valid']:
+                    assert abs(y['gpu_end_ns']-y['gpu_start_ns']-y['window_gpu_ns']) <= 2
+        for h in r['H']:
+            if 'release_fence_us' in h:
+                assert sum(h[k] for k in ('dequeue_us','release_event_us','release_fence_us')) <= h['image_wait_us']+2
+    for q in r['Q']:
+        if 'gpu_start_ns' in q and q['valid']:
+            assert q['gpu_end_ns']-q['gpu_start_ns'] >= q['gpu_us']*1000-2
+    for k in r.get('K', ()):
+        assert k['host_after_us'] >= k['host_before_us']
+    for edge in r.get('S', ()):
+        assert edge['vsync_wake_us'] >= edge['wait_start_us']
 
 
 def report(sessions, start=None, end=None):
@@ -117,9 +165,14 @@ def report(sessions, start=None, end=None):
         queries[q['submit_frame']].append(q)
     rendered = {a['present']: a for a in r['R']}
     matched = [rendered[n['native_frame']] for n in frames if n['native_frame'] in rendered]
-    costs = [sum(q['gpu_us'] for q in queries[a['present']]) for a in matched
+    measured_scale = gpu_ns_per_unit(r.get('K', ()))
+    scale = measured_scale or 1
+    costs = [scale * sum(q['gpu_us'] for q in queries[a['present']]) for a in matched
         if queries[a['present']] and all(q['valid'] for q in queries[a['present']])]
     result['render'] = dict(matched_frames=len(matched), valid_gpu_frames=len(costs), gpu=stats(costs),
+        gpu_ns_per_log_unit=measured_scale,
+        mean_command_buffers=mean(len(queries[a['present']]) for a in matched) if matched else None,
+        max_command_buffers=max((len(queries[a['present']]) for a in matched), default=0),
         mean_drawn=mean(a['drawn'] for a in matched) if matched else None,
         compile_us=sum(a['compile_us'] for a in matched), shaders=sum(a['shaders'] for a in matched),
         pipelines=sum(a['pipelines'] for a in matched),
@@ -136,6 +189,7 @@ def report(sessions, start=None, end=None):
         'N waits and T are exclusive scheduled wall time, pausing when another guest worker runs. They are not CPU attribution.',
         'T hot scopes sample one frame in 32; rare coarse waits are timed every recorded frame.',
         'Readback B runs on the render thread. Its time overlaps the guest readback wait; do not add them.',
+        'From 0.57.9, asynchronous chunks share a frame ID. Their Q rows count each covered GPU interval once, excluding gaps between submissions.',
     ]
     return s, result
 
@@ -144,25 +198,54 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('capture', type=Path)
     parser.add_argument('--verify', action='store_true')
-    parser.add_argument('--expect-no-vsync', action='store_true', help='verify immediate late submission and disabled refresh alignment')
+    parser.add_argument('--expect-no-vsync', action='store_true', help='verify guest pacing and immediate window presentation')
+    parser.add_argument('--expect-guest-no-vsync', action='store_true', help='check guest pacing alone, including captures without a window')
     parser.add_argument('--json', type=Path)
+    parser.add_argument('--story', action='store_true', help='compare New Game entries, full charges and Alma sword landing candidates in each boot')
+    parser.add_argument('--frames', type=int, nargs=2, action='append', default=[],
+                        metavar=('FIRST','LAST'), help='include this inclusive guest-flip window in --story output')
     parser.add_argument('--start', type=float, help='inclusive seconds since boot (not since first combat row)')
     parser.add_argument('--end', type=float, help='exclusive seconds since boot')
     args = parser.parse_args()
+    if args.frames and (not args.story or any(first<0 or last<first for first,last in args.frames)):
+        parser.error('--frames requires --story and an inclusive range of nonnegative flip numbers')
     if args.start is not None and args.end is not None and args.end <= args.start:
         parser.error('--end must be later than --start')
-    session, result = report(load(args.capture), args.start, args.end)
+    sessions = load(args.capture)
+    if args.story:
+        if args.expect_no_vsync or args.expect_guest_no_vsync or args.start is not None or args.end is not None:
+            parser.error('--story compares complete sessions')
+        from story_perf import story_report
+        if args.verify:
+            for session in sessions:
+                if session['rows']['N']:
+                    verify(session)
+        result = {'sessions': [story_report(s, args.frames) for s in sessions]}
+        output = json.dumps(result, indent=2)
+        if args.json:
+            args.json.write_text(output+'\n')
+        print(output)
+        raise SystemExit(0)
+    session, result = report(sessions, args.start, args.end)
     if args.verify:
         verify(session)
         result['verified'] = True
-    if args.expect_no_vsync:
+    if args.expect_no_vsync or args.expect_guest_no_vsync:
         swaps = session['rows']['V']
         assert swaps and all(v['periods'] == 0 and v['retargeted'] == 0 for v in swaps)
         for before, after in zip(swaps, swaps[1:]):
             if after['native_frame'] == before['native_frame']+1 and after['entry_us']-before['present_start_us'] > 17000:
                 assert after['wait_wall_us'] == 0, ('late frame was paced', before, after)
+        result['guest_no_vsync_verified'] = True
+        result['notes'].append('Guest swaps use an independent 60 fps ceiling.')
+    if args.expect_no_vsync:
+        windows = session['rows']['O']
+        assert windows, 'no window present mode recorded'
+        for window in windows:
+            assert window['present_mode'] == 0, ('window did not request VK_PRESENT_MODE_IMMEDIATE_KHR', window)
+            if 'native_swap_interval' in window:
+                assert window['native_swap_interval'] == 0, ('Switch window still waits for display refresh', window)
         result['no_vsync_verified'] = True
-        result['notes'].append('Refresh alignment is disabled. Any V wait remaining is the independent 60 fps ceiling.')
     output = json.dumps(result, indent=2)
     if args.json:
         args.json.write_text(output+'\n')

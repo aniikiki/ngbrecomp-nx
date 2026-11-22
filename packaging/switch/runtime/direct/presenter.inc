@@ -8,6 +8,11 @@
 #include <vector>
 #ifdef __SWITCH__
 #include <vulkan/vulkan_vi.h>
+#ifdef NGB_WSI_WAIT_TRACE
+#include <switch/display/native_window.h>
+#include <switch/nvidia/gpu.h>
+#include "acquire_trace.inc"
+#endif
 #else
 extern "C" VkResult ngb_display_test_surface(VkInstance, void*, VkSurfaceKHR*);
 #endif
@@ -24,7 +29,12 @@ struct Slot {
     VmaAllocation allocation{};
     uint32_t* mapped{};
 #if defined(NGB_COMBAT_PERF) && defined(NGB_NATIVE_DIAG)
-    struct { uint64_t begin_us, generation, lock_us, submit_us, present_us; bool timed; } sample{};
+    struct {
+        uint64_t begin_us, generation, lock_us, submit_us, present_us;
+        uint64_t scene_submit_us, submit_end_us, present_end_us;
+        uint32_t source_frame, image_index, present_result;
+        bool timed;
+    } sample{};
 #endif
 };
 struct WindowImage {
@@ -47,6 +57,9 @@ struct Window {
     VkQueryPool timestamps{};
     double period_ns{};
     uint64_t tick_mask{};
+#ifdef NGB_WSI_WAIT_TRACE
+    uint64_t next_clock_sample{};
+#endif
 #endif
 };
 struct Context {
@@ -82,6 +95,25 @@ bool check(VkResult rc, const char* call) {
 #define DISPLAY_VK(call) check((call), #call)
 
 #if defined(NGB_COMBAT_PERF) && defined(NGB_NATIVE_DIAG)
+struct {
+    VkImage image{};
+    uint32_t frame{};
+    uint64_t submit_us{};
+} screen_write; // Protected by submissions, including during the window submit.
+
+#ifdef NGB_WSI_WAIT_TRACE
+void sample_device_clock() {
+    uint64_t before = ngb_elapsed_ns();
+    if (before < win.next_clock_sample) return;
+    u64 gpu = 0;
+    Result rc = nvGpuGetTimestamp(&gpu);
+    uint64_t after = ngb_elapsed_ns();
+    uint64_t values[]{before/1000, gpu, after/1000, rc};
+    ngb_combat_row('K', values, 4);
+    win.next_clock_sample = after + 1000000000;
+}
+#endif
+
 void create_window_timer() {
     uint32_t count = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(ctx.physical, &count, nullptr);
@@ -107,13 +139,16 @@ void read_window_sample(Slot& slot, unsigned first) {
     const bool valid = s.timed && ctx.d->vkGetQueryPoolResults(ctx.device, win.timestamps, first, 2,
         sizeof(t), t, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS;
     const uint64_t ns = valid ? uint64_t(double((t[1] - t[0]) & win.tick_mask) * win.period_ns) : 0;
-    uint64_t values[]{s.begin_us, s.generation, s.lock_us, s.submit_us, s.present_us, ns, valid};
-    ngb_combat_row('Y', values, 7);
+    uint64_t values[]{s.begin_us, s.generation, s.lock_us, s.submit_us, s.present_us, ns, valid,
+        s.source_frame, s.image_index, s.scene_submit_us, s.submit_end_us, s.present_end_us,
+        valid ? uint64_t(double(t[0] & win.tick_mask) * win.period_ns) : 0,
+        valid ? uint64_t(double(t[1] & win.tick_mask) * win.period_ns) : 0, s.present_result};
+    ngb_combat_row('Y', values, sizeof values/sizeof *values);
     slot.sample = {};
 }
 #endif
 
-void release_window() {
+void release_window(bool ui = false) {
     disable();
     if (!ctx.device) return;
     const auto& d = *ctx.d;
@@ -122,6 +157,10 @@ void release_window() {
         d.vkQueueWaitIdle(ctx.queue);
     }
     for (auto& slot : win.slots) {
+#if defined(NGB_COMBAT_PERF) && defined(NGB_NATIVE_DIAG)
+        // Only the UI thread produces display rows in the recorder's ring.
+        if (ui && slot.sample.begin_us) read_window_sample(slot, 2 * (&slot - win.slots.data()));
+#endif
         if (slot.done) d.vkDestroyFence(ctx.device, slot.done, nullptr);
         if (slot.acquired) d.vkDestroySemaphore(ctx.device, slot.acquired, nullptr);
         if (slot.pixels) vmaDestroyBuffer(ctx.allocator, slot.pixels, slot.allocation);
@@ -271,7 +310,8 @@ bool create_window(void* window) {
     info.imageExtent = extent; info.imageArrayLayers = 1; info.imageUsage = usage;
     info.preTransform = caps.currentTransform;
     info.compositeAlpha = static_cast<VkCompositeAlphaFlagBitsKHR>(caps.supportedCompositeAlpha & -caps.supportedCompositeAlpha);
-    info.presentMode = VK_PRESENT_MODE_FIFO_KHR; info.clipped = VK_TRUE;
+    info.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    info.clipped = VK_TRUE;
     if (!DISPLAY_VK(d.vkCreateSwapchainKHR(ctx.device, &info, nullptr, &win.chain))) return false;
     if (!DISPLAY_VK(d.vkGetSwapchainImagesKHR(ctx.device, win.chain, &count, nullptr)) || !count) return false;
     std::vector<VkImage> images(count);
@@ -308,7 +348,20 @@ bool create_window(void* window) {
         if (!DISPLAY_VK(vmaCreateBuffer(ctx.allocator, &buf, &mem, &slot.pixels, &slot.allocation, &alloc))) return false;
         slot.mapped = static_cast<uint32_t*>(alloc.pMappedData);
     }
-    return create_pipeline();
+    if (!create_pipeline()) return false;
+#if defined(NGB_COMBAT_PERF) && defined(NGB_NATIVE_DIAG)
+    if (ngb_combat_enabled) {
+        uint64_t values[]{
+            ngb_elapsed_ns()/1000, caps.minImageCount, caps.maxImageCount,
+            info.minImageCount, count, win.slots.size(), uint32_t(info.presentMode),
+#ifdef __SWITCH__
+            native->swap_interval,
+#endif
+        };
+        ngb_combat_row('O', values, sizeof values/sizeof *values);
+    }
+#endif
+    return true;
 }
 
 void transition(VkCommandBuffer cmd, VkImage image, VkImageLayout from, VkImageLayout to) {
@@ -354,7 +407,7 @@ bool record(const NgbScreenFrame& frame, Slot& slot, WindowImage& dst, Picture g
     const auto& d = *ctx.d;
     const bool gpu = frame.gpu && game.image && !frame.blank;
     const bool software = !frame.gpu && frame.cpu_bgra && !frame.blank;
-    const uint32_t left = frame.standard ? 160u : 0u, width = NGB_SCREEN_W - 2 * left;
+    const uint32_t width = ngb_picture_width(frame.standard), left = (NGB_SCREEN_W - width) / 2;
     if (!upload_layers(frame, slot, software)) return false;
     VkCommandBuffer cmd = slot.cmd;
     if (!DISPLAY_VK(d.vkResetCommandBuffer(cmd, 0))) return false;
@@ -446,7 +499,7 @@ bool start(void* window) {
     return true;
 }
 int rebuild() {
-    release_window();
+    release_window(true);
     return start(ctx.window) ? 0 : -1;
 }
 
@@ -458,11 +511,21 @@ int present(const NgbScreenFrame& frame, uint64_t* times) {
 #if defined(NGB_COMBAT_PERF) && defined(NGB_NATIVE_DIAG)
     const bool trace = times && frame.gpu && !frame.blank && ngb_combat_enabled && ngb_combat_active();
     const unsigned generation = trace ? ngb_scanout_generation() : 0;
+#ifdef NGB_WSI_WAIT_TRACE
+    AcquireTrace wait{};
+#endif
     auto log_wait = [&](uint64_t slot_end, uint64_t image_end, bool reusable, bool acquired) {
         uint64_t values[] = {begin / 1000, generation, ngb_scanout_generation(),
                              (slot_end - begin) / 1000, (image_end - slot_end) / 1000,
-                             uint64_t(reusable), uint64_t(acquired)};
-        ngb_combat_row('H', values, 7);
+                             uint64_t(reusable), uint64_t(acquired),
+#ifdef NGB_WSI_WAIT_TRACE
+                             wait.dequeue.ns/1000, wait.release_event.ns/1000, wait.release_fence.ns/1000,
+                             wait.dequeue.calls, wait.release_event.calls, wait.release_fence.calls
+#else
+                             0, 0, 0, 0, 0, 0
+#endif
+        };
+        ngb_combat_row('H', values, sizeof values/sizeof *values);
     };
 #endif
     VkResult fence = d.vkWaitForFences(ctx.device, 1, &slot.done, VK_TRUE, 20000000);
@@ -473,7 +536,13 @@ int present(const NgbScreenFrame& frame, uint64_t* times) {
     if (fence == VK_TIMEOUT) return 0;
     if (!check(fence, "display slot fence")) return -1;
     uint32_t index;
+#ifdef NGB_WSI_WAIT_TRACE
+    if (trace) active_acquire = &wait;
+#endif
     VkResult acq = d.vkAcquireNextImageKHR(ctx.device, win.chain, 20000000, slot.acquired, VK_NULL_HANDLE, &index);
+#ifdef NGB_WSI_WAIT_TRACE
+    if (trace) active_acquire = nullptr;
+#endif
     uint64_t acquired = times ? ngb_elapsed_ns() : 0;
 #if defined(NGB_COMBAT_PERF) && defined(NGB_NATIVE_DIAG)
     if (trace) log_wait(slot_end, acquired, true, acq == VK_SUCCESS || acq == VK_SUBOPTIMAL_KHR);
@@ -486,9 +555,10 @@ int present(const NgbScreenFrame& frame, uint64_t* times) {
     auto& image = win.images[index];
     const auto game = latest_picture();
 #if defined(NGB_COMBAT_PERF) && defined(NGB_NATIVE_DIAG)
-    const bool sample = trace && game.image && (win.next % 8 == 0);
+    const bool sample = trace && game.image;
     if (sample) {
         slot.sample.generation = ngb_scanout_generation();
+        slot.sample.image_index = index;
         slot.sample.timed = win.timestamps != VK_NULL_HANDLE;
     }
 #endif
@@ -511,7 +581,13 @@ int present(const NgbScreenFrame& frame, uint64_t* times) {
     {
         std::lock_guard queue_lock(submissions);
 #if defined(NGB_COMBAT_PERF) && defined(NGB_NATIVE_DIAG)
-        if (sample) locked = ngb_elapsed_ns();
+        if (sample) {
+            locked = ngb_elapsed_ns();
+            if (screen_write.image == game.image) {
+                slot.sample.source_frame = screen_write.frame;
+                slot.sample.scene_submit_us = screen_write.submit_us;
+            }
+        }
 #endif
         if (!DISPLAY_VK(d.vkQueueSubmit(ctx.queue, 1, &sub, slot.done))) return -1;
 #if defined(NGB_COMBAT_PERF) && defined(NGB_NATIVE_DIAG)
@@ -528,6 +604,12 @@ int present(const NgbScreenFrame& frame, uint64_t* times) {
         slot.sample.lock_us = (locked - locking) / 1000;
         slot.sample.submit_us = (submitted - locked) / 1000;
         slot.sample.present_us = (presented - submitted) / 1000;
+        slot.sample.submit_end_us = submitted / 1000;
+        slot.sample.present_end_us = presented / 1000;
+        slot.sample.present_result = uint32_t(shown);
+#ifdef NGB_WSI_WAIT_TRACE
+        sample_device_clock();
+#endif
     }
 #endif
     ++win.next;
@@ -544,6 +626,11 @@ int present(const NgbScreenFrame& frame, uint64_t* times) {
 } // namespace
 
 std::mutex& queue_mutex() { return submissions; }
+#if defined(NGB_COMBAT_PERF) && defined(NGB_NATIVE_DIAG)
+void note_screen_write(VkImage image, uint32_t frame) {
+    screen_write = {image, frame, ngb_elapsed_ns()/1000};
+}
+#endif
 void attach(VkInstance instance, VkPhysicalDevice physical, VkDevice device, VkQueue queue,
             uint32_t family, const VolkDeviceTable& d, VmaAllocator allocator) {
     std::lock_guard lock(lifecycle);
@@ -554,6 +641,9 @@ void detach(VkDevice device) {
     if (!device || ctx.device != device) return;
     release_window();
     { std::lock_guard picture_lock(picture_mutex); picture = VK_NULL_HANDLE; }
+#if defined(NGB_COMBAT_PERF) && defined(NGB_NATIVE_DIAG)
+    { std::lock_guard queue_lock(submissions); screen_write = {}; }
+#endif
     ctx = {};
 }
 bool active() { return enabled.load(); }
@@ -582,7 +672,7 @@ extern "C" int ngb_display_open(void* window) {
 extern "C" void ngb_display_close() {
     using namespace switch_display;
     std::lock_guard lock(lifecycle);
-    release_window();
+    release_window(true);
 }
 extern "C" int ngb_display_present(const NgbScreenFrame* frame, uint64_t times[3]) {
     using namespace switch_display;

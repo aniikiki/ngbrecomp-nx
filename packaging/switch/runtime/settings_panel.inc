@@ -19,7 +19,7 @@ int ngb_switch_setting(unsigned i) {
     if (i>=sizeof value/sizeof value[0]) return 0;
     int v=pref(i);
     switch(i){
-    case 0:return 1+v;
+    case 0:return (int[]){1,NGB_RENDER_720P,2}[v];
     case 1:return v?1<<v:0;
     case 2:case 10:return 1<<v;
     case 20:return v*25;
@@ -29,6 +29,11 @@ int ngb_switch_setting(unsigned i) {
     }
 }
 static bool prefs_save(unsigned,unsigned);
+/* The original file stores 1x as 0 and 2x as 1. Swap 720p and 2x between
+ * menu order and file order on both read and write. */
+static unsigned file_choice(const Preference *p,unsigned v){
+    return p->id==0 && v<3?(unsigned[]){0,2,1}[v]:v;
+}
 static unsigned saved_choice(const Preference *p,unsigned id,unsigned v){return id==255 && p->page==CONTROLS?p->initial:p->id==id?v:(unsigned)pref(p->id);}
 void ngb_switch_toggle_hud(void){if(prefs_save(24,!pref(24)))atomic_fetch_add(&revision,1);}
 int ngb_settings_glow(void){return pref(18);}
@@ -48,7 +53,7 @@ static void prefs_load(void)
         for(unsigned i=0;i<COUNT;i++){
             const Preference *p=settings+i;
             if(!(p->flags&(SESSION|FIXED)) && !strcmp(key,p->key) && v<(unsigned)choices(p))
-                atomic_store(&value[p->id],v);
+                atomic_store(&value[p->id],file_choice(p,v));
         }
     fclose(f);
 }
@@ -58,7 +63,7 @@ static bool prefs_save(unsigned id,unsigned v)
     if (!f) return false;
     int n=1;
     for(unsigned i=0;i<COUNT;i++)if(!(settings[i].flags&(SESSION|FIXED)) &&
-        fprintf(f,"%s=%u\n",settings[i].key,saved_choice(settings+i,id,v))<0) n=0;
+        fprintf(f,"%s=%u\n",settings[i].key,file_choice(settings+i,saved_choice(settings+i,id,v)))<0) n=0;
     int err=fclose(f);
     if (n<=0 || err) { remove(PREF_FILE ".tmp"); return false; }
     if (rename(PREF_FILE ".tmp",PREF_FILE)) {

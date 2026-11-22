@@ -40,7 +40,7 @@ static struct {
     int packed;
     int raw_disk;
     int dismounted;
-    int delete_mark, delete_committed;
+    int delete_mark, delete_committed, system_profile;
     unsigned link_id;
     uint32_t raw_position;
     uint32_t file_limit;
@@ -162,6 +162,8 @@ static int plain_stat(const char *path, struct stat *st)
     return 0;
 #endif
 }
+#include "menu_profile.inc"
+
 static int directory(const char *path)
 {
     struct stat st;
@@ -169,6 +171,7 @@ static int directory(const char *path)
     if (errno != ENOENT) return -1;
     return mkdir(path, 0777);
 }
+#include "disc_names.inc"
 static int object_index(uint32_t token)
 {
     unsigned index = token & (FILE_SLOTS-1);
@@ -191,7 +194,8 @@ static int scan_data(const char *path, unsigned depth)
     DIR *d = opendir(path);
     if (!d) return -1;
     struct dirent *entry;
-    int status = 0;
+    int status = profile_location(path, PROFILE_DIR) ? recover_profile_directory(d, path) : 0;
+    if (status) { closedir(d); return status; }
     while ((entry = readdir(d))) {
         if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
         char child[PATH_CAP]; struct stat st;
@@ -204,14 +208,18 @@ static int scan_data(const char *path, unsigned depth)
     closedir(d);
     return status;
 }
-void ngb_files_close_all(void)
+int ngb_files_close_all(void)
 {
+    store_disc_names();
+    clear_disc_names();
+    name_cache_path[0] = 0;
     ngb_disc_archives_direct = 0;
     for (unsigned i = 0; i < FILE_SLOTS; ++i) {
         if (handles[i].token) ngb_file_close(handles[i].token);
     }
     memset(handles, 0, sizeof(handles));
     memset(links, 0, sizeof(links));
+    return stop_profile();
 }
 FILE *ngb_open_disc_movie(const char *leaf)
 {
@@ -225,7 +233,7 @@ FILE *ngb_open_disc_movie(const char *leaf)
 int ngb_files_init(const char *disc_root, const char *data_root)
 {
     int extracted_disc = 0;
-    ngb_files_close_all();
+    if (ngb_files_close_all()) return -1;
     if (!copy_path(disc, sizeof(disc), disc_root) || !copy_path(data, sizeof(data), data_root)) return -1;
     struct stat st;
     if (plain_stat(disc, &st) || !S_ISDIR(st.st_mode) || load_catalog(&extracted_disc) || directory(data)) return -1;
@@ -263,6 +271,13 @@ int ngb_files_init(const char *disc_root, const char *data_root)
     if (scan_data(data, 0)) return -1;
     ngb_disc_archives_direct = extracted_disc;
     return 0;
+}
+
+int ngb_files_init_indexed(const char *disc_root, const char *data_root, const char *cache_dir)
+{
+    int rc = ngb_files_init(disc_root, data_root);
+    if (!rc && ngb_disc_archives_direct) start_disc_names(cache_dir);
+    return rc;
 }
 
 static uint32_t write_disk_header(unsigned i, const void *buffer, uint32_t length,
@@ -319,6 +334,45 @@ static int cache_formatted(unsigned partition)
     uint64_t fat = (clusters * (clusters < 0xfff0 ? 2 : 4) + 4095) & ~4095ull;
     return (uint64_t)st.st_size >= 4096 + fat + cluster;
 }
+static uint32_t resolve_component(char path[PATH_CAP], const char *leaf, int required, int readonly)
+{
+    struct stat st;
+    char component[PATH_CAP];
+    copy_path(component, sizeof component, leaf);
+    struct name_directory *group = NULL;
+    if (readonly && names_active) {
+        size_t parent_end = strlen(path);
+        const char *relative = path + strlen(disc);
+        if (*relative == '/') ++relative;
+        const char *hit = find_disc_name(*name_slot(relative), leaf);
+        if (hit) {
+            if (!append(path, hit)) return BAD_NAME;
+            if (!plain_stat(path, &st)) return 0;
+            if (errno != ENOENT) return error_status();
+            path[parent_end] = 0;
+        }
+        group = scan_disc_names(path, relative, 0, 0);
+    }
+    if (group) {
+        const char *hit = find_disc_name(group, leaf);
+        if (hit) copy_path(component, sizeof component, hit);
+    } else {
+        DIR *parent = opendir(path);
+        if (!parent) return error_status();
+        struct dirent *entry;
+        while ((entry = readdir(parent))) {
+            if (!strcasecmp(entry->d_name, leaf)) {
+                copy_path(component, sizeof component, entry->d_name);
+                break;
+            }
+        }
+        closedir(parent);
+    }
+    if (!append(path, component)) return BAD_NAME;
+    if (plain_stat(path, &st) && (errno != ENOENT || required)) return error_status();
+    return 0;
+}
+
 static uint32_t resolve(const char *guest, uint32_t root, char out[PATH_CAP], int *readonly, int *volume_root)
 {
     char normalized[PATH_CAP];
@@ -390,21 +444,10 @@ static uint32_t resolve(const char *guest, uint32_t root, char out[PATH_CAP], in
         if (slash) *slash = 0;
         if (!strcmp(tail, "..") || strchr(tail, ':')) return DENIED;
         if (*tail && strcmp(tail, ".")) {
+            if (profile_temp(tail) && profile_location(out, PROFILE_DIR)) return DENIED;
             *volume_root = 0;
-            char component[PATH_CAP];
-            copy_path(component, sizeof(component), tail);
-            DIR *parent = opendir(out);
-            if (!parent) return error_status();
-            struct dirent *entry;
-            while ((entry = readdir(parent))) {
-                if (!strcasecmp(entry->d_name, tail)) {
-                    copy_path(component, sizeof(component), entry->d_name); break;
-                }
-            }
-            closedir(parent);
-            if (!append(out, component)) return BAD_NAME;
-            struct stat st;
-            if (plain_stat(out, &st) && (errno != ENOENT || (slash && slash[1]))) return error_status();
+            uint32_t status = resolve_component(out, tail, slash && slash[1], *readonly);
+            if (status) return status;
         }
         if (!slash) break;
         tail = slash + 1;
@@ -518,6 +561,8 @@ uint32_t ngb_file_open(const char *path, uint32_t root, uint32_t access,
     char native[PATH_CAP]; int readonly = 1, volume_root;
     uint32_t status = resolve(path, root, native, &readonly, &volume_root);
     if (status) return status;
+    int system_profile = !readonly && profile_location(native, PROFILE_DIR "/system.dat");
+    if (system_profile && drain_profile()) return 0xc0000001u;
     if (readonly && (access & (0x40000000u | 0x10000000u | 6u))) return DENIED;
     /* XDeleteSaveGame opens each child relative to the slot directory. Its
      * DELETE handles also request SYNCHRONIZE, WRITE_ATTRIBUTES and, for a
@@ -586,6 +631,10 @@ uint32_t ngb_file_open(const char *path, uint32_t root, uint32_t access,
     handles[slot].volume_root = volume_root;
     handles[slot].readonly = readonly; handles[slot].access = access; handles[slot].share = share;
     copy_path(handles[slot].path, sizeof(handles[slot].path), native);
+    if (system_profile) {
+        profile.path[0] = 0;
+        handles[slot].system_profile = !isdir;
+    }
     *handle = handles[slot].token; *information = created ? 2 : overwrite ? 3 : 1;
     return 0;
 }
@@ -631,6 +680,7 @@ uint32_t ngb_file_close(uint32_t handle)
     int rc = handles[i].link_id || handles[i].raw_disk == 1 ? 0 : handles[i].file ? fclose(handles[i].file) : handles[i].directory ? closedir(handles[i].directory) : 0;
     uint32_t status = rc ? error_status() : 0;
     if (handles[i].delete_mark || handles[i].delete_committed) {
+        if (handles[i].system_profile) profile.path[0] = 0;
         int another=0;
         for (unsigned j=0;j<FILE_SLOTS;j++)
             if ((int)j!=i && handles[j].token && !strcmp(handles[i].path,handles[j].path)) {
@@ -643,6 +693,10 @@ uint32_t ngb_file_close(uint32_t handle)
             if (plain_stat(handles[i].path,&st) || unlink(handles[i].path)) status=error_status();
             else { USED(handles[i].path)-=(uint64_t)st.st_size; --FILE_COUNT(handles[i].path); }
         }
+    } else if (!status && handles[i].system_profile) {
+        struct stat st;
+        if (!plain_stat(handles[i].path, &st) && S_ISREG(st.st_mode) && st.st_size == PROFILE_BYTES)
+            copy_path(profile.path, sizeof(profile.path), handles[i].path);
     }
     memset(&handles[i], 0, sizeof(handles[i]));
     return status;
@@ -1038,6 +1092,7 @@ uint32_t ngb_file_directory(uint32_t handle,const char *pattern,int restart,
     struct dirent *entry;
     while ((entry=readdir(handles[i].directory))) {
         if (entry->d_name[0]=='.' || !match_name(handles[i].pattern,entry->d_name)) continue;
+        if (profile_temp(entry->d_name) && profile_location(handles[i].path, PROFILE_DIR)) continue;
         char path[PATH_CAP]; struct stat st;
         if (!copy_path(path,sizeof(path),handles[i].path) || !append(path,entry->d_name)) return BAD_NAME;
         if (plain_stat(path,&st)) return error_status();

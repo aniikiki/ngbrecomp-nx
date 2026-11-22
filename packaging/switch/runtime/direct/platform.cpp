@@ -26,7 +26,8 @@ extern "C" {
 #endif
 int ngb_pc_setting(int which) {
 #ifdef NGB_PLAYER_BUILD
-    return ngb_switch_setting(which);
+    int value = ngb_switch_setting(which);
+    return which == 0 && value == NGB_RENDER_720P ? 2 : value;
 #endif
     return which==30;
 }

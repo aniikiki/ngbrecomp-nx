@@ -44,6 +44,106 @@ static void test_save_slot_cleanup(void)
     CHECK(!ngb_file_close(slot));
 }
 
+static void test_menu_profile(const char *disc, const char *data)
+{
+    const char *guest = "E:\\TDATA\\5443000d\\system.dat";
+    char dir[1200], path[1220], next[1240], old[1240];
+    snprintf(dir, sizeof dir, "%s/hdd/partition1/TDATA/5443000d", data);
+    snprintf(path, sizeof path, "%s/system.dat", dir);
+    snprintf(next, sizeof next, "%s.ngb-new", path);
+    snprintf(old, sizeof old, "%s.ngb-old", path);
+    CHECK(!mkdir(dir, 0700) && !ngb_files_init(disc, data));
+    uint32_t h, info, n;
+    unsigned char first[1360] = {1}, second[1360] = {2}, readback[1360];
+    CHECK(!ngb_queue_menu_profile(first, sizeof first));
+    CHECK(!ngb_file_open(guest, 0, 0x40000000u, 0, 5, 0x60, &h, &info));
+    CHECK(!ngb_file_write(h, first, sizeof first, 0, &n) && n == sizeof first);
+    CHECK(!ngb_file_close(h));
+    CHECK(!ngb_queue_menu_profile(first, sizeof first - 1));
+    CHECK(ngb_queue_menu_profile(first, sizeof first));
+    CHECK(ngb_queue_menu_profile(second, sizeof second));
+    second[0] = 7; /* Queued data must outlive its guest buffer. */
+    CHECK(!ngb_file_open(guest, 0, 0x80000000u, 0, 1, 0x60, &h, &info));
+    CHECK(!ngb_queue_menu_profile(first, sizeof first));
+    CHECK(!ngb_file_read(h, readback, sizeof readback, 0, &n) && n == sizeof readback && readback[0] == 2);
+    CHECK(!ngb_file_close(h));
+    /* A failed staging write preserves the old record and reports a real
+     * error to the next ordinary guest open. Removing the obstruction retries. */
+    CHECK(!mkdir(next, 0700) && ngb_queue_menu_profile(second, sizeof second));
+    CHECK(ngb_file_open(guest, 0, 0x80000000u, 0, 1, 0x60, &h, &info) == 0xc0000001u);
+    FILE *f = fopen(path, "rb");
+    CHECK(f && fgetc(f) == 2 && !fclose(f) && !rmdir(next));
+    CHECK(!ngb_file_open(guest, 0, 0x80000000u, 0, 1, 0x60, &h, &info));
+    CHECK(!ngb_file_read(h, readback, sizeof readback, 0, &n) && !memcmp(second, readback, sizeof second));
+    CHECK(!ngb_file_close(h));
+    CHECK(ngb_queue_menu_profile(first, sizeof first) && !ngb_files_close_all());
+    f = fopen(path, "rb");
+    CHECK(f && fread(readback, 1, sizeof readback, f) == sizeof readback && !fclose(f));
+    CHECK(!memcmp(first, readback, sizeof first));
+    /* Simulate a restart between the two FAT renames, with a complete and
+     * an incomplete staged record, and an interruption before the first rename. */
+    for (unsigned stage = 0; stage < 3; ++stage) {
+        if (stage < 2) CHECK(!rename(path, old));
+        f = fopen(next, "wb");
+        size_t size = stage == 0 ? sizeof second : 1;
+        CHECK(f && fwrite(second, 1, size, f) == size && !fclose(f));
+        CHECK(!ngb_files_init(disc, data));
+        CHECK(access(old, F_OK) && access(next, F_OK));
+        CHECK(!ngb_file_open(guest, 0, 0x80000000u, 0, 1, 0x60, &h, &info));
+        CHECK(!ngb_file_read(h, readback, sizeof readback, 0, &n) && n == sizeof second &&
+              !memcmp(readback, second, sizeof second));
+        CHECK(!ngb_file_close(h) && !ngb_files_close_all());
+    }
+    CHECK(!unlink(path) && !rmdir(dir));
+}
+
+static void test_disc_name_index(const char *temp, const char *disc, const char *data)
+{
+    char cache[1200], index[1280], folder[1200], old[1280], added[1280], link[1280];
+    snprintf(cache, sizeof cache, "%s/name-cache", temp);
+    snprintf(index, sizeof index, "%s/disc-names-v1.bin", cache);
+    snprintf(folder, sizeof folder, "%s/Media", disc);
+    snprintf(old, sizeof old, "%s/Smoke.AFS", folder);
+    snprintf(added, sizeof added, "%s/Mist.AFS", folder);
+    snprintf(link, sizeof link, "%s/Link", folder);
+    CHECK(!mkdir(folder, 0700));
+    FILE *f = fopen(old, "wb");
+    CHECK(f && fputs("old", f) >= 0 && !fclose(f));
+    CHECK(!symlink("../Mixed.bin", link));
+    CHECK(!ngb_files_init_indexed(disc, data, cache));
+    struct stat before, after;
+    CHECK(!stat(index, &before) && before.st_size > 10);
+    uint32_t h, dir, info, n;
+    char buf[8];
+    CHECK(!ngb_file_open("D:\\mEDIa", 0, 1, 3, 1, 0x21, &dir, &info));
+    CHECK(!ngb_file_open("sMoke.afs", dir, 1, 3, 1, 0x60, &h, &info));
+    CHECK(!ngb_file_read(h, buf, 3, 0, &n) && n == 3 && !memcmp(buf, "old", 3));
+    CHECK(!ngb_file_close(h) && !ngb_file_close(dir) && !ngb_files_close_all());
+    CHECK(!ngb_files_init_indexed(disc, data, cache));
+    CHECK(!stat(index, &after) && before.st_ino == after.st_ino);
+    CHECK(ngb_file_open("D:\\media\\LiNk", 0, 1, 3, 1, 0x60, &h, &info) == 0xc0000022u);
+    CHECK(ngb_file_open("D:\\media\\..\\Mixed.bin", 0, 1, 3, 1, 0x60, &h, &info) == 0xc0000022u);
+    CHECK(ngb_file_open("D:\\media\\mIst.afs", 0, 1, 3, 1, 0x60, &h, &info) == 0xc0000034u);
+    CHECK(!rename(old, added));
+    CHECK(ngb_file_open("D:\\media\\smoke.afs", 0, 1, 3, 1, 0x60, &h, &info) == 0xc0000034u);
+    CHECK(!ngb_file_open("D:\\media\\miST.afs", 0, 1, 3, 1, 0x60, &h, &info));
+    CHECK(!ngb_file_close(h));
+    f = fopen(added, "wb");
+    CHECK(f && fputs("new", f) >= 0 && !fclose(f) && !ngb_files_close_all());
+    CHECK(!ngb_files_init_indexed(disc, data, cache));
+    CHECK(!ngb_file_open("D:\\MEDIA\\mist.AFS", 0, 1, 3, 1, 0x60, &h, &info));
+    CHECK(!ngb_file_read(h, buf, 3, 0, &n) && n == 3 && !memcmp(buf, "new", 3));
+    CHECK(!ngb_file_close(h) && !ngb_files_close_all());
+    CHECK(!truncate(index, 7));
+    CHECK(!ngb_files_init_indexed(disc, data, cache) && !stat(index, &after) && after.st_size > 7);
+    CHECK(!ngb_files_close_all() && !unlink(index) && !rmdir(cache));
+    /* A read-only/unavailable cache must leave the disc usable. */
+    CHECK(!ngb_files_init_indexed(disc, data, added));
+    CHECK(!ngb_file_open("D:\\media\\mist.afs", 0, 1, 3, 1, 0x60, &h, &info));
+    CHECK(!ngb_file_close(h) && !ngb_files_close_all());
+    CHECK(!unlink(link) && !unlink(added) && !rmdir(folder));
+}
+
 int main(void)
 {
     char temp[] = "/tmp/ngb-files-XXXXXX", disc[1024], data[1024], path[1200];
@@ -60,6 +160,7 @@ int main(void)
     f = fopen(path, "wb"); CHECK(f && !fclose(f));
     CHECK(!ngb_files_init(disc, data) && !ngb_disc_archives_direct);
     CHECK(!unlink(path));
+    test_disc_name_index(temp, disc, data);
     CHECK(ngb_files_init(disc, data) == 0);
     CHECK(ngb_disc_archives_direct);
     test_save_slot_cleanup();
@@ -208,6 +309,7 @@ int main(void)
     CHECK(!ngb_file_read(file,buffer,2,0,&count) && count==2 && !memcmp(buffer,"OK",2));
     ngb_files_close_all(); CHECK(!unlink(path));
     snprintf(path,sizeof(path),"%s/hdd/partition5",data); CHECK(!rmdir(path));
+    test_menu_profile(disc, data);
     /* Existing data is charged again on restart, rather than resetting the
      * quota counter and permitting unlimited growth over repeated runs. */
     snprintf(path, sizeof(path), "%s/hdd/partition1/quota.bin", data);

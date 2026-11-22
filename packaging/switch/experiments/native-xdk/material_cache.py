@@ -16,12 +16,58 @@ GENERATOR_INPUTS = ['src/d3d/vk/backend.cpp', 'src/d3d/vk/spirv.cpp', 'src/d3d/v
 
 def compatibility():
     sources = {n: hashlib.sha256((ROOT / n).read_bytes()).hexdigest() for n in GENERATOR_INPUTS}
-    # 0.57.18 changed cache file I/O only. Keep the installed 0.57.17 seed
-    # and SD directory for this exact renderer revision. Any other renderer
-    # change still gets its own epoch; the manifest retains the actual hashes.
+    # These revisions add distinct keys for the signed texture view, modulated
+    # particles, quad gathers and clamped P8 texel reads. Soft A8 quads select an existing bilinear
+    # shader. The mission border, nonuniform haze and point coverage variants have distinct keys.
     epoch_sources = sources.copy()
     backend = 'src/d3d/vk/backend.cpp'
-    if sources[backend] == 'd125a6cd45cfc84f64b900bc0c7a8258922722e9c2812e912efac780085772c2':
+    shader = 'src/d3d/gpu/shaders.cpp'
+    header = 'src/d3d/gpu/shaders.h'
+    bounds = 'src/d3d/vk/combat_effects.h'
+    compatible = {
+        ('8ddaebf3c992a429038d4db4db9a58c3328f289f69eb97ea42a45303231617b2',
+         '3c2739f5642414f6816e064ff2316ca2f65d04c4c0fcff93357ddf1ef489b2bd',
+         'cc59d339e1768bdfdbdf38531f369775089a8f07368e7161c2d29758ad8acea9',
+         '85d57bb9ffe5ba6c70a954b0a9201fced94be865aa1f84e40f22b69d290f477e'),
+        ('db49869c739a1e24defc48375f80fe8d3d7ece91251772384c3d693456863f0f',
+         'b9021672d4bc654f12c1d8d7d1f90b5c7e9c0680479d78e8ba116f065a008afe',
+         '9cfd436bfd3986ffc698347f70f0779daeb9f460297446b02d88c3bf592802a6',
+         '49e9804d6b13fe67dd11f861317cd1ac5988f6a8970390438fd0093583bb757f'),
+        ('2f5dd1900e91ab8faab0aa026fc61e2a3a08bd82a1812e27df69a902874035a1',
+         'f1933f21b2c5c4d532550490be72563e5f820282f5318bbcdc4fdcd4c1742c8e',
+         'd241b842d4cf10c66a8ca6829259b2cacb93a01733e0e49d8d99768db1fbd987',
+         '49e9804d6b13fe67dd11f861317cd1ac5988f6a8970390438fd0093583bb757f'),
+        ('c39167f0070c717a2ce3c6782a252a27552e7443a2c186274fda95c23c2ac2a3',
+         '94a9bcacb86ad2adee58eea72e427f6041dcbfde2784245f6b30892c8f55e315',
+         '32aaf3524849fca1b71ca944f6f6b0c1dd69806f9325aedf383e25df9736eed8',
+         '49e9804d6b13fe67dd11f861317cd1ac5988f6a8970390438fd0093583bb757f'),
+        ('b7f7bfa2cd4fc2cd33e68aa082879d5ce7969d793788bad7604ec05932a77107',
+         '982d249862a0874460627ae00c962ac4c65b7a5e873dd06e3dfe17d5e861463f',
+         '657357b495700f6007d6117e7426187b0d69bca6c895c230d9e2497985e6432f',
+         '49e9804d6b13fe67dd11f861317cd1ac5988f6a8970390438fd0093583bb757f'),
+        ('b18774a205c59ffb810a17b4e9416b81d763399b7efbd19392efec7c8e829886',
+         'adb3e50536bab736857caf3e83be148a77859602a6068cd088807e25bd961be7',
+         'bd3a516b9cf6faea59a2632c72e130c961731bbe0f06f8872d70b57c2dfdab00',
+         '49e9804d6b13fe67dd11f861317cd1ac5988f6a8970390438fd0093583bb757f'),
+        ('4f3433e57b4d041cb0404bcd8408c595d2c1581249fd32bb03b9525d765771ca',
+         'adb3e50536bab736857caf3e83be148a77859602a6068cd088807e25bd961be7',
+         'bd3a516b9cf6faea59a2632c72e130c961731bbe0f06f8872d70b57c2dfdab00',
+         '49e9804d6b13fe67dd11f861317cd1ac5988f6a8970390438fd0093583bb757f'),
+        ('2a74b2317dfa7eca86d96defab8d14081745403bb6f56b127dc576eec705ae68',
+         'f7b2edfabb2dc6c6f02c0e53c8f2ab946f0b4eb4ea75e36ae23444a33204a510',
+         '5fd8c3314c21be2088578f11819993a348e0c388f776de2c529f16171dd37211',
+         '49e9804d6b13fe67dd11f861317cd1ac5988f6a8970390438fd0093583bb757f'),
+        ('998d2791a252682e4099b6f0a0be6489203045d47e12d01ba37104afb6306b85',
+         '45afd0850fca1ecb36853828370f60b2beb633cb43e97b4ab6a7c3aa78c0f3f4',
+         'db0389332911d8b987801d2cc3ea08fd10d121b7768f85d66c4fa9e7c401890b',
+         '49e9804d6b13fe67dd11f861317cd1ac5988f6a8970390438fd0093583bb757f'),
+    }
+    if tuple(sources[n] for n in (backend, shader, header, bounds)) in compatible:
+        epoch_sources[bounds] = '85d57bb9ffe5ba6c70a954b0a9201fced94be865aa1f84e40f22b69d290f477e'
+        epoch_sources[backend] = 'd125a6cd45cfc84f64b900bc0c7a8258922722e9c2812e912efac780085772c2'
+        epoch_sources[shader] = '947cbf13fa11dae76dd574d957aa2ec43283234de3344f09c8c132e5afc1c094'
+        epoch_sources[header] = 'c0dcde43ba650b496c786c8fc62e7827ed7cbc70d3241e9c80a3a12385c5f771'
+    if epoch_sources[backend] == 'd125a6cd45cfc84f64b900bc0c7a8258922722e9c2812e912efac780085772c2':
         epoch_sources[backend] = 'd6d10274541fe37750d0610f9c0fe6dff39b4a32ffcf2ae34af64afedf3280db'
     # The version also covers the compiler options in spirv.cpp and raw PipeKey ABI.
     digest = hashlib.sha256(json.dumps(epoch_sources, sort_keys=True).encode()).hexdigest()[:20]

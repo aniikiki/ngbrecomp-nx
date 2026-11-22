@@ -93,6 +93,9 @@ debug knobs out once it is the default.
   or 7), are decoded in the shader texel by texel (`bumpduv%d`: Load, signed bytes, then bilinear within the
   level and linear on to the next) -- filtered as the unsigned bytes they are stored as, texels either side
   of zero blend through the wrong range. A bump map is never read from a render target at its address.
+  The Switch renderer also exposes single-level V8U8 textures through a signed image view. When stage 0
+  supplies the displacement and stage 3 is free, its sampler filters that view directly. The original
+  unsigned view stays available to the colour combiner. Both views share the same upload.
 - The LOD bias (D3DTSS_MIPMAPLODBIAS) is converted as the console's D3D does, into the GPU's signed 5.8
   field (-16 to just under 16), then clamped to maxSamplerLodBias (LodBias in backend.cpp). A NaN becomes
   0x1000, -16, as xemu's register model shows (TEXFILTER0 E2063000 for the pond): the chapter 2 pond's
@@ -149,6 +152,28 @@ debug knobs out once it is the default.
   it at once); taking the alpha at the console pixel's centre removes it but steps soft edges and text.
   `NGB_D3D_NO_QUADSNAP=1` turns all of it off.
 
+- The Switch Render resolution setting offers 1x, native 720p and 2x. Native 720p draws the
+  scene, matching depth and full-screen copies at 1280×720 in widescreen or 960×720 in 4:3.
+  A GPU image copy passes that picture to the display at its exact size. Independent effect
+  targets keep the 2x profile and shadow maps use the Shadow resolution setting.
+- On an upscaled target or with MSAA the Switch renderer uses an alpha gather for clamped, single-level A8 quads with the game's linear
+  filter. A8 supplies white RGB at every texel. One gather returns the four alpha values for the existing
+  interpolation and cut-out test, including on the main menu's rotating and scrolling layers.
+  At upload the renderer checks the decoded P8 palette colours and A8 mask pixels. For fully opaque P8
+  it gathers RGB and applies the original interpolation weights. Equal red and green need only two gathers.
+  For P8 with transparency it reads each colour texel directly, or gathers just intensity and alpha
+  when every texel is gray. The same four texels feed the original alpha weighting and cut-out test.
+  A white A8 mask with all values in 6–249 can use a single hardware bilinear sample. These paths apply
+  to single-stage quads with an unconditional alpha test and keep the draw's vertex colour, fade and blend.
+  Mission thumbnails and borders with four zero vertex alphas also skip the GPU draw when their blend
+  preserves the destination and depth, stencil and visibility tests are inactive. Eligible draws use
+  these optimizations from the first menu frame. Single-sample 1x uses the hardware linear filter.
+  With MSAA off, all three resolutions also use a hardware discard rectangle inside the mission
+  border's transparent centre. The renderer verifies the decoded
+  palette, the sampled atlas region and the blend before excluding pixels from the draw. With
+  `/switch/ngb-runtime/alma-perf.flag` present, the diagnostic build records main-menu GPU and
+  presentation timings in `logs/alma-perf.csv`.
+
 - The Tairon drawbridge towers (chapter 8): two map sections lay rubble and blocks in one plane, cut into
   different triangles, and their depths tie within a few steps either way -- in xemu's renderer too, the
   game's own data. The towers' meshes (a vertex buffer whose header is in their chunk: "KMD", size 0x4FF470
@@ -172,6 +197,8 @@ debug knobs out once it is the default.
   it Vulkan draws nothing. A point sprite is stage 3 alone, as the console builds it: that stage gets the
   point's coordinates (xemu's pT3) and the combiners come from its state on the vertex colour; the other
   stages keep the vertex's coordinates and are not read (the torch embers and Ninpo sparks, #51).
+  Native 720p scales each axis separately. With 2x or 4x MSAA on Switch, each point's
+  shorter edge clips individual samples while its texture is shaded once per pixel.
   `NGB_D3D_SPRITELOG=1` logs each sprite setup's stages; xemu's `NV2A_SPRITE_LOG=1` the combiners the
   registers set for one.
 

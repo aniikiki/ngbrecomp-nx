@@ -3,6 +3,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+enum { NGB_RENDER_720P = 0 }; /* Fixed picture size in the render-scale API. */
 void ngb_switch_sample_quick(unsigned bits);
 int ngb_switch_setting(unsigned id);
 void ngb_switch_frame(void);

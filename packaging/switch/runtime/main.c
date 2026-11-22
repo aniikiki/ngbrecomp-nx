@@ -432,7 +432,7 @@ static void guest_worker(void *arg)
 
         boot_status=NGB_BOOT_ERROR;
         if (boot_log) fflush(boot_log);
-    } else if (ngb_files_init(external, "sdmc:/switch/ngb-runtime/data")) {
+    } else if (ngb_files_init_indexed(external, "sdmc:/switch/ngb-runtime/data", "sdmc:/switch/ngb-runtime/cache")) {
 
         boot_status = NGB_BOOT_ERROR;
         startup_error = "virtual disk initialization failed";

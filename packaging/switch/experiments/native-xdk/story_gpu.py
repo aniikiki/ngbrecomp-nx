@@ -15,6 +15,30 @@ def instrument(source, *, wave=True):
     replace(journal, 'if (ngb_combat_enabled) ' + journal)
     if not wave:
         return source
+    # Preserve both endpoints on the device clock as well as the existing
+    # interval union. A query's CPU read time can be several frames later.
+    replace('    uint32_t cp_tag[2]{};', '    uint32_t cp_tag[2]{}, screen_part_[2]{~0u, ~0u};')
+    replace('struct Span { uint64_t start{}, end{}; bool valid{}; };',
+            'struct Span { uint64_t start{}, end{}; bool valid{}, writes_screen{}; };')
+    replace('(t[1] - origin) & ts_mask_, true};\n            }',
+            '(t[1] - origin) & ts_mask_, true};\n            }\n            spans[part].writes_screen = part == screen_part_[slot];')
+    replace('        ts_count_[slot] = 0;', '        screen_part_[slot] = ~0u;\n        ts_count_[slot] = 0;')
+    replace("ns/1000,span.valid};ngb_combat_row('Q',v,4);",
+            """ns/1000,span.valid,
+                span.valid ? uint64_t(double((origin + span.start) & ts_mask_) * ts_period_ns_) : 0,
+                span.valid ? uint64_t(double((origin + span.end) & ts_mask_) * ts_period_ns_) : 0,
+                span.writes_screen};
+                ngb_combat_row('Q',v,sizeof v/sizeof *v);""")
+    submit = '        result = d_.vkQueueSubmit(queue_, 1, &si, fence);'
+    replace(submit, submit + '''
+#ifdef NGB_GPU_PRESENT
+        // QueueScanout has recorded the write to the shared screen image.
+        // Stamp it before dropping the same queue lock used by the UI blit.
+        if (result == VK_SUCCESS && screen_queued_ && ngb_combat_enabled) {
+            screen_part_[slot_] = chunk_;
+            switch_display::note_screen_write(screen_picture_.image, frame_ + 1);
+        }
+#endif''')
     replace('    struct ReadbackDiag {',
             Path(__file__).with_suffix('.inc').read_text() + '\n    struct ReadbackDiag {')
     replace('tci.queryCount = kFrameChunks * 2;',

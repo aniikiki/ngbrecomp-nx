@@ -56,6 +56,7 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
     target_compile_options(ngb-timers-test PRIVATE -Wall -Wextra -Werror)
     add_test(NAME guest-timers COMMAND ngb-timers-test)
     add_executable(ngb-files-test files_test.c files.c)
+    target_link_libraries(ngb-files-test PRIVATE Threads::Threads)
     target_compile_options(ngb-files-test PRIVATE -Wall -Wextra -Werror)
     add_test(NAME guest-files COMMAND ngb-files-test)
     add_executable(ngb-runtime-test runtime_test.c identity.c nv2a_boot.c scanout.c opening_movie.c menu_gpu.c pgraph_boot.c ohci_boot.c audio_boot.c contiguous.c vm.c timers.c files.c files_bridge.c

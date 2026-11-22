@@ -91,6 +91,8 @@ elif sys.argv[1] == 'host':
     link[1:1] = [str(full / 'entry.o'), str(full / 'gates.o'), str(base / 'native-regs/checkpoint.o')]
     if not control:
         link_disc_archives(root, out, link)
+        from menu_profile import link_menu_profile
+        link_menu_profile(root, out, link, next(c for c in commands if c[-1].endswith('/runtime_test.c')), host, 'objcopy')
     def compile_source(name, source=None, flags=()):
         if name == 'ohci_boot.c':
             # Host collector only: accept Xbox letter names directly, without
@@ -140,7 +142,7 @@ elif sys.argv[1] == 'host':
         return str(obj)
     driver = (experiment / 'replay.c').read_text()
     if diagnostics:
-        (sources / 'native_combat_perf.inc').write_text((runtime / 'combat_perf.inc').read_text().replace('#SESSION,0.56.25,','#SESSION,0.57.26,'))
+        (sources / 'native_combat_perf.inc').write_text((runtime / 'combat_perf.inc').read_text().replace('#SESSION,0.56.25,','#SESSION,0.57.37,'))
     runtime_source = (runtime / 'runtime.c').read_text().replace('RECOMP_TLS RecompRegs g_regs;', 'RecompRegs g_regs;')
     runtime_source = runtime_source.replace('        ngb_menu_draw(cursor);', '        extern void replay_unlock(uint32_t); replay_unlock(g_ebx);\n        ngb_menu_draw(cursor);')
     (sources / 'native-runtime.inc').write_text(runtime_source)
@@ -194,8 +196,8 @@ elif sys.argv[1] == 'host':
     inputs += [root / 'src/d3d' / n for n in ('native_diag.h','native_diag.inc','native_pacing.h')]
     inputs += [root / 'src/d3d/vk/cache_writer.h']
     inputs += [root / 'src/d3d' / n for n in ('native_mesh.inc','native_simple.inc','gpu/prepared.h','gpu/backend.h')]
-    inputs += [runtime / 'direct' / n for n in ('native_mesh.inc','native_model.inc','disc_archives.S')]
-    inputs += [runtime / n for n in ('workers.inc','combat_perf.h','combat_perf.inc','files.c','files.h','files_bridge.c','files_bridge.h','disc_reads.inc','ohci_boot.c')]
+    inputs += [runtime / 'direct' / n for n in ('native_mesh.inc','native_model.inc','disc_archives.S','menu_profile.S')]
+    inputs += [runtime / n for n in ('workers.inc','combat_perf.h','combat_perf.inc','files.c','files.h','files_bridge.c','files_bridge.h','disc_reads.inc','disc_names.inc','ohci_boot.c','menu_profile.inc')]
     if diagnostics:
         inputs += [experiment / 'story_gpu.inc']
     inputs += list(experiment.glob('*.py')) + [experiment / n for n in ('replay.c','native_contract.inc','native_lifetime_contract.inc','native_header_contract.inc','native_effect_contract.inc','test_pacing.cpp','test_combat_writer.c','test_material.cpp','test_mesh.cpp','test_simple.cpp')]

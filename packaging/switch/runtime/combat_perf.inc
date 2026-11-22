@@ -31,7 +31,7 @@ uint64_t ngb_combat_cpu_us(void){
 #endif
 }
 void ngb_combat_row(int kind,const uint64_t *v,unsigned n){
- unsigned i=(kind=='G'||kind=='I'||kind=='J'||kind=='U'||kind=='N'||kind=='V'||kind=='T')?0:(kind=='R'||kind=='Q'||kind=='B'||kind=='W'||kind=='A'||kind=='L'?1:2),h=atomic_load_explicit(&cp_ring[i].head,memory_order_relaxed);
+ unsigned i=(kind=='G'||kind=='I'||kind=='J'||kind=='M'||kind=='U'||kind=='N'||kind=='V'||kind=='T')?0:(kind=='R'||kind=='Q'||kind=='B'||kind=='W'||kind=='A'||kind=='L'?1:2),h=atomic_load_explicit(&cp_ring[i].head,memory_order_relaxed);
  if(n>CP_COLS || h-atomic_load_explicit(&cp_ring[i].tail,memory_order_acquire)>=CP_CAP){
   atomic_fetch_add(&cp_ring[i].lost,1);return;}
  CombatRow *r=&cp_ring[i].rows[h%CP_CAP];r->kind=kind;r->n=n;memcpy(r->v,v,n*sizeof(*v));
@@ -44,7 +44,10 @@ struct CombatIO { uint64_t ops,bytes,ns; };
 static struct CombatIO cp_read,cp_write,cp_archive;
 static unsigned cp_guest_frame;
 static uint64_t cp_menu_until;
+static uint64_t cp_mission_until;
 static int cp_entered_game;
+static atomic_int cp_main_menu;
+void ngb_combat_menu_visible(int visible){atomic_store_explicit(&cp_main_menu,visible,memory_order_relaxed);}
 void ngb_combat_file(int write,int archive,uint32_t bytes,uint64_t ns){
  struct CombatIO *io=write?&cp_write:&cp_read;
  ++io->ops;io->bytes+=bytes;io->ns+=ns;
@@ -55,6 +58,12 @@ void ngb_combat_new_game_press(void){
  uint64_t v[]={cp_guest_frame,now};
  ngb_combat_row('J',v,2);
  cp_menu_until=now+10000000;
+}
+void ngb_combat_mission_press(void){
+ uint64_t now=ngb_elapsed_ns()/1000;
+ uint64_t v[]={cp_guest_frame,now,1};
+ ngb_combat_row('M',v,3);
+ cp_mission_until=cp_menu_until=now+15000000;
 }
 static uint16_t combat_u16(const uint8_t *p){uint16_t v;memcpy(&v,p,sizeof v);return v;}
 static uint32_t combat_u32(const uint8_t *p){uint32_t v;memcpy(&v,p,sizeof v);return v;}
@@ -93,6 +102,16 @@ void ngb_combat_guest(unsigned frame,unsigned id,unsigned mode,unsigned diff,uns
  int on=(id==23 && mode==3) || (id==255 && mode==0 && maxhp>0);
 #ifdef NGB_NATIVE_DIAG
  cp_guest_frame=frame;
+ if(atomic_load_explicit(&cp_main_menu,memory_order_relaxed))on=1;
+ if(cp_mission_until){
+  uint64_t now=ngb_elapsed_ns()/1000;
+  if(now>cp_mission_until)cp_mission_until=0;
+  else if(ram && combat_u32(ram+0xc07378)==1 && combat_u32(ram+0xc0737c)==1){
+   uint64_t v[]={frame,now,2};
+   ngb_combat_row('M',v,3);
+   cp_mission_until=0;
+  }
+ }
  // Results can clear the mission and player before their effects finish.
  // Once a stage starts, keep the opt-in recorder active through the transition.
  if((id!=255 && mode==3) || (id==255 && mode==1))cp_entered_game=1;
@@ -120,7 +139,8 @@ static int combat_requested(const char *path){
 static int combat_open(const char *path){
  cp_file=fopen(path,"a+");if(!cp_file)return 0;
 #ifdef NGB_NATIVE_DIAG
- cp_entered_game=0;
+ cp_entered_game=0;cp_mission_until=cp_menu_until=0;
+ ngb_combat_menu_visible(0);
 #endif
  setvbuf(cp_file,cp_file_buffer,_IOFBF,sizeof cp_file_buffer);
  fprintf(cp_file,"#SESSION,0.56.25,clock_us=monotonic,cpu_us=thread_total_or_zero\n"
@@ -130,16 +150,28 @@ static int combat_open(const char *path){
 #endif
  "\n"
  "#R,present,time_us,cpu_us,draw_calls,drawn,descriptor_requests,writes,geometry_bytes,reused_bytes,shaders,pipelines,compile_us,texture_uploads,texture_us,max_tex_us,max_tex_w,max_tex_h,max_tex_fmt,queue_us,fence_us,publish_us,present_us,rt_changes,small_rt_draws,blend_draws,indices,draw_samples,sampled_draw_wall_us,sampled_draw_cpu_us,gpu_query_slots,guest_wait_us_total\n"
- "#Q,submit_frame,read_time_us,gpu_us,valid\n"
+ "#Q,submit_frame,read_time_us,gpu_us,valid"
+#ifdef NGB_NATIVE_DIAG
+ ",gpu_start_ns,gpu_end_ns,writes_screen"
+#endif
+ "\n"
  "#D,generation,time_us,acquire_us,blit_overlay_us,submit_us\n"
  "#P,time_us,renderer,pc_offset,lr_offset,pause_cost_us,rc\n"
  "#C,time_us,cpu_hz,gpu_hz,emc_hz,cpu_rc,gpu_rc,emc_rc\n"
  "#F,time_us,write_us,rows\n"
 #ifdef NGB_NATIVE_DIAG
  "#I,issue_us,read_start_us,read_end_us,preload_end_us,published_us,guest_copy_us,handle,basename_fnv1a,offset,requested,received,status\n"
- "#H,begin_us,generation_before,generation_after,slot_wait_us,image_wait_us,slot_ready,image_ready\n"
- "#Y,begin_us,generation_after_acquire,queue_lock_us,queue_submit_us,queue_present_us,window_gpu_ns,valid\n"
+ "#H,begin_us,generation_before,generation_after,slot_wait_us,image_wait_us,slot_ready,image_ready,dequeue_us,release_event_us,release_fence_us,dequeue_calls,release_event_calls,release_fence_calls\n"
+ "#O,time_us,min_images,max_images,requested_images,actual_images,command_slots,present_mode"
+#ifdef __SWITCH__
+ ",native_swap_interval"
+#endif
+ "\n"
+ "#Y,begin_us,generation_after_acquire,queue_lock_us,queue_submit_us,queue_present_us,window_gpu_ns,valid,source_frame,image_index,scene_submit_us,window_submit_us,queue_present_end_us,gpu_start_ns,gpu_end_ns,present_result\n"
+ "#K,host_before_us,gpu_ns,host_after_us,result\n"
+ "#S,wait_start_us,vsync_wake_us\n"
  "#J,last_guest_flip,new_game_press_us\n"
+ "#M,guest_flip,time_us,event_1_mission_press_2_grid_ready\n"
  "#W,submit_frame,strip_draws,sprite_draws,strip_sampled,sprite_sampled,strip_gpu_ns,sprite_gpu_ns,unavailable\n"
  "#A,submit_frame,material_detail,spans,omitted_calls,valid,opaque_calls,alpha_calls,additive_calls,offscreen_calls,composite_calls,history_calls,scanout_calls,opaque_ns,alpha_ns,additive_ns,offscreen_ns,composite_ns,history_ns,scanout_ns,feedback_calls,surface_copy_calls,feedback_ns,surface_copy_ns,feedback_pixels,surface_copy_pixels,screen_mix_calls,screen_mix_ns,add128_calls,add128_ns,ring_target_calls,ring_target_ns\n"
  "#L,submit_frame,phase,texture_sig,width,height,format,src,dst,calls,spans,gpu_ns,pixel_shader,texture1_sig,target_stages\n"
@@ -180,9 +212,37 @@ static atomic_bool cp_writer_stop;
 static bool cp_writer_started;
 static void combat_write_worker(void *unused){
  (void)unused;
+#ifdef NGB_VI_VSYNC_TRACE
+ ViDisplay display={0};
+ Event vsync={0};
+ Result rc=viOpenDefaultDisplay(&display);
+ if(R_SUCCEEDED(rc))rc=viGetDisplayVsyncEvent(&display,&vsync);
+ if(R_FAILED(rc))fprintf(cp_file,"#VSYNC_ERROR,%u\n",(unsigned)rc);
+#endif
  while(!atomic_load_explicit(&cp_writer_stop,memory_order_acquire)){
-  combat_flush(0);svcSleepThread(10000000);
+  combat_flush(0);
+#ifdef NGB_VI_VSYNC_TRACE
+  if(eventActive(&vsync) && ngb_combat_active()){
+   // Record the waiting interval as well as the wake. An already signalled
+   // event after an SD flush cannot date that refresh edge.
+   uint64_t before=ngb_elapsed_ns()/1000;
+   rc=eventWait(&vsync,25000000);
+   if(R_SUCCEEDED(rc)){
+    uint64_t after=ngb_elapsed_ns()/1000;
+    fprintf(cp_file,"S,%" PRIu64 ",%" PRIu64 "\n",before,after);
+   }else if(R_VALUE(rc)!=KERNELRESULT(TimedOut)){
+    fprintf(cp_file,"#VSYNC_ERROR,%u\n",(unsigned)rc);
+    eventClose(&vsync);
+   }
+   continue;
+  }
+#endif
+  svcSleepThread(10000000);
  }
+#ifdef NGB_VI_VSYNC_TRACE
+ if(eventActive(&vsync))eventClose(&vsync);
+ if(display.initialized)viCloseDisplay(&display);
+#endif
  combat_flush(1);
 }
 static int combat_start_writer(void){

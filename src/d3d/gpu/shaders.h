@@ -21,11 +21,19 @@ struct TexInfo {
 };
 enum : uint8_t {
     kTexWide = 4,  // an upscaled target shrunk by the pass: each tap averaged over console texels
-    kTexSigned = 8,  // a bump map (V8U8): its du dv decoded texel by texel in the shader (bumpduv)
+    kTexSigned = 8,  // V8U8 bump offsets, decoded before filtering
     kTexLinear = 16, // a screen quad's texture filtered linearly: weighted by alpha above 1x (QuadSnap, #83)
+    kTexBumpView = 32, // stage 0 displacement sampled through its signed view in unused slot 3
+    kTexQuadAlpha = 64, // gather the four alphas of a white Xbox A8 quad
+    kTexQuadOpaqueRG = 128, // opaque P8 with identical red and green in every texel
+    kTexQuadOpaqueRGB = kTexQuadOpaqueRG | kTexQuadAlpha, // independent R, G and B in an opaque P8
+    kTexQuadColorAlpha = kTexLinear | kTexQuadOpaqueRG, // four clamped P8 texels at level zero
+    kTexQuadGrayAlpha = kTexQuadColorAlpha | kTexQuadAlpha, // equal R, G and B, arbitrary alpha
 };
 
-enum class CombatPixel : uint8_t { None, Additive, History };
+enum class CombatPixel : uint8_t { None, Additive, History, ModulatedParticle, ModulatedParticleGreater };
+constexpr uint32_t kHazeTargetExtent = 1u << 8;  // PixelKey::alphakill, for screen reads with unequal X/Y scale
+constexpr uint64_t kRectangularPointKey = 0x72656374506f696eull; // point shaders on such targets
 
 struct PixelKey {
     uint32_t programmable = 0;
@@ -68,8 +76,8 @@ std::string FixedVertexHlsl(uint16_t regs, bool pretransformed, uint64_t decode 
 std::string PixelHlsl(const PixelKey& k);
 // a screen quad's vertex or pixel shader: texture coordinates as the quad was drawn, before its far edges were pulled out
 std::string QuadHlsl(std::string s);
-std::string PointHlsl(std::string s, int kind);
-std::string SpriteHlsl(std::string s);
+std::string PointHlsl(std::string s, int kind, bool rectangular);
+std::string PointPixelHlsl(std::string s, bool sprite, unsigned rectangular_samples);
 
 // HLSL a backend extension adds; the defaults write the console path
 struct ShaderHooks {
@@ -92,7 +100,7 @@ inline const ShaderHooks* g_shader_hooks = nullptr;
 
 // the constant buffer layout both stages share, register b1
 struct DrawConstants {
-    float surf[4];      // target width, height, 1 / depth scale, 0
+    float surf[4];      // guest target width, height, 1 / depth scale, horizontal render scale
     float fog[4];       // start, end, density, mode
     float fog_color[4];
     float misc[4];      // alpha ref, alpha func, shadow func, specular
@@ -121,6 +129,7 @@ struct DrawConstants {
     float uvc[4][4];
     float uvg[4][4];
     float qsnap[4];
+    float raster[4];    // physical target width, height, maximum rasterized point size, reserved
 };
 
 }  // namespace gpu

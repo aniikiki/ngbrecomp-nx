@@ -10,6 +10,9 @@ extern "C" {
 #endif
 
 enum { NGB_SCREEN_W = 1280, NGB_SCREEN_H = 720 };
+static inline unsigned ngb_picture_width(int standard) {
+    return standard ? NGB_SCREEN_H * 4 / 3 : NGB_SCREEN_W;
+}
 typedef struct { unsigned x, y, w, h; } NgbScreenRect;
 typedef struct {
     int gpu, blank, standard;

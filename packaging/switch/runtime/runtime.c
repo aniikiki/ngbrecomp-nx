@@ -1393,7 +1393,6 @@ int ngb_boot(const char *path, FILE *log)
             snprintf(stopped_reason, sizeof(stopped_reason), "XBE entry returned");
         }
     }
-    note("[RESULT] status=%d reason=%s", stopped_status, stopped_reason);
     ngb_devices_reset(); /* Join disc I/O before releasing the renderer or guest RAM. */
     ngb_scene_close();
     for (unsigned i=0;i<128;++i) free(fibers[i].stack);
@@ -1406,7 +1405,11 @@ int ngb_boot(const char *path, FILE *log)
     ngb_contiguous_reset();
     free(ram); ram = NULL; g_xbox_mem_offset = 0;
     ngb_vm_init(NULL);
-    ngb_files_close_all();
+    if (ngb_files_close_all()) {
+        stopped_status = NGB_BOOT_ERROR;
+        snprintf(stopped_reason, sizeof(stopped_reason), "Unable to save system.dat to the SD card");
+    }
+    note("[RESULT] status=%d reason=%s", stopped_status, stopped_reason);
     return stopped_status;
 }
 int ngb_stop_requested(void) { return atomic_load(&cancel); }

@@ -259,7 +259,7 @@ int main(int argc, char **argv)
     if (argc != 3) { fprintf(stderr, "usage: replay GAME_DIRECTORY SCRATCH_HDD\n"); return 2; }
     char image[1024];
     if (snprintf(image, sizeof(image), "%s/default.xbe", argv[1]) >= (int)sizeof(image)) return 2;
-    if (ngb_files_init(argv[1], argv[2])) return 2;
+    if (ngb_files_init_indexed(argv[1], argv[2], getenv("NGB_D3D_CACHE"))) return 2;
     const char *limit = getenv("NGB_REPLAY_SECONDS"); if (limit) replay_limit = strtoul(limit,NULL,10);
     const char *frames = getenv("NGB_REPLAY_FRAMES"); if (frames) replay_frame_limit = strtoul(frames,NULL,10);
     const char *trace = getenv("NGB_REPLAY_TRACE_START"); if (trace) replay_trace_start = strtoul(trace,NULL,10);

@@ -8,7 +8,9 @@ uint64_t ngb_combat_wait_us(void);
 extern int ngb_combat_enabled; /* immutable once workers start */
 int ngb_combat_active(void);
 #ifdef NGB_NATIVE_DIAG
+void ngb_combat_menu_visible(int visible);
 void ngb_combat_new_game_press(void);
+void ngb_combat_mission_press(void);
 void ngb_combat_file(int write,int cache_archive,uint32_t bytes,uint64_t ns);
 #endif
 uint64_t ngb_combat_cpu_us(void); /* zero if thread clock unavailable */

@@ -7,7 +7,7 @@ typedef struct {unsigned char page,id,initial,flags;const char *key,*label,*choi
 #define TOGGLE(p,i,k,l,d,f) {p,i,d,f,k,l,"Off|On"}
 #define BIND(i,n,k,l) {CONTROLS,i,n,BUTTON,k,l,"Up|Down|Left|Right|+|-|L Stick|R Stick|A|B|X|Y|R|L|ZL|ZR|None"}
 static const Preference settings[]={
- {GRAPHICS,0,0,0,"scale","Render resolution","1x|2x"},
+ {GRAPHICS,0,0,0,"scale","Render resolution","1x|720p (Native)|2x"},
  {GRAPHICS,1,0,0,"filter","Anisotropic filtering","Original|2x|4x|8x|16x"},
  {GRAPHICS,2,0,0,"shadow","Shadow resolution","1x|2x|4x"},
  {GRAPHICS,10,0,0,"msaa","Anti-aliasing","Off|2x|4x"},

@@ -61,9 +61,7 @@
 #ifdef NGB_DIRECT3D
 #include "output.h"
 #include "display_device.h"
-#ifdef NGB_GPU_PRESENT
 #include "recomp_settings.h"
-#endif
 extern "C" uint64_t fast_hash(const uint8_t*, size_t);
 #include "scanout.h"
 #endif
@@ -89,6 +87,9 @@ namespace {
 using kernel::HostPtr;
 
 float Bits(uint32_t v) { float f; std::memcpy(&f, &v, 4); return f; }
+
+// Use the same edge for adjacent clears, scissors and copies at fractional scales.
+int PixelEdge(int edge, float scale) { return int(std::lround(edge * scale)); }
 
 // D3DTSS_MIPMAPLODBIAS as the console's D3D gives it to the GPU: its signed 5.8 fixed-point field, -16 to just
 // under 16. A NaN -- the Chapter 2 pond's ripple maps have FFFFFFFF -- comes out as 0x1000, -16 (xemu's
@@ -284,6 +285,7 @@ struct Image {
     VmaAllocation mem = nullptr;
     VkImageView view = VK_NULL_HANDLE;
     VkImageView attachment = VK_NULL_HANDLE; // depth + stencil for rendering; view samples depth only
+    VkImageView bump_view = VK_NULL_HANDLE;  // signed view of a single-level V8U8 texture
     VkFormat format = VK_FORMAT_UNDEFINED;
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
     uint32_t w = 0, h = 0, layers = 1, levels = 1, samples = 1;
@@ -306,9 +308,19 @@ struct Target {
     bool stamped = false;
 };
 
+#ifdef NGB_DIRECT3D
+bool ScanoutSize(uint32_t w, uint32_t h) {
+    return (w == NGB_SCAN_W || w == 640) && h == NGB_SCAN_H;
+}
+#endif
+
 struct Tex {
     Image img;
     CombatHull combat_hull;
+#ifdef NGB_DIRECT3D
+    uint8_t quad_filter_flags = kTexLinear;
+    bool transparent_mission_border = false;
+#endif
     int gen = -1;              // made with generated mipmaps (1), or as given (0)
     uint64_t sig = 0;          // the guest bytes (and palette) it was made from
     uint32_t used = 0;         // frame last used
@@ -319,6 +331,8 @@ struct Tex {
 // PipeKey::has_ds: 1 a depth target; kDsDynamicBias the depth bias set at the draw (the map pieces' pull, below):
 // a bit of an existing field, so the key -- and every pipeline the caches and the seed keep -- stays as it was
 constexpr uint32_t kDsDynamicBias = 2;
+constexpr uint32_t kRtParticleWindows = 2;  // has_rt, an inclusive discard-rectangle pipeline
+constexpr uint32_t kRtMissionBorder = 4;    // one exclusive rectangle inside the mission border
 struct PipeKey {
     uint64_t vs, ps;
     uint32_t regs, elements[16], strides[16];
@@ -334,6 +348,65 @@ struct PipeKey {
 struct PipeHash {
     size_t operator()(const PipeKey& k) const { return size_t(Hash(&k, sizeof(k))); }
 };
+
+#ifdef NGB_DIRECT3D
+// The mission frame occupies part of a P8 atlas. Check the decoded alpha with the
+// palette used for this upload, including the neighbours read by its four-tap filter.
+bool TransparentMissionBorder(const TextureDesc& tex, uint64_t signature, const std::vector<uint8_t>& bgra) {
+    if (signature != 0x73e40780460aebdbull || tex.width != 256 || tex.height != 128 ||
+        bgra.size() != 256 * 128 * 4) return false;
+    for (unsigned y = 23; y <= 104; ++y)
+        for (unsigned x = 61; x <= 198; ++x)
+            if (bgra[(y * 256 + x) * 4 + 3]) return false;
+    return true;
+}
+
+VkRect2D MissionBorderInterior(const Assembled& a, const DrawConstants& c, const VkRect2D& sc, float sx, float sy) {
+    if (a.vertex_count != 4 || a.draw_count != 4 || a.index_count || !(a.regs & 1) || !(a.regs & (1 << 9)) ||
+        !(sx >= 1 && sx <= 10 && sy >= 1 && sy <= 10) ||
+        ((sx != 1 || sy != 1) && (c.qsnap[0] != 1 || c.qsnap[1] != 1)) ||
+        c.texsize[0][2] || c.texsize[0][3])
+        return {};
+    const auto& pos = a.elements[0];
+    const auto& uv = a.elements[9];
+    if (pos.format != 2 || uv.format != 16 || pos.buffer >= a.buffer_count || uv.buffer >= a.buffer_count) return {};
+    const auto& positions = a.buffers[pos.buffer];
+    const auto& texcoords = a.buffers[uv.buffer];
+    auto fits = [](const VertexBuffer& b, size_t offset, size_t size) {
+        return b.src && offset + size <= b.stride && offset + 3 * size_t(b.stride) + size <= b.bytes;
+    };
+    if (!fits(positions, pos.offset, 16) || !fits(texcoords, uv.offset, 8)) return {};
+
+    float p[4][4];
+    for (unsigned i = 0; i < 4; ++i) {
+        float tc[2];
+        std::memcpy(p[i], positions.src + pos.offset + i * size_t(positions.stride), sizeof(p[i]));
+        std::memcpy(tc, texcoords.src + uv.offset + i * size_t(texcoords.stride), sizeof(tc));
+        if (tc[0] != ((i & 1) ? 203.f : 53.f) / 256 || tc[1] != ((i & 2) ? 114.f : 14.f) / 128 ||
+            p[i][3] != 1 || !std::isfinite(p[i][0]) || !std::isfinite(p[i][1])) return {};
+    }
+    if (p[0][0] != p[2][0] || p[1][0] != p[3][0] || p[0][1] != p[1][1] || p[2][1] != p[3][1] ||
+        p[1][0] - p[0][0] < 8 || p[2][1] - p[0][1] < 8) return {};
+
+    // Apply the same HUD placement and half-pixel offset as the vertex shader.
+    // QuadSnap moves the UVs with the edges, preserving their gradients in screen space.
+    auto project = [](float value, float scale, float pivot) {
+        return (scale > 0 ? pivot + (value - pivot) * scale : value) + .5f;
+    };
+    float left = project(p[0][0], c.ext[0], c.ext[1]), right = project(p[1][0], c.ext[0], c.ext[1]);
+    float top = project(p[0][1], c.ext[2], c.ext[3]), bottom = project(p[2][1], c.ext[2], c.ext[3]);
+    if (!(left >= -4096 && right <= 4096 && right > left && top >= -4096 && bottom <= 4096 && bottom > top))
+        return {};
+    // These fractions lie inside the checked atlas texels on all four sides.
+    // Round inward by another pixel to cover precision differences at the edges.
+    int x0 = std::max(sc.offset.x, int(std::ceil((left + (right - left) * .070f) * sx)) + 1);
+    int x1 = std::min(sc.offset.x + int(sc.extent.width), int(std::floor((left + (right - left) * .955f) * sx)) - 1);
+    int y0 = std::max(sc.offset.y, int(std::ceil((top + (bottom - top) * .110f) * sy)) + 1);
+    int y1 = std::min(sc.offset.y + int(sc.extent.height), int(std::floor((top + (bottom - top) * .890f) * sy)) - 1);
+    if (x1 <= x0 || y1 <= y0) return {};
+    return {{x0, y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}};
+}
+#endif
 
 // a texture's top level to dir: DDS for DXT, PPM for BGRA8 (alpha dropped); name_or_null: tex_<addr>_<w>x<h>
 void DumpTexture(const TextureDesc& d, const FormatInfo& fi, const uint8_t* guest, const uint32_t* palette,
@@ -471,10 +544,15 @@ private:
     // the quality settings (nv2a_quality_get), read once a frame: display-sized targets render
     // at scale_ times their size, small depth-only ones (shadow maps) at shadow_ times
     int scale_ = 1, shadow_ = 1, aniso_level_ = 0, msaa_ = 1;
+#ifdef NGB_DIRECT3D
+    uint32_t native_width_ = 0;    // fixed-size scene and depth, zero for integer render scales
+#endif
     bool anisotropy_ = false;
     bool bc_ = true;   // the GPU reads DXT (textureCompressionBC); without it (Mali, Adreno) DXT is decoded to BGRA
     bool combat_clip_ = false;
+    bool particle_windows_ = false;
     bool wide_lines_ = false;   // lines wider than a pixel (the sparks of a hit are 2.7 to 3, #51)
+    bool standard_sample_locations_ = false;
     float point_max_ = 1.0f;
     float view_yaw_ = 0, view_pitch_ = 0;   // NGB_D3D_VIEWLOG
     bool view_seen_ = false;
@@ -673,6 +751,7 @@ private:
     struct Retired { Image img; VkImageView view; uint32_t frame; };
     std::vector<Retired> graveyard_;
     const bool bumpcheck_ = std::getenv("NGB_D3D_BUMPCHECK") != nullptr;
+    VkSampler bump_sampler_ = VK_NULL_HANDLE;
     uint64_t bump_key_ = 0;           // textures_ key of the bump map last bound (NGB_D3D_BUMPCHECK)
     void BumpCheck(Tex& tx, const char* when);
     std::set<uint32_t> told_size_;    // textures logged as reading a target of another size (#16), or their own (| 1)
@@ -1001,34 +1080,41 @@ bool VulkanBackend::CreateDevice() {
         f2.features.wideLines = have.wideLines;
         f2.features.largePoints = have.largePoints;
     }
-    const char* exts[] = {VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
+    std::vector<const char*> exts{VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME};
 #ifdef __APPLE__
-                          "VK_KHR_portability_subset",
+    exts.push_back("VK_KHR_portability_subset");
+#endif
+#if defined(NGB_GPU_PRESENT) || defined(NGB_DIRECT3D)
+    uint32_t count = 0;
+    VKCHECK(vkEnumerateDeviceExtensionProperties(phys_, nullptr, &count, nullptr));
+    std::vector<VkExtensionProperties> available(count);
+    VKCHECK(vkEnumerateDeviceExtensionProperties(phys_, nullptr, &count, available.data()));
+    auto supports = [&](const char* name) {
+        return std::any_of(available.begin(),available.end(),[&](const auto& p) { return !std::strcmp(p.extensionName,name); });
+    };
 #endif
 #ifdef NGB_GPU_PRESENT
-                          VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+    can_present_ = can_present_ && supports(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    if (can_present_) exts.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
 #endif
-    };
+#ifdef NGB_DIRECT3D
+    if (supports(VK_EXT_DISCARD_RECTANGLES_EXTENSION_NAME)) {
+        VkPhysicalDeviceDiscardRectanglePropertiesEXT limits{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DISCARD_RECTANGLE_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &limits};
+        vkGetPhysicalDeviceProperties2(phys_, &props);
+        particle_windows_ = limits.maxDiscardRectangles >= kParticleWindowCount;
+        if (particle_windows_) exts.push_back(VK_EXT_DISCARD_RECTANGLES_EXTENSION_NAME);
+    }
+#endif
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.pNext = &f2;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
-    dci.enabledExtensionCount = sizeof(exts) / sizeof(exts[0]);
-#ifdef NGB_GPU_PRESENT
-    if (can_present_) {
-        uint32_t count = 0;
-        vkEnumerateDeviceExtensionProperties(phys_, nullptr, &count, nullptr);
-        std::vector<VkExtensionProperties> available(count);
-        vkEnumerateDeviceExtensionProperties(phys_, nullptr, &count, available.data());
-        can_present_ = std::any_of(available.begin(), available.end(), [](const auto& p) {
-            return !std::strcmp(p.extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME);
-        });
-    }
-    if (!can_present_) --dci.enabledExtensionCount;
-#endif
-    dci.ppEnabledExtensionNames = exts;
+    dci.enabledExtensionCount = uint32_t(exts.size());
+    dci.ppEnabledExtensionNames = exts.data();
     VKCHECK(vkCreateDevice(phys_, &dci, nullptr, &dev_));
     volkLoadDeviceTable(&d_, dev_);
+    particle_windows_ = particle_windows_ && d_.vkCmdSetDiscardRectangleEXT;
     d_.vkGetDeviceQueue(dev_, qfam_, 0, &queue_);
     return FinishDevice();
 }
@@ -1075,6 +1161,20 @@ bool VulkanBackend::FinishDevice() {
     // Nvidia float depth too, for the shadow blotches of #29: they stayed, and second passes over a drawn
     // surface came out flickering or missing on Nvidia (#51, #53). NGB_D3D_DEPTH32=1: float, to compare.
     VkFormatProperties fp;
+#ifdef NGB_DIRECT3D
+    // The displacement pass uses linear repeat even when the colour sampler clamps.
+    vkGetPhysicalDeviceFormatProperties(phys_, VK_FORMAT_R8G8B8A8_SNORM, &fp);
+    const VkFormatFeatureFlags needed = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+    VkImageFormatProperties bump_props;
+    if ((fp.optimalTilingFeatures & needed) == needed &&
+        vkGetPhysicalDeviceImageFormatProperties(phys_, kColorFormat, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
+            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT, &bump_props) == VK_SUCCESS) {
+        VkSamplerCreateInfo ci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        ci.magFilter = ci.minFilter = VK_FILTER_LINEAR;
+        ci.addressModeU = ci.addressModeV = ci.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        if (d_.vkCreateSampler(dev_, &ci, nullptr, &bump_sampler_) != VK_SUCCESS) bump_sampler_ = VK_NULL_HANDLE;
+    }
+#endif
     bool d32 = std::getenv("NGB_D3D_DEPTH32") != nullptr;
     vkGetPhysicalDeviceFormatProperties(phys_, VK_FORMAT_D24_UNORM_S8_UINT, &fp);
     ds_format_ = !d32 && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)
@@ -1091,6 +1191,7 @@ bool VulkanBackend::FinishDevice() {
     wide_lines_ = feat.wideLines == VK_TRUE;
     line_max_ = pr.limits.lineWidthRange[1];
     point_max_ = feat.largePoints == VK_TRUE ? pr.limits.pointSizeRange[1] : 1.0f;
+    standard_sample_locations_ = pr.limits.standardSampleLocations;
     lod_bias_max_ = pr.limits.maxSamplerLodBias;
     ms_counts_ = pr.limits.framebufferColorSampleCounts & pr.limits.framebufferDepthSampleCounts &
                  pr.limits.framebufferStencilSampleCounts;
@@ -1122,7 +1223,13 @@ void VulkanBackend::ReadQuality() {
     }
     static const char* scale_env = std::getenv("NGB_D3D_SCALE");
     static const char* flip_env = std::getenv("NGB_D3D_QUALITY_FLIP");
-    if (const char* e = scale_env) scale_ = std::clamp(std::atoi(e), 1, 10);   // debugging
+    if (const char* e = scale_env) {
+#ifdef NGB_DIRECT3D
+        if (!std::strcmp(e, "720p")) scale_ = NGB_RENDER_720P;
+        else
+#endif
+        scale_ = std::clamp(std::atoi(e), 1, 10);
+    }
     if (const char* e = flip_env) {   // testing: MSAA and scale changing every n s
         static uint32_t start = presents_;
         uint32_t n = uint32_t(std::max(1, std::atoi(e)) * 60), k = (presents_ - start) / n;
@@ -1131,6 +1238,13 @@ void VulkanBackend::ReadQuality() {
             scale_ = 3;
         }
     }
+#ifdef NGB_DIRECT3D
+    native_width_ = 0;
+    if (scale_ == NGB_RENDER_720P) {
+        native_width_ = ngb_picture_width(ngb_settings_standard_aspect());
+        scale_ = 2;  // separate effects keep their 2x texture sizes and shadow setting
+    }
+#endif
 }
 
 void VulkanBackend::QueueSubmit(const VkSubmitInfo& si, VkFence fence) {
@@ -1426,6 +1540,12 @@ VulkanBackend::~VulkanBackend() {
         }
     }
     if (dev_) {
+        for (auto& entry : textures_) DestroyImage(entry.second.img);
+        for (auto& retired : graveyard_) {
+            if (retired.view) d_.vkDestroyImageView(dev_, retired.view, nullptr);
+            DestroyImage(retired.img);
+        }
+        if (bump_sampler_) d_.vkDestroySampler(dev_, bump_sampler_, nullptr);
         for (auto& image:continuous_glow_) DestroyImage(image);
         for (auto& image:glow_soft_) DestroyImage(image);
         DestroyImage(quick_background_);
@@ -2002,6 +2122,7 @@ bool VulkanBackend::CreateImage(Image& img, VkFormat fmt, uint32_t w, uint32_t h
 }
 
 void VulkanBackend::DestroyImage(Image& img) {
+    if (img.bump_view) d_.vkDestroyImageView(dev_, img.bump_view, nullptr);
     if (img.attachment) d_.vkDestroyImageView(dev_, img.attachment, nullptr);
     if (img.view) d_.vkDestroyImageView(dev_, img.view, nullptr);
     if (img.image) vmaDestroyImage(vma_, img.image, img.mem);
@@ -2062,6 +2183,12 @@ Target* VulkanBackend::EnsureTarget(const Surface& s, bool depth) {
     if (!depth && w==128 && h==128 && ContinuousGlowEnabled() && glow_targets_.count(s.data))
         scale=GlowTargetScale(uint32_t(scale_));
     uint32_t iw = w * scale, ih = h * scale;
+#ifdef NGB_DIRECT3D
+    if (native_width_ && ScanoutSize(w, h)) {
+        iw = native_width_;
+        ih = NGB_SCREEN_H;
+    }
+#endif
     // MSAA (a quality setting) for the display-sized targets: the 3D and what is drawn over it
     uint32_t samples = big ? uint32_t(msaa_) : 1;
     if (it != targets_.end()) {
@@ -2587,10 +2714,10 @@ void VulkanBackend::Clear(const State& s, uint32_t count, const uint8_t* rects, 
     float sx = float(any.w) / gw, sy = float(any.h) / gh;
     std::vector<VkClearRect> rs;
     auto add = [&](int x0, int y0, int x1, int y1) {
-        x0 = std::clamp(int(x0 * sx), 0, int(any.w));
-        y0 = std::clamp(int(y0 * sy), 0, int(any.h));
-        x1 = std::clamp(int(x1 * sx), 0, int(any.w));
-        y1 = std::clamp(int(y1 * sy), 0, int(any.h));
+        x0 = std::clamp(PixelEdge(x0, sx), 0, int(any.w));
+        y0 = std::clamp(PixelEdge(y0, sy), 0, int(any.h));
+        x1 = std::clamp(PixelEdge(x1, sx), 0, int(any.w));
+        y1 = std::clamp(PixelEdge(y1, sy), 0, int(any.h));
         if (x1 > x0 && y1 > y0) rs.push_back({{{x0, y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}}, 0, 1});
     };
     if (count && rects) {
@@ -2833,8 +2960,11 @@ VkImageView VulkanBackend::MakeStatic(Tex& tx,const TextureDesc& d,const uint8_t
     if (tx.img.image) Retire(tx.img);   // made again: the old one goes when no frame in flight uses it
     tx.combat_hull = {};
 #ifdef NGB_DIRECT3D
-    if (combat_clip_ && fi.host == Host::BC3 && !d.cube && d.depth == 1 && d.width == 64 &&
-        (d.height == 64 || d.height == 128))
+    tx.transparent_mission_border = false;
+    tx.quad_filter_flags = d.format == 0x19 ? kTexLinear | kTexQuadAlpha : kTexLinear;
+    if (fi.host == Host::BC3 && !d.cube && d.depth == 1 &&
+        ((combat_clip_ && d.width == 64 && (d.height == 64 || d.height == 128)) ||
+         (d.width == 128 && d.height == 128 && d.levels == 1)))
         tx.combat_hull = CombatAlphaHull(guest, d.width, d.height);
 #endif
     uint32_t faces = d.cube ? 6 : 1;
@@ -2872,10 +3002,16 @@ VkImageView VulkanBackend::MakeStatic(Tex& tx,const TextureDesc& d,const uint8_t
             tx.gen = 2;        // not to be made: the same whatever the setting
         }
     }
+    bool signed_view = bump_sampler_ && levels == 1 && !d.cube && (d.format == 0x28 || d.format == 0x17);
     auto make = [&] {
-        return CreateImage(tx.img, fmt, d.width, d.height, faces, levels, false, d.cube,
-                           VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                               (tx.gen == 1 ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0), 1, false);
+        VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        if (tx.gen == 1) usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        if (signed_view) {
+            if (CreateImage(tx.img, fmt, d.width, d.height, faces, levels, false, d.cube, usage, 1, true)) return true;
+            DestroyImage(tx.img);
+            signed_view = false;
+        }
+        return CreateImage(tx.img, fmt, d.width, d.height, faces, levels, false, d.cube, usage);
     };
     if (!make()) {   // out of memory: what this frame and the last didn't use goes, and once more (#81)
 #ifdef NGB_TEXTURE_PRELOAD
@@ -2886,6 +3022,16 @@ VkImageView VulkanBackend::MakeStatic(Tex& tx,const TextureDesc& d,const uint8_t
                      gone);
         if (!gone || !make())
             return VK_NULL_HANDLE;
+    }
+    if (signed_view) {
+        // DecodeLevel stores V8U8 in BGRA memory as U,V,U,V. Read bytes 0 and 1
+        // through an RGBA signed view while keeping the ordinary BGRA view intact.
+        VkImageViewCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        ci.image = tx.img.image;
+        ci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        ci.format = VK_FORMAT_R8G8B8A8_SNORM;
+        ci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        if (d_.vkCreateImageView(dev_, &ci, nullptr, &tx.img.bump_view) != VK_SUCCESS) tx.img.bump_view = VK_NULL_HANDLE;
     }
     tx.sig = sig;
     tx.used = frame_;
@@ -2917,6 +3063,30 @@ VkImageView VulkanBackend::MakeStatic(Tex& tx,const TextureDesc& d,const uint8_t
                     }
                 }
                 if (out.empty()) continue;
+#ifdef NGB_DIRECT3D
+                // Classify the actual uploaded pixels, including the current P8 palette.
+                if (levels == 1 && !d.cube && d.depth == 1) {
+                    if (d.format == 0x19) {
+                        size_t a = 3;
+                        while (a < out.size() && out[a] >= 6 && out[a] <= 249) a += 4;
+                        if (a >= out.size()) tx.quad_filter_flags = 0; // soft A8 can use bilinear
+                    } else if (d.format == 0x0b && palette) {
+                        tx.transparent_mission_border = TransparentMissionBorder(d, sig, out);
+                        bool opaque = true;
+                        uint8_t rg_difference = 0, gb_difference = 0;
+                        for (size_t i = 0; i < out.size(); i += 4) {
+                            opaque &= out[i + 3] == 255;
+                            rg_difference |= out[i + 2] ^ out[i + 1];
+                            gb_difference |= out[i + 1] ^ out[i];
+                            if (!opaque && (rg_difference || gb_difference)) break;
+                        }
+                        if (opaque)
+                            tx.quad_filter_flags = rg_difference ? kTexQuadOpaqueRGB : kTexQuadOpaqueRG;
+                        else
+                            tx.quad_filter_flags = (rg_difference || gb_difference) ? kTexQuadColorAlpha : kTexQuadGrayAlpha;
+                    }
+                }
+#endif
                 if (bump_src && l == 0 && f == 0 && bumpcheck_) tx.check = out;
                 if (bump_src && f == 0 && (l == 0 || std::getenv("NGB_D3D_BUMPLOG"))) {   // a bump map's first upload: its values, in the log (#16: they differ by machine)
                     static int n;
@@ -3336,7 +3506,7 @@ VkPipeline VulkanBackend::MakePipeline(const PipeKey& k, VkShaderModule vs, VkSh
         cbs.attachmentCount = k.has_rt ? 1 : 0;
         cbs.pAttachments = &cb;
         // the line width only on the line pipelines: the others, nearly all, stay as the caches have them
-        VkDynamicState dyn[6] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
+        VkDynamicState dyn[7] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
                                  VK_DYNAMIC_STATE_STENCIL_REFERENCE};
         VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
         dy.dynamicStateCount = 4;
@@ -3345,6 +3515,14 @@ VkPipeline VulkanBackend::MakePipeline(const PipeKey& k, VkShaderModule vs, VkSh
         dy.pDynamicStates = dyn;
         VkFormat cf = kColorFormat;
         VkPipelineRenderingCreateInfo pr{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+        VkPipelineDiscardRectangleStateCreateInfoEXT windows{VK_STRUCTURE_TYPE_PIPELINE_DISCARD_RECTANGLE_STATE_CREATE_INFO_EXT};
+        if (particle_windows_ && (k.has_rt & (kRtParticleWindows | kRtMissionBorder))) {
+            bool border = (k.has_rt & kRtMissionBorder) != 0;
+            windows.discardRectangleMode = border ? VK_DISCARD_RECTANGLE_MODE_EXCLUSIVE_EXT : VK_DISCARD_RECTANGLE_MODE_INCLUSIVE_EXT;
+            windows.discardRectangleCount = border ? 1 : kParticleWindowCount;
+            pr.pNext = &windows;
+            dyn[dy.dynamicStateCount++] = VK_DYNAMIC_STATE_DISCARD_RECTANGLE_EXT;
+        }
         pr.colorAttachmentCount = k.has_rt ? 1 : 0;
         pr.pColorAttachmentFormats = &cf;
         pr.depthAttachmentFormat = k.has_ds ? ds_format_ : VK_FORMAT_UNDEFINED;
@@ -3520,6 +3698,9 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     if (rt && ds && (rt->img.w != ds->img.w || rt->img.h != ds->img.h || rt->samples != ds->samples))
         ds = nullptr;                                  // as BeginRendering has it
     if (!rt && !ds) { st_.notarget++; return; }
+    const Target& target = rt ? *rt : *ds;
+    const float sx = float(target.img.w) / target.gw, sy = float(target.img.h) / target.gh;
+    const bool unequal_scale = sx != sy;
     if (ContinuousGlowEnabled()) InvalidateContinuousGlow(s.rt.data);
     if (rt) rt->glow_frame = ~0u;
     SparkEndpoint spark_ends[2]{};
@@ -3529,7 +3710,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     if (rt && rt->gw>=640 && rt->gh>=448 && SparkFixEnabled() && SparkAspect()>16.0/9.0 &&
         SparkEndpoints(s,prim,count,asm_,spark_ends)) {
         // Match the original hardware line-width clamp at this actual target scale.
-        float scale=float(rt->img.w)/float(rt->gw);
+        float scale=sy;
         float width=wide_lines_?std::clamp(Bits(s.rs[kRsLineWidth])*scale*SparkWidth(),1.0f,line_max_)/scale:1.0f/scale;
         spark_quad=ExpandSpark(s,spark_ends,float(SparkAspect()/(16.0/9.0)),width,spark_vertices,spark_assembled);
     }
@@ -3574,21 +3755,48 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         } else views[i] = BindTexture(s, i, info[i], from_target[i]);
     }
     draw_rt_ = nullptr;
-    // Only the UT producer can select these paths. Preserve the original
-    // visibility count, side effects, sampler and order for every other pass.
+    auto read_only_depth_stencil = [&] {
+        return !ds || ((!s.rs[kRsZEnable] || !SimpleState(s,kMZWriteEnable)) &&
+            (!s.rs[kRsStencilEnable] || !(SimpleState(s,kMStencilWriteMask) & 255) ||
+             (StencilOp(s.rs[kRsStencilFail]) == VK_STENCIL_OP_KEEP && StencilOp(SimpleState(s,kMStencilZFail)) == VK_STENCIL_OP_KEEP &&
+              StencilOp(SimpleState(s,kMStencilPass)) == VK_STENCIL_OP_KEEP)));
+    };
     const bool additive = effect == CombatEffect::Transparent && rt && !vis_on_ && !IdView() && !s.ps &&
         SimpleState(s,kMBlendEnable) && SimpleState(s,kMSrcBlend) == 0x302 && SimpleState(s,kMDestBlend) == 1 &&
         SimpleState(s,kMBlendOp) == 0x8006 &&
         (!SimpleState(s,kMAlphaTestEnable) || Cmp(SimpleState(s,kMAlphaFunc)) == VK_COMPARE_OP_ALWAYS) &&
-        (!ds || ((!s.rs[kRsZEnable] || !SimpleState(s,kMZWriteEnable)) &&
-        (!s.rs[kRsStencilEnable] || !(SimpleState(s,kMStencilWriteMask) & 255) ||
-         (StencilOp(s.rs[kRsStencilFail]) == VK_STENCIL_OP_KEEP && StencilOp(SimpleState(s,kMStencilZFail)) == VK_STENCIL_OP_KEEP &&
-          StencilOp(SimpleState(s,kMStencilPass)) == VK_STENCIL_OP_KEEP))));
+        read_only_depth_stencil();
     const auto& t0 = s.tss[0];
     const auto& t1 = s.tss[1];
     const CombatHull* hull = nullptr;
     std::array<float,4> tile{};
-    if (additive && combat_clip_ && !from_target[0] && views[0] && !a.pretransformed &&
+    static const char* psdbg = std::getenv("NGB_D3D_PSDEBUG");
+    CombatPixel particle = CombatPixel::None;
+    bool clip_particle = false;
+#ifdef NGB_DIRECT3D
+    // Two MODULATE stages: (BC3 * vertex colour) * (white RGB, varying
+    // opacity). The title uses this for layers of waterfall spray.
+    if (!s.ps && s.vs_handle == 0x142 && prim == 6 && count == 4 && !a.pretransformed &&
+        !s.rs[kRsLighting] && !s.rs[kRsVertexBlend] && s.rs[kRsZEnable] && rt &&
+        !vis_on_ && !IdView() && !psdbg && !g_shader_hooks &&
+        views[0] && !from_target[0] && info[0].kind == kTex2D && !info[0].rect && !info[0].flags &&
+        SimpleState(s,kMBlendEnable) && SimpleState(s,kMSrcBlend) == 0x302 &&
+        SimpleState(s,kMDestBlend) == 0x303 && SimpleState(s,kMBlendOp) == 0x8006 &&
+        (s.rs[kRsTextureFactor] & 0xffffff) == 0xffffff && s.tss[2][kTssColorOp] <= 1 &&
+        ModulatesCurrent(t0, 2) && ModulatesCurrent(t1, 3) && !t0[kTssTextureTransformFlags] &&
+        t0[kTssAlphaKill] != 4 && t1[kTssAlphaKill] != 4) {
+        TextureDesc tex;
+        if (Describe(s.textures[0],tex) && tex.format == 0x0f && tex.width == 128 && tex.height == 128 && tex.levels == 1) {
+            auto cmp = SimpleState(s,kMAlphaTestEnable) ? Cmp(SimpleState(s,kMAlphaFunc)) : VK_COMPARE_OP_ALWAYS;
+            particle = cmp == VK_COMPARE_OP_GREATER ? CombatPixel::ModulatedParticleGreater : CombatPixel::ModulatedParticle;
+            // A zero fails GREATER even at ref=0, before any stencil writes.
+            // With the test off the whole quad may still paint the stencil.
+            clip_particle = rt->samples == 1 && (cmp == VK_COMPARE_OP_GREATER || read_only_depth_stencil());
+            if (clip_particle && !(s.rs[kRsTextureFactor] >> 24)) return;
+        }
+    }
+#endif
+    if (((additive && combat_clip_) || clip_particle) && !from_target[0] && views[0] && !a.pretransformed &&
         a.topology == Topology::Triangles && s.vs_handle == 0x142 && !s.rs[kRsLighting] &&
         s.rs[kRsFillMode] != 0x1b00 && s.rs[kRsFillMode] != 0x1b01 &&
         t0[kTssTexCoordIndex] == 0 && !t0[kTssTextureTransformFlags] && !aniso_level_ &&
@@ -3597,7 +3805,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         (t1[kTssColorOp] <= 1 || (t1[kTssAlphaOp] == 4 && (t1[kTssAlphaArg1] == 1 || t1[kTssAlphaArg2] == 1) &&
          s.tss[2][kTssColorOp] <= 1))) {
         TextureDesc tex;
-        if (Describe(s.textures[0],tex) && tex.format == 0x0f &&
+        if (Describe(s.textures[0],tex) && tex.format == 0x0f && (tex.width == 64 || clip_particle) &&
             (tex.levels == 1 || (!t0[kTssMipFilter] && !t0[kTssMaxMipLevel]))) {
             auto i = textures_.find((uint64_t(tex.data) << 8) | tex.format);
             if (i != textures_.end() && i->second.img.view == views[0] && i->second.combat_hull.useful &&
@@ -3611,7 +3819,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     bool quad = count <= kQuadVertices && !s.rs[kRsZEnable];
     FixedKey fk;
     if (!prog) fk = MakeFixedKey(s);
-    if (hull) fk.light |= kCombatClipPlanes;
+    if (hull && additive) fk.light |= kCombatClipPlanes;
     uint64_t vkey;
     if (prog) {
         if (!s.vs->hash) s.vs->hash = Hash(s.vs->program.data(), s.vs->program.size() * 4) | 1;
@@ -3626,7 +3834,10 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     // coordinates (SpriteHlsl); made as drawn, not kept in the cache, whose recipes make the plain ones
     bool points = a.topology == Topology::Points;
     bool sprite = points && s.rs[kRsPointSpriteEnable];
+    const bool rectangular_point = points && unequal_scale;
+    const unsigned point_samples = standard_sample_locations_ && (target.samples == 2 || target.samples == 4) ? target.samples : 1;
     if (points) vkey ^= 0x9D7E0000;
+    if (rectangular_point) vkey ^= kRectangularPointKey;
     if (spark_quad) vkey ^= 0x53A4B197E42D061Bull;
     static const bool spritelog = std::getenv("NGB_D3D_SPRITELOG") != nullptr;
     if (sprite && spritelog) {   // NGB_D3D_SPRITELOG: each point sprite setup once, every stage (#51)
@@ -3673,7 +3884,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         // the quad step for a screen quad -- and for every pretransformed fixed-function draw, as the shader cache
         // rebuilds those (its record has no quad flag; the step does nothing unless QuadSnap turns it on)
         if (quad || (!prog && a.pretransformed)) src = QuadHlsl(std::move(src));
-        if (points) src = PointHlsl(std::move(src), prog ? 0 : a.pretransformed ? 2 : 1);
+        if (points) src = PointHlsl(std::move(src), prog ? 0 : a.pretransformed ? 2 : 1, rectangular_point);
         static const char* dump = std::getenv("NGB_D3D_SHADERDUMP");
         if (dump) {
             char path[512];
@@ -3707,11 +3918,48 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     static bool noshadow = std::getenv("NGB_D3D_NOSHADOW") != nullptr;   // debugging: no shadow-map passes
     if (noshadow && (info[0].shadow || info[1].shadow || info[2].shadow || info[3].shadow)) return;
     PixelKey pk = MakePixelKey(s, info);
+    VkImageView bump_view = VK_NULL_HANDLE;
+    if ((pk.tex[0].flags & kTexSigned) && !pk.tex[3].kind && !((pk.tex_modes >> 15) & 31) && !sprite && !psdbg) {
+        auto it = textures_.find(bump_key_);
+        if (it != textures_.end() && it->second.img.view == views[0]) bump_view = it->second.img.bump_view;
+        if (bump_view) pk.tex[0].flags |= kTexBumpView;
+    }
     pk.quad = quad;
+#ifdef NGB_DIRECT3D
+    bool mission_border = false;
+    // A single-sample 1x quad already uses ordinary hardware filtering. Only
+    // specialize the four taps when QuadSnap actually requests their weighting.
+    static const bool quad_snap = std::getenv("NGB_D3D_NO_QUADSNAP") == nullptr;
+    if (quad_snap && quad && a.pretransformed && count == 4 && rt &&
+        !pk.programmable && !from_target[0] && views[0] && !aniso_level_ &&
+        pk.tex[0].kind == kTex2D && pk.tex[0].flags == kTexLinear) {
+        const auto& t = s.tss[0];
+        TextureDesc tex;
+        if (t[kTssMinFilter] == 2 && t[kTssMagFilter] == 2 && !t[kTssMaxMipLevel] &&
+            t[kTssAddressU] == 3 && t[kTssAddressV] == 3 &&
+            Describe(s.textures[0], tex) && tex.levels == 1 && (tex.format == 0x19 || tex.format == 0x0b)) {
+            bool weighted = rt->img.w > rt->gw || rt->img.h > rt->gh || rt->samples > 1;
+            if (weighted && tex.format == 0x19) pk.tex[0].flags |= kTexQuadAlpha;
+            auto it = textures_.find((uint64_t(tex.data) << 8) | tex.format);
+            if (it != textures_.end() && it->second.img.view == views[0] &&
+                !pk.proj && s.tss[1][kTssColorOp] <= 1 &&
+                (!SimpleState(s, kMAlphaTestEnable) || Cmp(SimpleState(s, kMAlphaFunc)) == VK_COMPARE_OP_ALWAYS)) {
+                pk.tex[0].flags = weighted ? it->second.quad_filter_flags : 0;
+                mission_border = it->second.transparent_mission_border;
+            }
+        }
+    }
+#endif
     if (history && from_target[0]) {
         pk.tex[0].flags &= ~kTexLinear;
         pk.combat = CombatPixel::History;
     } else if (additive) pk.combat = CombatPixel::Additive;
+    else if (particle != CombatPixel::None) {
+        pk.combat = particle;
+        // The material fixes both stages. Stale unused XDK arguments should
+        // not create another shader or pipeline for the same operation.
+        std::memset(pk.ff, 0, sizeof(pk.ff));
+    }
 #ifdef NGB_DIRECT3D
     // UT layers repeatedly shade the same pixels. When the Xbox accepts every
     // alpha, a blended draw needs no final compare or conditional discard.
@@ -3744,14 +3992,15 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         pk.alphakill &= 8;
         pk.sprite = 1;
     }
+    if (unequal_scale && (pk.alphakill & 0xf0)) pk.alphakill |= kHazeTargetExtent;
     uint64_t pkey = Hash(&pk, sizeof(pk)) ^ 0x9E3779B97F4A7C15ull;
     if (IdView()) pkey ^= 0x1D1D1D1D1D1D1D1Dull * uint64_t(IdViewMode());   // other shaders: other modules in the cache
     if (sprite) pkey ^= 0x51D5;
+    if (rectangular_point) pkey ^= kRectangularPointKey + (point_samples - 1);
     // debugging: NGB_D3D_PSDEBUG=flat (solid red) | tex (stage 0's texture) | uv | diffuse
-    static const char* psdbg = std::getenv("NGB_D3D_PSDEBUG");
     static int flat = psdbg && !std::strcmp(psdbg, "flat");
     if (psdbg) pkey = Hash(psdbg, std::strlen(psdbg), pkey);
-    if (!psdbg && !sprite) {
+    if (!psdbg && !sprite && !rectangular_point) {
         bool pnew;
         {
             std::lock_guard<std::recursive_mutex> g(cache_mu_);
@@ -3761,7 +4010,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     }
     VkShaderModule pmod = Module(pkey, [&] {
         std::string src = PixelHlsl(pk);
-        if (sprite) src = SpriteHlsl(std::move(src));
+        if (sprite || rectangular_point) src = PointPixelHlsl(std::move(src), sprite, rectangular_point ? point_samples : 0);
         // NGB_D3D_PSDEBUG=bump | duv | copy: the water's draws only (a bump map in stage 0 displacing stage
         // 2's texture, #16): the ripple texture's raw bytes as sampled (u red, v green: two-tone, as small
         // signed values look unsigned), the displacement decoded from it (grey = none), or stage 2's
@@ -3844,6 +4093,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     uint32_t cw = SimpleState(s, kMColorWriteEnable);
     k.wmask = ((cw >> 16) & 1) | ((cw >> 8) & 1) << 1 | (cw & 1) << 2 | ((cw >> 24) & 1) << 3;
     k.has_rt = rt != nullptr;
+    if (hull && clip_particle && particle_windows_) k.has_rt |= kRtParticleWindows;
     k.has_ds = ds != nullptr;
     k.samples = rt ? rt->samples : ds ? ds->samples : 1;
     if (ds) {
@@ -3867,8 +4117,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
             // render scale a fraction of what it is per console pixel, so the bias at it the same fraction -- the
             // lava light laid over the cave walls (blended, depth test LEQUAL) fell back onto the walls above 1x and
             // fought them in a flicker of specks (#213). At the target's scale, as the pull below.
-            const Target* zt = rt ? rt : ds;   // (a depth-only pass: its depth target's scale)
-            float zs = zt ? float(zt->img.w) / float(std::max<uint32_t>(zt->gw, 1)) : 1.0f;
+            float zs = std::max(sx, sy);
             // and three times the game's slope part where nothing writes depth (#213): the lava light laid over the
             // cave walls specked at grazing angles, its margin too small (twice left a few in the Magma and Ice
             // Caverns); what writes depth (shadow casters) as the game
@@ -3892,7 +4141,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
                     // there). Half a console pixel's worth covers them on an edge-on wall and is next to nothing on
                     // a surface facing the camera, where a constant pull brought things behind a facade through it;
                     // 2 depth steps more for the flattest ties.
-                    float scale = rt ? float(rt->img.w) / float(std::max<uint32_t>(rt->gw, 1)) : 1.0f;
+                    float scale = std::max(sx, sy);
                     pull_slope = -SectionSlope() * std::max(scale, 1.0f);
                     pull_steps = -SectionPull();
                     section_pulled_++;
@@ -3909,7 +4158,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         if (shadow_pull && receiver && !(k.has_ds & kDsDynamicBias) && a.topology == Topology::Triangles && k.zen &&
             !k.zwrite && k.has_ds) {
             k.has_ds |= kDsDynamicBias;
-            float scale = rt ? float(rt->img.w) / float(std::max<uint32_t>(rt->gw, 1)) : 1.0f;
+            float scale = std::max(sx, sy);
             pull_slope = -SectionSlope() * std::max(scale, 1.0f);
             pull_steps = -SectionPull();
         }
@@ -3962,7 +4211,21 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         pkey^=0x674C4F5753540001ull;k.ps=pkey;
         pmod=Module(pkey,[&] {return GlowStrengthHlsl(PixelHlsl(pk));},false);
     }
+#ifdef NGB_DIRECT3D
+    if (mission_border && particle_windows_ && prim == 6 && !prog && pk.combat == CombatPixel::None &&
+        (pk.tex[0].flags == kTexQuadColorAlpha || !pk.tex[0].flags) && rt->samples == 1 &&
+        rt->gw >= 640 && rt->gh >= 448 &&
+        !vis_on_ && !trace_ && !psdbg && !IdView() && !g_shader_hooks &&
+        !t0[kTssTextureTransformFlags] && t0[kTssTexCoordIndex] == 0 && t0[kTssColorOp] == 4 &&
+        t0[kTssAlphaOp] == 4 && t0[kTssAlphaArg1] == 2 && t0[kTssAlphaArg2] == 0 && t0[kTssResultArg] != 5 &&
+        !k.zen && !k.sten && k.blend && k.src == 0x302 && k.dst == 0x303 && k.op == 0x8006)
+        k.has_rt |= kRtMissionBorder;
+#endif
     VkPipeline pipe = vmod && pmod ? Pipeline(k) : VK_NULL_HANDLE;
+    if (!pipe && vmod && pmod && (k.has_rt & (kRtParticleWindows | kRtMissionBorder))) {
+        k.has_rt &= ~(kRtParticleWindows | kRtMissionBorder);
+        pipe = Pipeline(k);
+    }
     if (!pipe && vmod && pmod && (k.has_ds & kDsDynamicBias)) {
         // the map piece's pipeline with the bias at the draw still being made: drawn meanwhile without the pull,
         // by the pipeline it had before (the caches have it), rather than left out
@@ -3991,7 +4254,10 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     c.surf[0] = float(gw);
     c.surf[1] = float(gh);
     c.surf[2] = 1.0f / s.zscale;
-    c.surf[3] = float((rt ? rt->img : ds->img).w) / float(gw);   // the target's pixels to the console's
+    c.surf[3] = sx;
+    c.raster[0] = float(target.img.w);
+    c.raster[1] = float(target.img.h);
+    c.raster[2] = point_max_;
     if (s.rs[kRsFogEnable]) {
         c.fog[0] = Bits(s.rs[kRsFogStart]);
         c.fog[1] = Bits(s.rs[kRsFogEnd]);
@@ -4348,13 +4614,28 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         for (int i = 0; i < 8; i++)
             if ((fk.types >> (i * 2)) & 3) LightToView(s.lights[size_t(i)], s.transforms[2].data(), c.lt[i]);
     }
+#ifdef NGB_DIRECT3D
+    // The mission grid fades its pictures and borders through vertex alpha.
+    // Preserve the HUD layout accounting above, then omit the GPU work when
+    // the blend preserves every destination channel and the draw has no other output.
+    if (rt && rt->gw >= 640 && rt->gh >= 448 && prim == 6 && a.pretransformed &&
+        !prog && !pk.programmable && pk.combat == CombatPixel::None && !from_target[0] && views[0] &&
+        !vis_on_ && !trace_ && !psdbg && !IdView() && !g_shader_hooks &&
+        !k.zen && !k.sten && k.blend && k.src == 0x302 && k.dst == 0x303 && k.op == 0x8006 &&
+        t0[kTssColorOp] == 4 && t0[kTssAlphaOp] == 4 && t0[kTssAlphaArg1] == 2 &&
+        t0[kTssAlphaArg2] == 0 && t0[kTssResultArg] != 5 && t1[kTssColorOp] <= 1 &&
+        CombatQuadIsInvisible(a)) {
+        TextureDesc tex;
+        if (Describe(s.textures[0], tex) && tex.format == 0x0b) return;
+    }
+#endif
     VkDeviceSize vc;
     if (points && !prog) {   // the point sizes for PointHlsl, in registers fixed function leaves unused
         auto v = s.vsc;
         float vh = s.viewport.h > 0 ? float(s.viewport.h) : float(gh);
         float mx = Bits(s.rs[kRsPointSizeMax]);
         if (!(mx > 0)) mx = 64.0f;
-        v[190] = {Bits(s.rs[kRsPointSize]), Bits(s.rs[kRsPointSizeMin]), std::min(mx, point_max_ / c.surf[3]),
+        v[190] = {Bits(s.rs[kRsPointSize]), Bits(s.rs[kRsPointSizeMin]), rectangular_point ? mx : std::min(mx, point_max_ / sx),
                   s.rs[kRsPointScaleEnable] ? 1.0f : 0.0f};
         v[191] = {Bits(s.rs[kRsPointScaleA]), Bits(s.rs[kRsPointScaleB]), Bits(s.rs[kRsPointScaleC]), vh};
         vc = UploadReused(vc_reuse_, v.data(), sizeof(v), ringAlign_);
@@ -4376,7 +4657,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         if (capture || composite) c.qsnap[1] = 0.0f;
     }
 #endif
-    if (hull) {
+    if (hull && additive) {
         for (unsigned j = 0; j < 4; ++j) {
             c.uvc[0][j] = tile[j] + hull->lo[j];
             c.uvc[1][j] = tile[j] + hull->hi[j];
@@ -4460,6 +4741,11 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     VkDescriptorBufferInfo bvc{ring_, vc, sizeof(s.vsc)}, bdc{ring_, dc, sizeof(c)};
     VkDescriptorImageInfo img[4], smp[4];
     for (int i = 0; i < 4; i++) {
+        if (i == 3 && bump_view) {
+            img[i] = {VK_NULL_HANDLE, bump_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            smp[i] = {bump_sampler_, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
+            continue;
+        }
         VkImageView v = views[i];
         if (!v) v = info[i].kind == kTexCube ? nullcube_.view : null2d_.view;
         img[i] = {VK_NULL_HANDLE, v,
@@ -4491,14 +4777,13 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     const Image& any = rt ? rt->img : ds->img;
     VkViewport vpt{0, float(any.h), float(any.w), -float(any.h), 0, 1};
     SetViewport(vpt);
-    float sx = float(any.w) / gw, sy = float(any.h) / gh;
-    int x0 = int(s.viewport.x * sx), y0 = int(s.viewport.y * sy);
-    int x1 = int((s.viewport.x + s.viewport.w) * sx), y1 = int((s.viewport.y + s.viewport.h) * sy);
+    int x0 = PixelEdge(s.viewport.x, sx), y0 = PixelEdge(s.viewport.y, sy);
+    int x1 = PixelEdge(s.viewport.x + s.viewport.w, sx), y1 = PixelEdge(s.viewport.y + s.viewport.h, sy);
     if (s.scissor_count) {
-        x0 = std::max(x0, int(s.scissors[0] * sx));
-        y0 = std::max(y0, int(s.scissors[1] * sy));
-        x1 = std::min(x1, int(s.scissors[2] * sx));
-        y1 = std::min(y1, int(s.scissors[3] * sy));
+        x0 = std::max(x0, PixelEdge(s.scissors[0], sx));
+        y0 = std::max(y0, PixelEdge(s.scissors[1], sy));
+        x1 = std::min(x1, PixelEdge(s.scissors[2], sx));
+        y1 = std::min(y1, PixelEdge(s.scissors[3], sy));
     }
     if (hud_clip1 > 0) {
         x0 = std::max(x0, int(std::floor(hud_clip0 * sx)));
@@ -4513,6 +4798,19 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     x1 = std::clamp(x1, x0, int(any.w));
     y1 = std::clamp(y1, y0, int(any.h));
     VkRect2D sc{{x0, y0}, {uint32_t(x1 - x0), uint32_t(y1 - y0)}};
+#ifdef NGB_DIRECT3D
+    if (k.has_rt & kRtMissionBorder) {
+        // Always set the rectangle, including an empty one if this quad does not match.
+        VkRect2D interior = MissionBorderInterior(a, c, sc, sx, sy);
+        d_.vkCmdSetDiscardRectangleEXT(cmd_, 0, 1, &interior);
+    }
+#endif
+    ParticleWindows windows;
+    if (hull && clip_particle) {
+        bool use_windows = (k.has_rt & kRtParticleWindows) != 0;
+        ParticleScissor(a, *hull, tile, c.wvp, any.w, any.h, sc, use_windows ? &windows : nullptr);
+        if (use_windows) d_.vkCmdSetDiscardRectangleEXT(cmd_,0,kParticleWindowCount,windows.data());
+    }
     static int logn = std::getenv("NGB_D3D_LOGDRAWS") ? std::atoi(std::getenv("NGB_D3D_LOGDRAWS")) : 0;
     if (logn > 0) {
         logn--;
@@ -4543,7 +4841,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     if (k.has_ds & kDsDynamicBias)
         d_.vkCmdSetDepthBias(cmd_, float(k.zbias + pull_steps), 0.0f, k.zslope + pull_slope);
     if (Lines(k))   // D3DRS_LINEWIDTH, in the game's pixels: at the target's scale (the streaks' NGB_SPARK_WIDTH)
-        d_.vkCmdSetLineWidth(cmd_, wide_lines_ ? std::clamp(Bits(s.rs[kRsLineWidth]) * sx *
+        d_.vkCmdSetLineWidth(cmd_, wide_lines_ ? std::clamp(Bits(s.rs[kRsLineWidth]) * sy *
                                                             (Bits(s.rs[kRsLineWidth]) > 1.0f ? SparkWidth() : 1.0f),
                                                             1.0f, line_max_) : 1.0f);
 
@@ -4729,11 +5027,12 @@ void VulkanBackend::Copy(const Surface& src, const Surface& dst, uint32_t count,
     auto add = [&](int x0, int y0, int x1, int y1, int dx, int dy) {
         VkImageBlit r{};
         r.srcSubresource = r.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        float sa = float(a->img.w) / a->gw, sb = float(b->img.w) / b->gw;
-        r.srcOffsets[0] = {int(x0 * sa), int(y0 * sa), 0};
-        r.srcOffsets[1] = {int(x1 * sa), int(y1 * sa), 1};
-        r.dstOffsets[0] = {int(dx * sb), int(dy * sb), 0};
-        r.dstOffsets[1] = {int((dx + x1 - x0) * sb), int((dy + y1 - y0) * sb), 1};
+        float ax = float(a->img.w) / a->gw, ay = float(a->img.h) / a->gh;
+        float bx = float(b->img.w) / b->gw, by = float(b->img.h) / b->gh;
+        r.srcOffsets[0] = {PixelEdge(x0, ax), PixelEdge(y0, ay), 0};
+        r.srcOffsets[1] = {PixelEdge(x1, ax), PixelEdge(y1, ay), 1};
+        r.dstOffsets[0] = {PixelEdge(dx, bx), PixelEdge(dy, by), 0};
+        r.dstOffsets[1] = {PixelEdge(dx + x1 - x0, bx), PixelEdge(dy + y1 - y0, by), 1};
         rs.push_back(r);
     };
     if (count && src_rects) {
@@ -5128,12 +5427,12 @@ void VulkanBackend::TraceFrame(Target& t) {
 #ifdef NGB_DIRECT3D
 void VulkanBackend::QueueScanout(const Surface& front) {
     Target* t = EnsureTarget(front, false);
-    if (!t || (t->gw != NGB_SCAN_W && t->gw != 640) || t->gh != NGB_SCAN_H) return;
+    if (!t || !ScanoutSize(t->gw, t->gh)) return;
 #ifdef NGB_GPU_PRESENT
     if (!screen_picture_.image && switch_display::active()) {
         // Keep the most recent picture on the GPU so the frontend can also
         // redraw a paused frame. Both threads submit to the same graphics queue.
-        const uint32_t width = ngb_settings_standard_aspect() ? 960u : uint32_t(NGB_SCREEN_W);
+        const uint32_t width = ngb_picture_width(ngb_settings_standard_aspect());
         if (!CreateImage(screen_picture_, kColorFormat, width, NGB_SCREEN_H, 1, 1, false, false,
                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                          VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
@@ -5151,12 +5450,20 @@ void VulkanBackend::QueueScanout(const Surface& front) {
         EndRendering();
         Barrier(t->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         Barrier(screen_picture_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        VkImageBlit blit{};
-        blit.srcSubresource = blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        blit.srcOffsets[1] = {int(t->img.w), int(t->img.h), 1};
-        blit.dstOffsets[1] = {int(screen_picture_.w), int(screen_picture_.h), 1};
-        d_.vkCmdBlitImage(cmd_, t->img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                          screen_picture_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+        if (t->img.w == screen_picture_.w && t->img.h == screen_picture_.h) {
+            VkImageCopy copy{};
+            copy.srcSubresource = copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            copy.extent = {t->img.w, t->img.h, 1};
+            d_.vkCmdCopyImage(cmd_, t->img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                              screen_picture_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        } else {
+            VkImageBlit blit{};
+            blit.srcSubresource = blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            blit.srcOffsets[1] = {int(t->img.w), int(t->img.h), 1};
+            blit.dstOffsets[1] = {int(screen_picture_.w), int(screen_picture_.h), 1};
+            d_.vkCmdBlitImage(cmd_, t->img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                              screen_picture_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+        }
         if (!qk_.layer.empty()) QuickMenu(screen_picture_);
         Barrier(screen_picture_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         screen_queued_ = true;

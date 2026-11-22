@@ -74,6 +74,13 @@ const ShaderHooks& Hooks() {
 
 std::string Common() { return kCommonHead + Hooks().Constants() + kCommonTail; }
 
+// Only the variants for a nonuniform target need this trailing register.
+// All previous material recipes retain their exact source and buffer offsets.
+void DeclareRasterExtent(std::string& s) {
+    const char* last = "    float4 qsnap;\n";
+    s.insert(s.find(last) + std::strlen(last), "    float4 raster;\n");
+}
+
 // vertex programs
 
 const char* kVsHelpers = R"(
@@ -877,6 +884,7 @@ bool IdView() { return IdViewMode() > 0; }
 
 std::string PixelHlsl(const PixelKey& k) {
     std::string s = Common();
+    if (k.alphakill & kHazeTargetExtent) DeclareRasterExtent(s);
     s += PsHelpers();
     for (int i = 0; i < 4; i++) {
         const TexInfo& t = k.tex[i];
@@ -893,6 +901,12 @@ std::string PixelHlsl(const PixelKey& k) {
     }
     for (int i = 0; i < 4; i++) {
         if (!(k.tex[i].flags & kTexSigned) || k.tex[i].kind != kTex2D) continue;
+        if (i == 0 && (k.tex[i].flags & kTexBumpView)) {
+            // The colour combiner can still read tex0 as unsigned. The same bytes in
+            // tex3 are signed before the sampler interpolates across zero.
+            s += "float2 bumpduv0(float2 uv) { return tex3.SampleLevel(smp3, uv, 0).rg; }\n";
+            continue;
+        }
         // NGB_D3D_BUMPLEVEL=n (debugging): the ripple texture read at level n everywhere, to see each level's texels
         static const char* force = std::getenv("NGB_D3D_BUMPLEVEL");
         // the level the console's sampler would read: the computed one plus the stage's bias, from its most
@@ -949,7 +963,15 @@ std::string PixelHlsl(const PixelKey& k) {
     bool vertex_colour = !k.tex[0].kind && f[0] == 2 && f[1] == 0 && f[4] == 2 && f[5] == 0;
     bool use_fade = fade[0] == 3 && fade[2] == 1 && fade[4] == 4 && fade[5] == 3 && fade[6] == 1 &&
                     fade[8] != 5 && k.ff[2][0] <= 1;
-    if (k.combat != CombatPixel::None && !k.programmable && k.skip_alpha_test && !k.alphakill &&
+    if (k.combat == CombatPixel::ModulatedParticle || k.combat == CombatPixel::ModulatedParticleGreater) {
+        // The texture factor has white RGB and the FVF has no specular
+        // colour. Preserve the Xbox's per-pixel distance fog and 8-bit test.
+        body += "float4 layer = saturate(tex0.Sample(smp0, tc0.xy) * v0);\n"
+                "float alpha = saturate(tfactor.a * layer.a);\n";
+        if (k.combat == CombatPixel::ModulatedParticleGreater)
+            body += "if ((int)round(alpha * 255) <= (int)misc.x) discard;\n";
+        body += "float4 outc = float4(lerp(fogin.rgb, layer.rgb, fogin.a), alpha);\n";
+    } else if (k.combat != CombatPixel::None && !k.programmable && k.skip_alpha_test && !k.alphakill &&
         !k.proj && !k.sprite && !g_shader_hooks && (textured || vertex_colour) && f[8] != 5 &&
         (fade[0] <= 1 || use_fade)) {
         if (textured) {
@@ -1039,28 +1061,80 @@ std::string PixelHlsl(const PixelKey& k) {
                 // haze (d). Near the copy's edges the move toward that edge fades out (to none at the edge, over 3%
                 // of the copy): the haze is drawn there, less moved, and never reads past the picture -- where it
                 // read the edge column clamped, a streaky band; mirrored, the picture's mirror
-                body += F("float2 hz%d;\n{\n    float2 u = %s, b = i.pos.xy / (surf.xy * surf.w), d = u - b;\n"
+                const char* extent = (k.alphakill & kHazeTargetExtent) ? "raster.xy" : "(surf.xy * surf.w)";
+                body += F("float2 hz%d;\n{\n    float2 u = %s, b = i.pos.xy / %s, d = u - b;\n"
                           "    d.x *= d.x > 0 ? saturate((1 - b.x) / 0.03) : saturate(b.x / 0.03);\n"
                           "    d.y *= d.y > 0 ? saturate((1 - b.y) / 0.03) : saturate(b.y / 0.03);\n"
-                          "    hz%d = b + d;\n}\n", i, uv.c_str(), i);
+                          "    hz%d = b + d;\n}\n", i, uv.c_str(), extent, i);
                 uv = F("hz%d", i);
             }
             std::string cube;
+            const bool palette_texels = t.flags == kTexQuadColorAlpha || t.flags == kTexQuadGrayAlpha;
             if (t.shadow)
                 body += F("float4 t%d = shadow%d((tc%d.xy / tc%d.w)%s, tc%d.z / tc%d.w, %d, i.pos.xy, texsize[%d].xy);\n", i, i, i, i,
                           norm.c_str(), i, i, t.shadow, i);
             else if (t.kind == kTex2D && (t.flags & kTexWide))
                 body += F("float4 t%d = spreadtap%d(%s, spread[%d], %s);\n", i, i, uv.c_str(), i, Hooks().ReadScale(t).c_str());
+            else if (!palette_texels && (t.flags & kTexQuadOpaqueRG)) {
+                // Gather each independent channel and retain QuadSnap's floating-point
+                // weights. Hardware bilinear filtering can round these differently.
+                const bool full_rgb = (t.flags & kTexQuadOpaqueRGB) == kTexQuadOpaqueRGB;
+                body += F("float2 grid = (%s) * texsize[%d].xy - 0.5;\n", uv.c_str(), i);
+                body += F("float2 base = floor(grid), w = grid - base, centre = (base + 1) / texsize[%d].xy;\n"
+                          "float4 red = tex%d.GatherRed(smp%d, centre).wzxy;\n"
+                          "float4 blue = tex%d.GatherBlue(smp%d, centre).wzxy;\n", i, i, i, i, i);
+                if (full_rgb) body += F("float4 green = tex%d.GatherGreen(smp%d, centre).wzxy;\n", i, i);
+                body += "float4 weights = float4((1-w.x)*(1-w.y), w.x*(1-w.y), (1-w.x)*w.y, w.x*w.y);\n"
+                        "float total = weights.x + weights.y + weights.z + weights.w;\n";
+                if (full_rgb)
+                    body += F("float3 rgb = (float3(red.x, green.x, blue.x)*weights.x + float3(red.y, green.y, blue.y)*weights.y + "
+                              "float3(red.z, green.z, blue.z)*weights.z + float3(red.w, green.w, blue.w)*weights.w) / total;\n"
+                              "float4 t%d = float4(rgb, 1);\n", i);
+                else
+                    body += F("float2 rgb = (float2(red.x, blue.x)*weights.x + float2(red.y, blue.y)*weights.y + "
+                              "float2(red.z, blue.z)*weights.z + float2(red.w, blue.w)*weights.w) / total;\n"
+                              "float4 t%d = float4(rgb.x, rgb.x, rgb.y, 1);\n", i);
+            }
+            else if (!palette_texels && (t.flags & kTexQuadAlpha)) {
+                // A8 decodes to (1,1,1,a). Gather at the middle of the same four
+                // texels, so rounding the gather coordinates cannot select a
+                // neighbouring footprint. Keep the quad shader's cut-out rule.
+                body += F("float2 grid = (%s) * texsize[%d].xy - 0.5;\n", uv.c_str(), i);
+                body += F("float2 base = floor(grid), w = grid - base;\n"
+                          "float4 qa = tex%d.GatherAlpha(smp%d, (base + 1) / texsize[%d].xy).wzxy;\n"
+                          "float4 weights = float4((1-w.x)*(1-w.y), w.x*(1-w.y), (1-w.x)*w.y, w.x*w.y);\n"
+                          "float4 aw = weights * qa;\n"
+                          "float alpha = aw.x + aw.y + aw.z + aw.w;\n"
+                          "if (all(qa < 0.02 || qa > 0.98))\n"
+                          "    alpha = w.y < 0.5 ? (w.x < 0.5 ? qa.x : qa.y) : (w.x < 0.5 ? qa.z : qa.w);\n"
+                          "float4 t%d = float4(1, 1, 1, alpha);\n", i, i, i, i);
+            }
             else if (t.kind == kTex2D && k.quad && (t.flags & kTexLinear)) {
                 // the four texels around, weighted by their alpha when the backend asks (qsnap.y, QuadSnap)
-                std::string tap =
-                    "float4 t$;\n"
-                    "if (qsnap.y > 0) {\n"
-                    "    float2 sz$; tex$.GetDimensions(sz$.x, sz$.y);\n"
-                    "    float2 f$ = (UV) * sz$ - 0.5;\n"
-                    "    float2 b$ = floor(f$), w$ = f$ - b$, c$ = (b$ + 0.5) / sz$, d$ = 1 / sz$;\n"
-                    "    float4 q0$ = tex$.SampleLevel(smp$, c$, 0), q1$ = tex$.SampleLevel(smp$, c$ + float2(d$.x, 0), 0);\n"
-                    "    float4 q2$ = tex$.SampleLevel(smp$, c$ + float2(0, d$.y), 0), q3$ = tex$.SampleLevel(smp$, c$ + d$, 0);\n"
+                std::string tap = "float4 t$;\nif (qsnap.y > 0) {\n";
+                if (palette_texels) {
+                    // The four inputs to the filter are individual texels at level zero.
+                    // A gray palette needs only luminance and alpha from that footprint.
+                    tap += "    float2 sz$ = texsize[$].xy, f$ = (UV) * sz$ - 0.5;\n"
+                           "    float2 b$ = floor(f$), w$ = f$ - b$;\n";
+                    if (t.flags == kTexQuadGrayAlpha) {
+                        tap += "    float2 centre$ = (b$ + 1) / sz$;\n"
+                               "    float4 g$ = tex$.GatherRed(smp$, centre$).wzxy, a$ = tex$.GatherAlpha(smp$, centre$).wzxy;\n"
+                               "    float4 q0$ = float4(g$.xxx,a$.x), q1$ = float4(g$.yyy,a$.y);\n"
+                               "    float4 q2$ = float4(g$.zzz,a$.z), q3$ = float4(g$.www,a$.w);\n";
+                    } else {
+                        tap += "    int2 lo$ = int2(clamp(b$, 0, sz$ - 1)), hi$ = int2(clamp(b$ + 1, 0, sz$ - 1));\n"
+                               "    float4 q0$ = tex$.Load(int3(lo$,0)), q1$ = tex$.Load(int3(hi$.x,lo$.y,0));\n"
+                               "    float4 q2$ = tex$.Load(int3(lo$.x,hi$.y,0)), q3$ = tex$.Load(int3(hi$,0));\n";
+                    }
+                } else {
+                    tap += "    float2 sz$; tex$.GetDimensions(sz$.x, sz$.y);\n"
+                           "    float2 f$ = (UV) * sz$ - 0.5;\n"
+                           "    float2 b$ = floor(f$), w$ = f$ - b$, c$ = (b$ + 0.5) / sz$, d$ = 1 / sz$;\n"
+                           "    float4 q0$ = tex$.SampleLevel(smp$, c$, 0), q1$ = tex$.SampleLevel(smp$, c$ + float2(d$.x, 0), 0);\n"
+                           "    float4 q2$ = tex$.SampleLevel(smp$, c$ + float2(0, d$.y), 0), q3$ = tex$.SampleLevel(smp$, c$ + d$, 0);\n";
+                }
+                tap +=
                     "    float4 wq$ = float4((1 - w$.x) * (1 - w$.y), w$.x * (1 - w$.y), (1 - w$.x) * w$.y, w$.x * w$.y);\n"
                     "    float4 aw$ = wq$ * float4(q0$.a, q1$.a, q2$.a, q3$.a);\n"
                     "    float sa$ = aw$.x + aw$.y + aw$.z + aw$.w;\n"
@@ -1091,7 +1165,7 @@ std::string PixelHlsl(const PixelKey& k) {
         body += "cur.rgb = saturate(cur.rgb + v1.rgb);\n";
         body += "float4 outc = float4(lerp(fogin.rgb, cur.rgb, fogin.a), cur.a);\n";
     }
-    if (!k.skip_alpha_test) body += "alphatest(outc.a);\n";
+    if (!k.skip_alpha_test && k.combat != CombatPixel::ModulatedParticleGreater) body += "alphatest(outc.a);\n";
     body += Hooks().Output();
     // NGB_D3D_IDVIEW=1 (debugging): an opaque 3D surface tinted by its draw's colour (qsnap.z: 1 + a palette
     // index), its own shading kept -- two surfaces fighting over pixels show as two colours speckling
@@ -1118,7 +1192,7 @@ std::string PixelHlsl(const PixelKey& k) {
 // pixel shader. kind: 0 a vertex program (its oPts), 1 fixed function (vp in view space), 2 pretransformed.
 // The fixed function sizes come in c[190] (size, min, max, scaling on) and c[191] (A, B, C, viewport
 // height), registers its draws leave unused.
-std::string PointHlsl(std::string s, int kind) {
+std::string PointHlsl(std::string s, int kind, bool rectangular) {
     auto put = [&](const char* at, const std::string& add, bool before) {
         size_t i = s.find(at);
         if (i != std::string::npos) s.insert(before ? i : i + std::strlen(at), add);
@@ -1136,7 +1210,13 @@ std::string PointHlsl(std::string s, int kind) {
     // the centre in the console's pixels (half a pixel in, as the vertex epilogue puts it), from the position
     // as it goes out: fixed function has no p
     size += "    float2 pc = float2((o.pos.x / o.pos.w + 1) * surf.x * 0.5, (1 - o.pos.y / o.pos.w) * surf.y * 0.5);\n";
-    size += "    o.psize = max(psz * surf.w, 1);\n    o.ptc = float4(pc * surf.w, o.psize, 0);\n";
+    if (rectangular) {
+        DeclareRasterExtent(s);
+        size += "    float2 scale = raster.xy / surf.xy;\n"
+                "    float2 extent = clamp(psz * scale, 1, raster.z);\n"
+                "    o.psize = max(extent.x, extent.y);\n"
+                "    o.ptc = float4(pc * scale, extent);\n";
+    } else size += "    o.psize = max(psz * surf.w, 1);\n    o.ptc = float4(pc * surf.w, o.psize, 0);\n";
     // before main's return, whatever comes ahead of it: the fog line differs (fixed function fog from the
     // depth, #51's torch embers), and anchored on one form the size went unwritten -- a point with no size
     // (validation VUID 08773), not drawn at all
@@ -1147,14 +1227,41 @@ std::string PointHlsl(std::string s, int kind) {
 
 // A point sprite's pixel shader: stage 3's coordinates run 0 to 1 across the point, top left first; the
 // other stages keep the vertex's, as on the console (xemu: pT3 = gl_PointCoord).
-std::string SpriteHlsl(std::string s) {
+std::string PointPixelHlsl(std::string s, bool sprite, unsigned rectangular_samples) {
     size_t i = s.find("    float fogamt : TEXCOORD4;\n");
     if (i != std::string::npos) s.insert(i + std::strlen("    float fogamt : TEXCOORD4;\n"), "    float4 ptc : TEXCOORD5;\n");
+    const bool multisampled = rectangular_samples == 2 || rectangular_samples == 4;
+    if (multisampled) s.insert(s.find(") : SV_Target {", s.find("float4 main(")), ", out uint pointCoverage : SV_Coverage");
     const char* tc = "    float4 tc0 = i.tc0, tc1 = i.tc1, tc2 = i.tc2, tc3 = i.tc3;\n";
     i = s.find(tc);
-    if (i != std::string::npos)
-        s.replace(i, std::strlen(tc), "    float4 spr = float4((i.pos.xy - i.ptc.xy) / i.ptc.z + 0.5, 0, 1);\n"
-                                      "    float4 tc0 = i.tc0, tc1 = i.tc1, tc2 = i.tc2, tc3 = spr;\n");
+    if (i != std::string::npos) {
+        // Vulkan rasterizes a square. On a nonuniform target keep only the
+        // Xbox point's rectangular footprint, including for untextured points.
+        std::string uv = rectangular_samples
+            ? "    float4 spr = float4((i.pos.xy - i.ptc.xy) / i.ptc.zw + 0.5, 0, 1);\n"
+            : "    float4 spr = float4((i.pos.xy - i.ptc.xy) / i.ptc.z + 0.5, 0, 1);\n";
+        if (multisampled) {
+            // The point rasterizer covers the long axis. Clip the short axis at the Vulkan
+            // standard sample locations, shading the texture only once per fragment.
+            uv += "    bool clipX = i.ptc.z < i.ptc.w;\n"
+                  "    float2 corner = floor(i.pos.xy) - i.ptc.xy + 0.5 * i.ptc.zw;\n"
+                  "    float edge = clipX ? corner.x : corner.y, width = min(i.ptc.z, i.ptc.w);\n"
+                  "    pointCoverage = ~0u;\n"
+                  "    if (edge < 0 || edge + 1 > width) {\n";
+            if (rectangular_samples == 2)
+                uv += "        float2 at = edge + float2(0.75, 0.25);\n";
+            else
+                uv += "        float4 at = edge + (clipX ? float4(0.375, 0.875, 0.125, 0.625)"
+                      " : float4(0.125, 0.375, 0.625, 0.875));\n";
+            uv += "        pointCoverage = 0u;\n";
+            for (unsigned j = 0; j < rectangular_samples; ++j)
+                uv += F("        if (at[%u] >= 0 && at[%u] < width) pointCoverage |= %uu;\n", j, j, 1u << j);
+            uv += "        if (!pointCoverage) discard;\n    }\n";
+        } else if (rectangular_samples)
+            uv += "    if (any(spr.xy < 0) || any(spr.xy >= 1)) discard;\n";
+        uv += sprite ? "    float4 tc0 = i.tc0, tc1 = i.tc1, tc2 = i.tc2, tc3 = spr;\n" : tc;
+        s.replace(i, std::strlen(tc), uv);
+    }
     return s;
 }
 

@@ -9,9 +9,11 @@
 #define NGB_FILE_MAX_BYTES (1024u * 1024u)
 #define NGB_DATA_MAX_BYTES (32u * 1024u * 1024u)
 int ngb_files_init(const char *disc_root, const char *data_root);
+int ngb_files_init_indexed(const char *disc_root, const char *data_root, const char *cache_dir);
 /* The retail loader can read its AFS archives in place on an extracted disc. */
 extern int ngb_disc_archives_direct;
-void ngb_files_close_all(void);
+int ngb_files_close_all(void);
+int ngb_queue_menu_profile(const void *bytes, unsigned size);
 uint32_t ngb_file_open(const char *path, uint32_t root, uint32_t access,
                        uint32_t share, uint32_t disposition, uint32_t options,
                        uint32_t *handle, uint32_t *information);
