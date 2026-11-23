@@ -29,6 +29,7 @@ extern "C" void ngb_switch_frame(void);
 #include "gpu/texture.h"
 #ifdef NGB_NATIVE_CONTRACT_TEST
 #include "gpu/readback.h"
+#include "gpu/shaders.h"
 #include <condition_variable>
 #include <thread>
 #include <chrono>
@@ -686,13 +687,14 @@ bool Before(int fn, Call c) {
         g_state.streams[0] = saved;
         break;
     }
-    case D3DF_D3DDevice_DrawIndexedVertices:
+    case D3DF_D3DDevice_DrawIndexedVertices: {
         if (c.a(2)) Draw(c.a(0), 0, c.a(1), static_cast<const uint8_t*>(HostPtr(c.a(2))));
 #ifdef NGB_DIRECT3D
         captured_index_stack = g_backend && !g_mirror && ngb_scene_active && c.a(2) && c.a(0) == 6 &&
                                R32(c.r[ESP]) == 0x0030C0B2 ? c.r[ESP] : 0;
 #endif
         break;
+    }
     case D3DF_D3DDevice_DrawVertices:
         Draw(c.a(0), c.r[ECX], c.r[EAX], nullptr);
         break;

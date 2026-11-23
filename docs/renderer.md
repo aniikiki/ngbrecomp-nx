@@ -93,9 +93,10 @@ debug knobs out once it is the default.
   or 7), are decoded in the shader texel by texel (`bumpduv%d`: Load, signed bytes, then bilinear within the
   level and linear on to the next) -- filtered as the unsigned bytes they are stored as, texels either side
   of zero blend through the wrong range. A bump map is never read from a render target at its address.
-  The Switch renderer also exposes single-level V8U8 textures through a signed image view. When stage 0
-  supplies the displacement and stage 3 is free, its sampler filters that view directly. The original
-  unsigned view stays available to the colour combiner. Both views share the same upload.
+  The Switch renderer exposes the whole V8U8 mip chain through a signed image view. When stage 0
+  supplies the displacement and stage 3 is free, the texture unit filters the signed offsets within
+  and between levels. The shader applies the Xbox LOD bias and most detailed level to an unbiased
+  LOD query. The original unsigned view stays available to the colour combiner. Both views share the same upload.
 - The LOD bias (D3DTSS_MIPMAPLODBIAS) is converted as the console's D3D does, into the GPU's signed 5.8
   field (-16 to just under 16), then clamped to maxSamplerLodBias (LodBias in backend.cpp). A NaN becomes
   0x1000, -16, as xemu's register model shows (TEXFILTER0 E2063000 for the pond): the chapter 2 pond's

@@ -32,6 +32,7 @@ enum : uint8_t {
 };
 
 enum class CombatPixel : uint8_t { None, Additive, History, ModulatedParticle, ModulatedParticleGreater };
+enum class BumpLod : uint8_t { Zero, MostDetailed, FromDerivatives };
 constexpr uint32_t kHazeTargetExtent = 1u << 8;  // PixelKey::alphakill, for screen reads with unequal X/Y scale
 constexpr uint64_t kRectangularPointKey = 0x72656374506f696eull; // point shaders on such targets
 
@@ -45,7 +46,9 @@ struct PixelKey {
     TexInfo tex[4];
     uint32_t alphakill = 0;  // bit per stage; bits 4-7: the stage's 2D read left out past 0..1 (the heat haze, #55)
     uint32_t flat = 0, two_sided = 0;
-    uint32_t proj = 0;       // fixed function: bit per stage sampled at coordinates divided by w
+    uint8_t proj = 0;        // fixed function: bit per stage sampled at coordinates divided by w
+    BumpLod bump_lod = BumpLod::Zero;
+    uint16_t instance_factor = 0;  // zero in existing recipes; read the billboard's flat colour when set
     // a screen quad (QuadHlsl); a point sprite, stage 3 at the point's own coordinates after the stages before it
     // (#51). Halves of what was one uint32_t quad: the key's size and bytes as the shader cache has them.
     uint8_t quad = 0;
@@ -53,16 +56,20 @@ struct PixelKey {
     uint8_t sprite = 0, skip_alpha_test = 0;  // zero in existing shader recipes
     bool operator==(const PixelKey& o) const;
 };
+static_assert(sizeof(PixelKey) == 340, "PixelKey is stored in shader recipes");
 
 uint64_t Hash(const void* p, size_t n, uint64_t h = 1469598103934665603ull);
 
 PixelKey MakePixelKey(const State& s, const TexInfo tex[4]);
+// Stages whose coordinates a fixed-function triangle material uses, including alpha kill.
+uint32_t FixedTextureSampleMask(const State& s);
 
 // vertex program microcode to HLSL, regs is the bit mask of v registers the draw supplies
 // decode: VertexDecode per register, 4 bits each, for elements the input assembler hands over raw
 std::string VertexProgramHlsl(const std::vector<uint32_t>& program, uint16_t regs, uint64_t decode = 0);
 // fixed function vertex state a shader is built for
 constexpr uint32_t kCombatClipPlanes = 1u << 31;  // FixedKey::light, native UT geometry
+constexpr uint32_t kBillboardInstances = 1u << 30; // FixedKey::light, clip matrix and colour per instance
 struct FixedKey {
     uint32_t light = 0;    // bit 0 lighting, 1 specular, 2 local viewer, 3 normalize, then D3DMCS 2 bits each from bit 8:
                            // diffuse, specular, ambient, emissive (material when the vertex lacks that colour)

@@ -71,6 +71,21 @@ def compatibility():
          '45afd0850fca1ecb36853828370f60b2beb633cb43e97b4ab6a7c3aa78c0f3f4',
          'db0389332911d8b987801d2cc3ea08fd10d121b7768f85d66c4fa9e7c401890b',
          '49e9804d6b13fe67dd11f861317cd1ac5988f6a8970390438fd0093583bb757f'),
+        # 0.57.58 uses distinct keys for mipmapped displacement and the water's disabled alpha test.
+        ('fe77b05971d28484d7e2889f5d70c02b57beac7502936f7cc6440c89779f2650',
+         '8e4f3c48945427f0a95995f5a79b55ba54fac0caffef9e3932c878a47e2eba9a',
+         '9f71bcc1c57d84699275cec4241991604ab8ee138ad6a3f7e843f9a9a580aa9e',
+         '49e9804d6b13fe67dd11f861317cd1ac5988f6a8970390438fd0093583bb757f'),
+        # 0.57.59 adds separate keys for instanced billboard transforms and colours.
+        ('dfacc9580ceb65907a568bb5c2d7c712d69f87acf423b61bfa48d8f006a8e622',
+         'e1a59623208598b5634ca85ae7d4d10367cc6a871ef0ea33782afc078e7b2b23',
+         '95d8049d64808b5efb69b70db3931513864bd43cad9be21c463bc5a274b9336c',
+         '49e9804d6b13fe67dd11f861317cd1ac5988f6a8970390438fd0093583bb757f'),
+        # 0.57.60 selects existing coordinate keys for unread billboard stages.
+        ('b844505d4dfba7402440ab2bf559aebff25d90efadf149066d2cabb7de740b44',
+         '69ca18a986ed8d8a622787928941daea8cb2a8c0691b3f2dcc05a5570b1269ec',
+         'dd025add898ec7e28c0ec844cd9ac672dce0849d1d2d2922a0beeb168d2300bb',
+         '49e9804d6b13fe67dd11f861317cd1ac5988f6a8970390438fd0093583bb757f'),
     }
     if tuple(sources[n] for n in (backend, shader, header, bounds)) in compatible:
         epoch_sources[bounds] = '85d57bb9ffe5ba6c70a954b0a9201fced94be865aa1f84e40f22b69d290f477e'

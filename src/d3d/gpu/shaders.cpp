@@ -72,7 +72,11 @@ const ShaderHooks& Hooks() {
     return g_shader_hooks ? *g_shader_hooks : plain;
 }
 
-std::string Common() { return kCommonHead + Hooks().Constants() + kCommonTail; }
+std::string Common(bool billboards = false) {
+    std::string s = kCommonHead + Hooks().Constants() + kCommonTail;
+    if (billboards) s.insert(s.find("};"), "    nointerpolation float4 billboardFactor : TEXCOORD5;\n");
+    return s;
+}
 
 // Only the variants for a nonuniform target need this trailing register.
 // All previous material recipes retain their exact source and buffer offsets.
@@ -208,8 +212,9 @@ std::string VsInputStruct(uint16_t regs) {
 }
 
 // the input struct and the head of main: elements read raw are finished into float4 i.vN first
-std::string VsInputs(uint16_t regs, uint64_t decode) {
-    if (!decode) return VsInputStruct(regs) + "VOut main(VIn i) {\n";
+std::string VsInputs(uint16_t regs, uint64_t decode, bool billboards = false) {
+    const char* instance = billboards ? ", uint instance : SV_InstanceID" : "";
+    if (!decode) return VsInputStruct(regs) + "VOut main(VIn i" + instance + ") {\n";
     std::string raw = "struct VRaw {\n", in = "struct VIn {\n", body;
     bool packed = false;
     for (int r = 0; r < 16; r++) {
@@ -234,7 +239,7 @@ std::string VsInputs(uint16_t regs, uint64_t decode) {
              "    int3 v = int3(int(u << 21) >> 21, int(u << 10) >> 21, int(u) >> 22);\n"
              "    return float4(max(float3(v) / float3(1023, 1023, 511), -1), 1);\n"
              "}\n";
-    return s + "VOut main(VRaw ri) {\n    VIn i;\n" + body;
+    return s + "VOut main(VRaw ri" + instance + ") {\n    VIn i;\n" + body;
 }
 
 const char* kVsEpilogue = R"(
@@ -563,7 +568,31 @@ std::string FfOp(uint32_t op, const std::string& a1, const std::string& a2, cons
     }
 }
 
+// SELECTARG reads just its selected argument. Two blend operations also
+// read texture alpha implicitly, and MULTIPLYADD and LERP read ARG0.
+bool FixedOpReadsTexture(uint32_t op, uint32_t arg1, uint32_t arg2, uint32_t arg0) {
+    auto texture = [](uint32_t arg) { return (arg & 0xf) == 2; };
+    if (op <= 1) return false;
+    if (op == 2) return texture(arg1);
+    if (op == 3) return texture(arg2);
+    if (op == 14 || op == 16) return true;
+    return texture(arg1) || texture(arg2) || ((op == 23 || op == 24) && texture(arg0));
+}
+
 }  // namespace
+
+uint32_t FixedTextureSampleMask(const State& s) {
+    uint32_t mask = 0;
+    for (unsigned i = 0; i < s.tss.size(); ++i) {
+        const auto& t = s.tss[i];
+        if (t[kTssColorOp] <= 1) break;
+        const bool reads = FixedOpReadsTexture(t[kTssColorOp], t[kTssColorArg1], t[kTssColorArg2], t[kTssColorArg0]) ||
+                           FixedOpReadsTexture(t[kTssAlphaOp], t[kTssAlphaArg1], t[kTssAlphaArg2], t[kTssAlphaArg0]);
+        if (!s.textures[i] && reads) break; // the XDK disables this stage and all that follow it
+        if (s.textures[i] && (reads || t[kTssAlphaKill] == 4)) mask |= 1u << i;
+    }
+    return mask;
+}
 
 bool PixelKey::operator==(const PixelKey& o) const { return std::memcmp(this, &o, sizeof(*this)) == 0; }
 
@@ -753,9 +782,10 @@ FixedKey MakeFixedKey(const State& s) {
 
 // D3D's fixed function vertex pipeline: transform, lighting in view space, texture coordinate generation and transforms
 std::string FixedVertexHlsl(uint16_t regs, bool pretransformed, uint64_t decode, const FixedKey& f) {
-    std::string s = Common();
+    bool billboards = (f.light & kBillboardInstances) != 0;
+    std::string s = Common(billboards);
     s += kVsHelpers;
-    s += VsInputs(regs, decode);
+    s += VsInputs(regs, decode, billboards);
     s += kVsPrologue;
     auto v = [&](int r, const char* def) { return (regs >> r) & 1 ? F("i.v%d", r) : std::string(def); };
     bool clip_effect = !pretransformed && (f.light & kCombatClipPlanes);
@@ -786,7 +816,11 @@ std::string FixedVertexHlsl(uint16_t regs, bool pretransformed, uint64_t decode,
         if (f.light & 8) s += "    vn = dot(vn, vn) > 0 ? normalize(vn) : vn;\n";
     } else {
         s += "    float4 ip = float4(" + v(0, "float4(0,0,0,1)") + ".xyz, 1);\n";
-        s += "    float4 cp = mul(ip, wvp);\n";
+        if (billboards)
+            s += "    uint base = instance * 5;\n"
+                 "    float4x4 clip = transpose(float4x4(c[base], c[base+1], c[base+2], c[base+3]));\n"
+                 "    float4 cp = mul(ip, clip);\n";
+        else s += "    float4 cp = mul(ip, wvp);\n";
         s += "    float3 vp = mul(ip, wv).xyz;\n";
         s += "    float3 vn = mul(float4(" + v(2, "float4(0,0,0,0)") + ".xyz, 0), wvn).xyz;\n";
         if (f.light & 8) s += "    vn = dot(vn, vn) > 0 ? normalize(vn) : vn;\n";
@@ -873,6 +907,7 @@ std::string FixedVertexHlsl(uint16_t regs, bool pretransformed, uint64_t decode,
     if (clip_effect)
         s += "    float4 axes = float4(oT0.xy, oT0.x + oT0.y, oT0.x - oT0.y);\n"
              "    o.clipLo = axes - uvc[0];\n    o.clipHi = uvc[1] - axes;\n";
+    if (billboards) s += "    o.billboardFactor = c[base+4];\n";
     return s + "    return o;\n}\n";
 }
 
@@ -883,7 +918,7 @@ int IdViewMode() {
 bool IdView() { return IdViewMode() > 0; }
 
 std::string PixelHlsl(const PixelKey& k) {
-    std::string s = Common();
+    std::string s = Common(k.instance_factor != 0);
     if (k.alphakill & kHazeTargetExtent) DeclareRasterExtent(s);
     s += PsHelpers();
     for (int i = 0; i < 4; i++) {
@@ -904,7 +939,17 @@ std::string PixelHlsl(const PixelKey& k) {
         if (i == 0 && (k.tex[i].flags & kTexBumpView)) {
             // The colour combiner can still read tex0 as unsigned. The same bytes in
             // tex3 are signed before the sampler interpolates across zero.
-            s += "float2 bumpduv0(float2 uv) { return tex3.SampleLevel(smp3, uv, 0).rg; }\n";
+            if (k.bump_lod == BumpLod::FromDerivatives) {
+                // Query the unbiased signed sampler. The pond's Xbox bias is -16,
+                // outside nxvk's sampler bias range. Apply it once before sampling.
+                s += "float2 bumpduv0(float2 uv) {\n"
+                     "    float lod = max(tex3.CalculateLevelOfDetailUnclamped(smp3, uv) + bumplum[0].z, bumplum[0].w);\n"
+                     "    return tex3.SampleLevel(smp3, uv, lod).rg;\n}\n";
+            } else if (k.bump_lod == BumpLod::MostDetailed) {
+                s += "float2 bumpduv0(float2 uv) { return tex3.SampleLevel(smp3, uv, bumplum[0].w).rg; }\n";
+            } else {
+                s += "float2 bumpduv0(float2 uv) { return tex3.SampleLevel(smp3, uv, 0).rg; }\n";
+            }
             continue;
         }
         // NGB_D3D_BUMPLEVEL=n (debugging): the ripple texture read at level n everywhere, to see each level's texels
@@ -945,6 +990,7 @@ std::string PixelHlsl(const PixelKey& k) {
     }
     if (k.combat == CombatPixel::Additive) s += "[earlydepthstencil]\n";
     s += F("float4 main(VOut i, bool front : SV_IsFrontFace) : SV_Target {\n");
+    if (k.instance_factor) s += "#define tfactor i.billboardFactor\n";
     s += "    float4 tc0 = i.tc0, tc1 = i.tc1, tc2 = i.tc2, tc3 = i.tc3;\n";
     s += k.two_sided ? "    float4 v0 = front ? i.d0 : i.b0, v1 = front ? i.d1 : i.b1;\n" : "    float4 v0 = i.d0, v1 = i.d1;\n";
     s += "    if (misc.w == 0) v1 = float4(0, 0, 0, 1);\n";
@@ -1035,19 +1081,9 @@ std::string PixelHlsl(const PixelKey& k) {
             // a stage reading a texture with none bound is off, as the console's D3D sets up its combiners:
             // the game's fades are drawn TEXTURE x TFACTOR without a texture, and show their vertex colour.
             // Only the arguments its operations read count: a leftover TEXTURE in one SELECTARG2 ignores
-            // turned the stage, and the alpha it does compute, on and off as attacks changed that slot --
-            // windows and candles flickering (#48, found by HammerD72). Ops: 2 arg1, 3 arg2, 23-24 arg0
-            // too, 14 and 16 the texture's alpha, the rest arg1 and arg2.
-            auto reads_tex = [&](int base) {
-                uint32_t op = f[base];
-                auto is_tex = [&](int j) { return (f[base + j] & 0xF) == 2; };
-                if (op <= 1) return false;
-                if (op == 2) return is_tex(1);
-                if (op == 3) return is_tex(2);
-                if (op == 14 || op == 16) return true;
-                return is_tex(1) || is_tex(2) || ((op == 23 || op == 24) && is_tex(3));
-            };
-            if (!t.kind && (reads_tex(0) || reads_tex(4)))
+            // turned the stage, and the alpha it does compute, on and off as attacks changed that slot
+            // (windows and candles flickering, #48, found by HammerD72).
+            if (!t.kind && (FixedOpReadsTexture(f[0], f[1], f[2], f[3]) || FixedOpReadsTexture(f[4], f[5], f[6], f[7])))
                 break;
             std::string norm = (t.rect ? F(" / texsize[%d].xy", i) : "") + F(" + texsize[%d].zw", i);
             // a 2D quad above 1x: its coordinates kept to what the console's pixel centres sample, in the vertices'

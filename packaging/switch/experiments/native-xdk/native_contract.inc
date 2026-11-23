@@ -35,6 +35,7 @@ extern "C" void ngb_d3d_native_test(void) {
     g_state.simple=saved_simple;
     NativeShaderContract();
     NativeEffectContract();
+    NativeBillboardContract();
     NativeCombatContract();
     NativeShadowContract();
     auto submission_resources = NativeSubmissionContract();

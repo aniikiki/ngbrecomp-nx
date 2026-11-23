@@ -89,10 +89,10 @@ def instrument(source, *, wave=True):
         k.blend && k.src == 0x302 && k.dst == 1 && !from_target[0])
         wave_query = WaveBegin(s, views[0]);
 ''' + draw)
-    end = '        d_.vkCmdDraw(cmd_, a.draw_count, 1, 0, 0);\n    }'
-    replace(end, end + '''
-    if (wave_query != ~0u)
-        d_.vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ts_pool_[slot_], wave_query + 1);''')
+    end = '    if (visq != ~0u) d_.vkCmdEndQuery(cmd_, vis_pool_[slot_], visq);'
+    replace(end, '''    if (wave_query != ~0u)
+        d_.vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ts_pool_[slot_], wave_query + 1);
+''' + end)
     # Both the 720p GPU route and the software fallback have a transfer here.
     # Narrow the anchors to QueueScanout so an unrelated transfer cannot match.
     first = source.index('void VulkanBackend::QueueScanout(')

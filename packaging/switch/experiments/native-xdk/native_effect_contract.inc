@@ -92,6 +92,110 @@ static void NativeEffectContract() {
     std::fprintf(stderr, "[EFFECT-CONTRACT-PASS] feedback aliases, fresh contents, in-flight resize\n");
 }
 
+// Compare the recorder and Vulkan instance path with individual draws. Sparse
+// indices take the assembler's non-indexed path even for an Xbox indexed strip.
+extern "C" uint64_t ngb_test_instanced_draws(bool indexed);
+static void NativeBillboardContract() {
+    constexpr unsigned width = 16, height = 8;
+    struct Vertex { float x, y, z; uint32_t colour; float u, v; };
+    constexpr uint16_t far_index = 1152;
+    uint32_t memory = NativePool(64);
+    const Vertex quad[] = {{-.3f,-.5f,.5f,~0u,0,0}, {-.3f,.5f,.5f,~0u,0,1},
+                           {.3f,-.5f,.5f,~0u,1,0}, {.3f,.5f,.5f,~0u,1,1}};
+    uint32_t vb_data = NativeData((far_index + 1) * sizeof(Vertex)), vb = vb_data | 0x80000000u;
+    uint32_t texture = memory + 32;
+    std::memcpy(HostPtr(vb, sizeof quad), quad, sizeof quad);
+    std::memcpy(HostPtr(vb + far_index * sizeof(Vertex), sizeof(Vertex)), quad + 3, sizeof(Vertex));
+    W32(memory, 0x01000001); W32(memory + 4, vb_data);
+    uint32_t bytes = NativeTextureHeader(4, 4, 1, 1, 0x0f, 0, false, false, texture + 12, texture + 16);
+    W32(texture, 0x01040001); W32(texture + 4, NativeData(bytes));
+    // A BC3 block with opaque white and black columns makes its coordinates observable.
+    uint32_t block = R32(texture + 4) | 0x80000000u;
+    W32(block, 0xff); W32(block + 4, 0);
+    W32(block + 8, 0xffff); W32(block + 12, 0x50505050);
+
+    gpu::State s{};
+    uint32_t surface = NativeCreateSurface(width, height, 0x12);
+    s.rt = SurfaceOf(surface); s.zs = SurfaceOf(NativeCreateSurface(width, height, 0x2e));
+    s.viewport = {0, 0, width, height, 0, 1}; s.vs_handle = 0x142;
+    s.streams[0] = {memory, sizeof(Vertex)}; s.textures[0] = texture;
+    s.rs[gpu::kRsZEnable] = 1; s.simple[gpu::kMZFunc / 4] = 0x207;
+    s.simple[gpu::kMBlendEnable / 4] = 1; s.simple[gpu::kMBlendOp / 4] = 0x8006;
+    s.simple[gpu::kMSrcBlend / 4] = 0x302; s.simple[gpu::kMDestBlend / 4] = 1;
+    for (unsigned m : {2u, 3u, 16u, 17u, 256u})
+        for (unsigned axis = 0; axis < 4; ++axis) s.transforms[m][axis * 5] = 1;
+    auto& tex = s.tss[0];
+    tex[gpu::kTssColorOp] = tex[gpu::kTssAlphaOp] = 2; // SELECTARG1(TEXTURE)
+    tex[gpu::kTssColorArg1] = tex[gpu::kTssAlphaArg1] = 2;
+    tex[gpu::kTssAddressU] = tex[gpu::kTssAddressV] = 3;
+    tex[gpu::kTssMinFilter] = tex[gpu::kTssMagFilter] = 1;
+    tex[gpu::kTssResultArg] = 1;
+    auto& tint = s.tss[1];
+    tint[gpu::kTssColorOp] = tint[gpu::kTssAlphaOp] = 4; // MODULATE(TFACTOR, CURRENT)
+    tint[gpu::kTssColorArg1] = tint[gpu::kTssAlphaArg1] = 3;
+    tint[gpu::kTssColorArg2] = tint[gpu::kTssAlphaArg2] = 1;
+    tint[gpu::kTssColorArg0] = tint[gpu::kTssAlphaArg0] = 2; // unread arguments
+    tint[gpu::kTssResultArg] = 1;
+    gpu::TextureDesc output;
+    if (!gpu::Describe(surface, output)) ngb_stop("billboard contract target", surface);
+    auto check = [&](uint16_t last, unsigned mask, bool can_batch, uint32_t background = 0) {
+        if (gpu::FixedTextureSampleMask(s) != mask) ngb_stop("billboard contract sampler mask", mask);
+        const uint16_t indices[] = {0, 1, 2, last};
+        auto strip = reinterpret_cast<const uint8_t*>(indices);
+        std::array<uint32_t, width * height> reference{};
+        for (bool batch : {false, true}) {
+            uint64_t before = ngb_test_instanced_draws(last == 3);
+            g_backend->Clear(s, 0, nullptr, gpu::kClearTarget | gpu::kClearZ, background, 1, 0);
+            for (unsigned i = 0; i < gpu::kBillboardsPerDraw + 7; ++i) {
+                s.transforms[256][12] = i % 2 ? .45f : -.45f;
+                s.rs[gpu::kRsTextureFactor] = 0x2008050bu + (i % 3) * 0x04020100u;
+                s.simple[gpu::kMColorWriteEnable / 4] = i < gpu::kBillboardsPerDraw + 2 ? 0x01010101 : 0x00010000;
+                if (i % 2) g_backend->DrawPrepared(s, 6, 0, 4, strip, {0, ~0u});
+                else g_backend->Draw(s, 6, 0, 4, strip);
+                if (!batch) g_backend->Fence(); // submit individually through the same API
+            }
+            g_backend->Draw(s, 6, 0, 4, strip); // state inherited from the last instance
+            g_backend->Sync(output.data, gpu::TotalSize(output));
+            if ((ngb_test_instanced_draws(last == 3) != before) != (batch && can_batch))
+                ngb_stop("billboard contract draw path", last);
+            for (unsigned y = 0; y < height; ++y) for (unsigned x = 0; x < width; ++x) {
+                auto& expected = reference[y * width + x];
+                uint32_t pixel = R32(output.data + y * output.pitch + x * 4);
+                if (!batch) expected = pixel;
+                else if (expected != pixel) ngb_stop("billboard contract pixel mismatch", last);
+            }
+        }
+        if (std::none_of(reference.begin(), reference.end(), [background](uint32_t c) {
+                return c != background && (c & 0xffffff) && (c >> 24) && (c >> 24) < 255;
+            })) ngb_stop("billboard contract drew no translucent colour", last);
+        return reference;
+    };
+    auto plain = check(3, 1, true);
+    tint[gpu::kTssTexCoordIndex] = 0x30001;
+    tint[gpu::kTssTextureTransformFlags] = 0x102;
+    s.tss[2][gpu::kTssTexCoordIndex] = 0x20002;
+    s.tss[3][gpu::kTssTexCoordIndex] = 0x10003;
+    if (check(far_index, 1, true) != plain) ngb_stop("empty stages changed billboard pixels", 1);
+    s.textures[1] = texture;
+    if (check(3, 1, true) != plain) ngb_stop("unread texture changed billboard pixels", 2);
+    tint[gpu::kTssAlphaKill] = 4;
+    check(3, 3, false); // alpha kill alone consumes the reflected coordinates
+    tint[gpu::kTssTexCoordIndex] = tint[gpu::kTssTextureTransformFlags] = 0;
+    check(3, 3, true); // two sampled stages with ordinary UVs can share the draw
+    tint[gpu::kTssTexCoordIndex] = 0x30001;
+    tint[gpu::kTssAlphaKill] = 0;
+    tint[gpu::kTssColorOp] = 14;
+    check(3, 3, false); // BLENDTEXTUREALPHA implicitly samples even with no TEXTURE arguments
+    tint[gpu::kTssColorOp] = 4;
+    s.textures[1] = 0;
+    tex[gpu::kTssTexCoordIndex] = 0x30000;
+    if (check(3, 1, false) == plain) ngb_stop("sampled reflection had no visible effect", 3);
+    tex[gpu::kTssTexCoordIndex] = 0;
+    s.textures[0] = surface;
+    check(3, 1, false, 0xa0603018); // each particle reads the previous one's rendered colour
+    std::fprintf(stderr, "[BILLBOARD-CONTRACT-PASS] automatic batching, sampler dependencies, reflected and translucent pixels\n");
+}
+
 // A depth/stencil image must remain a usable shadow map after rendering and
 // on the next frame. Check the sampled result, not only the depth readback.
 static void NativeShadowContract() {

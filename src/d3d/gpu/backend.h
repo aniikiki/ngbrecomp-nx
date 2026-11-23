@@ -2,6 +2,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <vector>
 
 #include "gpu/state.h"
@@ -38,6 +39,20 @@ struct QuickPeek {
 };
 
 struct IndexBounds;
+
+struct BillboardInstance {
+    std::array<float, 16> world;
+    uint32_t factor;
+
+    void Apply(State& s) const {
+        s.transforms[256] = world;
+        s.rs[kRsTextureFactor] = factor;
+    }
+};
+
+// Fixed-function draws leave the vertex constant bank free. Each instance
+// uses four of its float4 registers for clip coordinates and one for colour.
+constexpr size_t kBillboardsPerDraw = std::tuple_size_v<decltype(State::vsc)> / 5;
 
 class Backend {
 public:
@@ -95,6 +110,15 @@ public:
     virtual void Present(const Surface& front, void (*consumed)(void*), void* context) {
         Present(front);
         if (consumed) consumed(context);
+    }
+
+    // Replay the same ordered four-index strip for each instance. The
+    // recorder's next state delta is relative to the last instance.
+    virtual void DrawBillboards(State& s, const uint8_t* indices, std::span<const BillboardInstance> instances) {
+        for (const auto& instance : instances) {
+            instance.Apply(s);
+            Draw(s, 6, 0, 4, indices);
+        }
     }
 
 private:

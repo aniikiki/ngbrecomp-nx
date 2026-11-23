@@ -11,7 +11,7 @@ import sys
 from material_cache import compatibility
 
 root = Path('/work')
-version = '0.57.57'
+version = '0.57.60'
 (root / 'build/switch-runtime/history').mkdir(parents=True, exist_ok=True)
 assert '--seed' in sys.argv, 'supply the validated portable material seed with --seed'
 seed = Path(sys.argv[sys.argv.index('--seed') + 1]).resolve()

@@ -38,6 +38,9 @@
 #include "gpu/backend.h"
 #include "native_diag.h"
 #include "gpu/headers.h"
+#ifdef NGB_DIRECT3D
+#include "gpu/shaders.h"
+#endif
 #include "gpu/vertex.h"
 #include "kernel/kernel.h"
 
@@ -98,7 +101,7 @@ static uint64_t PaceNowUs() {
         std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
-enum class Op : uint8_t { State, Headers, Peek, Draw, Clear, Copy, Present, Flush, Gamma, VisBegin, VisEnd, Sync };
+enum class Op : uint8_t { State, Headers, Peek, Draw, Clear, Copy, Present, Flush, Gamma, VisBegin, VisEnd, Sync, Billboards };
 
 struct Cmd {
     Op op;
@@ -134,6 +137,7 @@ struct IndexSlot {
 struct Batch {
 #ifdef NGB_DIRECT3D
     std::vector<std::shared_ptr<const IndexSnapshot>> index_snapshots;
+    std::vector<BillboardInstance> billboards;
 #endif
     uint64_t id = 0;
     uint64_t handed_us = 0;   // (NV2A_PACE_LOG)
@@ -314,6 +318,8 @@ public:
                     const uint8_t* indices, PreparedState changes, CombatEffect effect) {
         std::lock_guard lock(cap_);
 #ifdef NGB_DIRECT3D
+        if (thread_ && prim == 6 && !start && count == 4 && indices && effect == CombatEffect::None &&
+            !recording_visibility_ && TryInstanceBillboards(s, indices, changes)) return;
         const size_t before = cur_->cmds.size();
 #endif
         SendState(s, start + count, changes);
@@ -608,6 +614,65 @@ private:
         for (unsigned i = 1; i < padding; ++i) std::memcpy(dest + 2*i, indices, 2);
         std::memcpy(dest + 2*padding, indices, count * 2);
         prev.c += padding + count;
+        return true;
+    }
+#endif
+
+#ifdef NGB_DIRECT3D
+    static bool CanInstanceBillboards(const State& s) {
+        if (s.vs_handle != 0x142 || s.ps || s.rs[kRsLighting] || s.rs[kRsVertexBlend] ||
+            !s.rs[kRsZEnable] || !s.simple[kMBlendEnable / 4] || s.simple[kMSrcBlend / 4] != 0x302 ||
+            s.simple[kMDestBlend / 4] != 1 || s.simple[kMBlendOp / 4] != 0x8006) return false;
+        uint32_t generated = 0;
+        for (unsigned i = 0; i < s.textures.size(); ++i) {
+            if (!s.textures[i]) continue;
+            // Each draw that samples its own target needs a fresh copy.
+            uint32_t data = kernel::R32(s.textures[i] + 4) & 0x0fffffffu;
+            if (data == (s.rt.data & 0x0fffffffu) || data == (s.zs.data & 0x0fffffffu)) return false;
+            if (s.tss[i][kTssTexCoordIndex] >> 16) generated |= 1u << i;
+        }
+        // Only a sampled generated coordinate needs the per-particle view-space transform.
+        return !generated || !(generated & FixedTextureSampleMask(s));
+    }
+
+    bool TryInstanceBillboards(const State& s, const uint8_t* indices, PreparedState changes) {
+        auto& commands = cur_->cmds;
+        if (commands.empty()) return false;
+        const auto& last = commands.back();
+        const bool first_pair = last.op == Op::Draw && last.effect == CombatEffect::None &&
+                                last.a == 6 && !last.b && last.c == 4 && last.d == 1;
+        if (!first_pair && (last.op != Op::Billboards || last.c >= kBillboardsPerDraw)) return false;
+        constexpr size_t index_bytes = 4 * sizeof(uint16_t);
+        if (std::memcmp(cur_->bytes.data() + last.data, indices, index_bytes) || !CanInstanceBillboards(s)) return false;
+
+        // Leave the first draw on the ordinary strip-joining path until the same geometry recurs.
+        const size_t before = commands.size();
+        auto& instances = cur_->billboards;
+        const BillboardInstance previous{sent_.transforms[256], sent_.rs[kRsTextureFactor]};
+        const BillboardInstance current{s.transforms[256], s.rs[kRsTextureFactor]};
+        current.Apply(sent_);
+        SendState(s, 4, changes);
+        if (commands.size() == before) {
+            auto& group = commands.back();
+            if (first_pair) {
+                group.op = Op::Billboards;
+                group.a = uint32_t(instances.size());
+                group.c = 1;
+                instances.push_back(previous);
+            }
+            instances.push_back(current);
+            ++group.c;
+            return true;
+        }
+        // A state, resource or peek change separates the draws. This command also
+        // delivers the current world matrix and colour masked out of SendState.
+        Cmd group{Op::Billboards};
+        group.data = Put(indices, index_bytes);
+        group.a = uint32_t(instances.size());
+        group.c = 1;
+        instances.push_back(current);
+        commands.push_back(group);
+        if (commands.size() >= kBatchCommands) Submit();
         return true;
     }
 #endif
@@ -938,6 +1003,7 @@ private:
     void Recycle(Batch* b) {
 #ifdef NGB_DIRECT3D
         b->index_snapshots.clear();
+        b->billboards.clear();
 #endif
         b->cmds.clear();
         b->bytes.clear();
@@ -1084,6 +1150,11 @@ private:
                 inner_->UsePeek(p);
                 break;
             }
+            case Op::Billboards:
+#ifdef NGB_DIRECT3D
+                inner_->DrawBillboards(state_, data, std::span(b.billboards).subspan(c.a, c.c));
+#endif
+                break;
             case Op::Draw:
 #ifdef NGB_DIRECT3D
                 if (c.d == 2) {

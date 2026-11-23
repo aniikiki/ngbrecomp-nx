@@ -286,7 +286,7 @@ struct Image {
     VmaAllocation mem = nullptr;
     VkImageView view = VK_NULL_HANDLE;
     VkImageView attachment = VK_NULL_HANDLE; // depth + stencil for rendering; view samples depth only
-    VkImageView bump_view = VK_NULL_HANDLE;  // signed view of a single-level V8U8 texture
+    VkImageView bump_view = VK_NULL_HANDLE;  // signed view of the V8U8 mip chain
     VkFormat format = VK_FORMAT_UNDEFINED;
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
     uint32_t w = 0, h = 0, layers = 1, levels = 1, samples = 1;
@@ -465,6 +465,7 @@ public:
     void Clear(const State& s, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z,
                uint32_t stencil) override;
     void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices, const IndexBounds* bounds, CombatEffect effect) override;
+    void DrawBillboards(State& s, const uint8_t* indices, std::span<const BillboardInstance> instances) override;
     void Copy(const Surface& src, const Surface& dst, uint32_t count, const uint8_t* src_rects,
               const uint8_t* dst_points) override;
     void Present(const Surface& front) override { Present(front, nullptr, nullptr); }
@@ -481,6 +482,10 @@ public:
     void UseQuick(const QuickPeek& q) override { qk_ = q; }
 
 private:
+    void DrawGeometry(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices,
+                      const IndexBounds* bounds, CombatEffect effect, std::span<const BillboardInstance> instances);
+    VkDeviceSize UploadBillboards(const State& s, uint32_t width, uint32_t height,
+                                 std::span<const BillboardInstance> instances);
     // the game's side of the call being drawn (gpu::Peek) and of the frame (QuickPeek): taken here at the call, or
     // given by a render thread's capture (pk_given_) -- the drawing reads these, never the game itself
     Peek pk_;
@@ -759,7 +764,7 @@ private:
     struct Retired { Image img; VkImageView view; uint32_t frame; };
     std::vector<Retired> graveyard_;
     const bool bumpcheck_ = std::getenv("NGB_D3D_BUMPCHECK") != nullptr;
-    VkSampler bump_sampler_ = VK_NULL_HANDLE;
+    VkSampler bump_samplers_[2] = {}; // indexed by VkSamplerMipmapMode
     uint64_t bump_key_ = 0;           // textures_ key of the bump map last bound (NGB_D3D_BUMPCHECK)
     void BumpCheck(Tex& tx, const char* when);
     std::set<uint32_t> told_size_;    // textures logged as reading a target of another size (#16), or their own (| 1)
@@ -1188,7 +1193,12 @@ bool VulkanBackend::FinishDevice() {
         VkSamplerCreateInfo ci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
         ci.magFilter = ci.minFilter = VK_FILTER_LINEAR;
         ci.addressModeU = ci.addressModeV = ci.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-        if (d_.vkCreateSampler(dev_, &ci, nullptr, &bump_sampler_) != VK_SUCCESS) bump_sampler_ = VK_NULL_HANDLE;
+        ci.maxLod = VK_LOD_CLAMP_NONE;
+        for (auto mode : {VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_MIPMAP_MODE_LINEAR}) {
+            ci.mipmapMode = mode;
+            if (d_.vkCreateSampler(dev_, &ci, nullptr, &bump_samplers_[mode]) != VK_SUCCESS)
+                bump_samplers_[mode] = VK_NULL_HANDLE;
+        }
     }
 #endif
     bool d32 = std::getenv("NGB_D3D_DEPTH32") != nullptr;
@@ -1569,7 +1579,8 @@ VulkanBackend::~VulkanBackend() {
             if (retired.view) d_.vkDestroyImageView(dev_, retired.view, nullptr);
             DestroyImage(retired.img);
         }
-        if (bump_sampler_) d_.vkDestroySampler(dev_, bump_sampler_, nullptr);
+        for (auto sampler : bump_samplers_)
+            if (sampler) d_.vkDestroySampler(dev_, sampler, nullptr);
         for (auto& image:continuous_glow_) DestroyImage(image);
         for (auto& image:glow_soft_) DestroyImage(image);
         DestroyImage(quick_background_);
@@ -2929,8 +2940,7 @@ VkImageView VulkanBackend::BindTexture(const State& s, int stage, TexInfo& info,
     }
     uint64_t key = uint64_t(d.data) << 8 | d.format;
     Tex& tx = textures_[key];
-    // a bump map (the next stage's texture mode 6 or 7 reads this one): V8U8, its signed bytes decoded
-    // texel by texel in the shader (gpu/shaders.cpp bumpduv), not by the sampler's filter
+    // A bump map supplies signed offsets to a BUMPENVMAP texture stage.
     bool bump_src = s.ps && stage < 3 && (d.format == 0x28 || d.format == 0x17) && [&] {
         uint32_t m = (s.rs[kRsPsTextureModes] >> ((stage + 1) * 5)) & 0x1F;
         return m == 6 || m == 7;
@@ -2945,6 +2955,7 @@ VkImageView VulkanBackend::BindTexture(const State& s, int stage, TexInfo& info,
                          d.width >= 8 && d.height >= 8 && pow2(d.width) && pow2(d.height) &&
                          d.format != 0x28 && d.format != 0x17;
     if (tx.img.image && tx.sig == sig && tx.img.w == d.width && tx.img.h == d.height &&
+        (tx.gen == 1 || tx.img.levels == d.levels) &&
         (tx.gen == 2 || tx.gen == (mip_candidate ? 1 : 0))) {
         tx.used = frame_;
         if (bump_src) {
@@ -3038,7 +3049,7 @@ VkImageView VulkanBackend::MakeStatic(Tex& tx,const TextureDesc& d,const uint8_t
             tx.gen = 2;        // not to be made: the same whatever the setting
         }
     }
-    bool signed_view = bump_sampler_ && levels == 1 && !d.cube && (d.format == 0x28 || d.format == 0x17);
+    bool signed_view = (bump_samplers_[0] || bump_samplers_[1]) && !d.cube && (d.format == 0x28 || d.format == 0x17);
     auto make = [&] {
         VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         if (tx.gen == 1) usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
@@ -3066,7 +3077,7 @@ VkImageView VulkanBackend::MakeStatic(Tex& tx,const TextureDesc& d,const uint8_t
         ci.image = tx.img.image;
         ci.viewType = VK_IMAGE_VIEW_TYPE_2D;
         ci.format = VK_FORMAT_R8G8B8A8_SNORM;
-        ci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        ci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, 1};
         if (d_.vkCreateImageView(dev_, &ci, nullptr, &tx.img.bump_view) != VK_SUCCESS) tx.img.bump_view = VK_NULL_HANDLE;
     }
     tx.sig = sig;
@@ -3640,9 +3651,9 @@ static void RigidViewport(const State& s, uint32_t gw, uint32_t gh, float (&out)
     float vpm[16] = {sx, 0, 0, 0, 0, sy, 0, 0, 0, 0, v.max_z - v.min_z, 0, ox, oy, v.min_z, 1};
     std::memcpy(out,vpm,sizeof(vpm));
 }
-static void RigidMatrices(const State& s,const float* vpm,float* wv,float* clip) {
+static void RigidMatrices(const State& s,const float* world,const float* vpm,float* wv,float* clip) {
     float wvp[16],full[16];
-    MatMul(s.transforms[256].data(), s.transforms[2].data(), wv);
+    MatMul(world, s.transforms[2].data(), wv);
     MatMul(wv, s.transforms[3].data(), wvp);
     MatMul(wvp,vpm,full);
     Transpose(full,clip);
@@ -3694,6 +3705,35 @@ void VulkanBackend::CaptureQuick(QuickPeek& q) {
 
 void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices,
                          const IndexBounds* bounds, CombatEffect effect) {
+    DrawGeometry(s, prim, start, count, indices, bounds, effect, {});
+}
+
+VkDeviceSize VulkanBackend::UploadBillboards(const State& s, uint32_t width, uint32_t height,
+                                            std::span<const BillboardInstance> instances) {
+    struct Constants { float clip[16], factor[4]; };
+    Constants constants[kBillboardsPerDraw];
+    float viewport[16], world_view[16];
+    RigidViewport(s, width, height, viewport);
+    for (size_t i = 0; i < instances.size(); ++i) {
+        RigidMatrices(s, instances[i].world.data(), viewport, world_view, constants[i].clip);
+        Color(instances[i].factor, constants[i].factor);
+    }
+    return UploadReused(vc_reuse_, constants, sizeof(Constants) * instances.size(), ringAlign_);
+}
+
+void VulkanBackend::DrawBillboards(State& s, const uint8_t* indices, std::span<const BillboardInstance> instances) {
+    static const bool debug_pixels = std::getenv("NGB_D3D_PSDEBUG") != nullptr;
+    if (instances.size() < 2 || instances.size() > kBillboardsPerDraw ||
+        vis_on_ || trace_ || IdView() || debug_pixels || g_shader_hooks) {
+        Backend::DrawBillboards(s, indices, instances);
+        return;
+    }
+    instances.back().Apply(s);
+    DrawGeometry(s, 6, 0, 4, indices, nullptr, CombatEffect::None, instances);
+}
+
+void VulkanBackend::DrawGeometry(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices,
+                                 const IndexBounds* bounds, CombatEffect effect, std::span<const BillboardInstance> instances) {
 #ifdef NGB_COMBAT_PERF
     // Rotate selection over frames; CPU clock excludes time blocked in the driver.
     struct Sample {uint64_t &wall,&cpu,t,c;~Sample(){if(t){wall+=(ngb_elapsed_ns()-t)/1000;
@@ -3759,7 +3799,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     // are tested on the render thread, where their current bytes are consumed.
     float rigid_wv[16],rigid_clip[16];
     bool checked_rigid=false;
-    if (!vis_on_ && !ContinuousGlowEnabled() && !trace_ && !a.pretransformed &&
+    if (instances.empty() && !vis_on_ && !ContinuousGlowEnabled() && !trace_ && !a.pretransformed &&
         a.topology==Topology::Triangles && !s.rs[kRsVertexBlend] &&
         (s.vs_handle==0x142 || s.vs_handle==0x152 || s.vs_handle==0x112)) {
         uint32_t width,height;
@@ -3767,7 +3807,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         if (width && height) {
             float vp[16];
             RigidViewport(s,width,height,vp);
-            RigidMatrices(s,vp,rigid_wv,rigid_clip);
+            RigidMatrices(s,s.transforms[256].data(),vp,rigid_wv,rigid_clip);
             checked_rigid=true;
             if (OutsideRigidClip(a,rigid_clip)) {
                 if (NGB_DIAG) {
@@ -3859,6 +3899,15 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     bool quad = count <= kQuadVertices && !s.rs[kRsZEnable];
     FixedKey fk;
     if (!prog) fk = MakeFixedKey(s);
+    uint32_t billboard_samples = 0;
+    if (!instances.empty()) {
+        billboard_samples = FixedTextureSampleMask(s);
+        fk.light |= kBillboardInstances;
+        // Use the default two-component coordinates for unread stages so stale
+        // generation and projection modes share the same shader and pipeline.
+        for (unsigned i = 0; i < s.tss.size(); ++i)
+            if (!(billboard_samples & (1u << i))) fk.tex[i] = (2u << 12) | i;
+    }
     if (hull && additive) fk.light |= kCombatClipPlanes;
     uint64_t vkey;
     if (prog) {
@@ -3958,11 +4007,23 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     static bool noshadow = std::getenv("NGB_D3D_NOSHADOW") != nullptr;   // debugging: no shadow-map passes
     if (noshadow && (info[0].shadow || info[1].shadow || info[2].shadow || info[3].shadow)) return;
     PixelKey pk = MakePixelKey(s, info);
+    pk.instance_factor = !instances.empty();
+    if (pk.instance_factor) pk.proj &= billboard_samples;
     VkImageView bump_view = VK_NULL_HANDLE;
-    if ((pk.tex[0].flags & kTexSigned) && !pk.tex[3].kind && !((pk.tex_modes >> 15) & 31) && !sprite && !psdbg) {
+    VkSampler bump_sampler = VK_NULL_HANDLE;
+    static const bool force_bump_level = std::getenv("NGB_D3D_BUMPLEVEL") != nullptr;
+    if ((pk.tex[0].flags & kTexSigned) && !pk.tex[3].kind && !((pk.tex_modes >> 15) & 31) && !sprite && !psdbg && !force_bump_level) {
         auto it = textures_.find(bump_key_);
-        if (it != textures_.end() && it->second.img.view == views[0]) bump_view = it->second.img.bump_view;
-        if (bump_view) pk.tex[0].flags |= kTexBumpView;
+        if (it != textures_.end() && it->second.img.view == views[0] && it->second.img.bump_view) {
+            const uint32_t mip = s.tss[0][kTssMipFilter];
+            bump_sampler = bump_samplers_[mip == 1 ? VK_SAMPLER_MIPMAP_MODE_NEAREST : VK_SAMPLER_MIPMAP_MODE_LINEAR];
+            if (bump_sampler) {
+                bump_view = it->second.img.bump_view;
+                pk.tex[0].flags |= kTexBumpView;
+                if (it->second.img.levels > 1)
+                    pk.bump_lod = mip ? BumpLod::FromDerivatives : BumpLod::MostDetailed;
+            }
+        }
     }
     pk.quad = quad;
 #ifdef NGB_DIRECT3D
@@ -4001,10 +4062,12 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         std::memset(pk.ff, 0, sizeof(pk.ff));
     }
 #ifdef NGB_DIRECT3D
-    // UT layers repeatedly shade the same pixels. When the Xbox accepts every
-    // alpha, a blended draw needs no final compare or conditional discard.
-    // Texture-stage alpha kills remain part of PixelHlsl.
-    pk.skip_alpha_test = SimpleState(s, kMBlendEnable) &&
+    // Blended effects and opaque refractive water can omit the final discard when
+    // every alpha passes. Texture-stage kills are handled separately in PixelHlsl.
+    const uint32_t stage2_mode = (pk.tex_modes >> 10) & 31;
+    const bool refractive_water = (pk.tex[0].flags & kTexSigned) && from_target[2] &&
+        (stage2_mode == 6 || stage2_mode == 7) && !(pk.input_texture & (15u << 16));
+    pk.skip_alpha_test = (SimpleState(s, kMBlendEnable) || refractive_water) &&
         (!SimpleState(s, kMAlphaTestEnable) || Cmp(SimpleState(s, kMAlphaFunc)) == VK_COMPARE_OP_ALWAYS);
 #endif
     // The heat haze over lava -- fixed-function sprites blended by their alpha, reading a 512x256 copy of the
@@ -4629,7 +4692,7 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
             std::memcpy(c.wvp,rigid_clip,sizeof(rigid_clip));
         } else
 #endif
-        RigidMatrices(s,vpm,wv,c.wvp);
+        RigidMatrices(s,s.transforms[256].data(),vpm,wv,c.wvp);
         Transpose(wv, c.wv);
         float n[16] = {};
         InverseTranspose3x3(wv, n);
@@ -4670,7 +4733,8 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     }
 #endif
     VkDeviceSize vc;
-    if (points && !prog) {   // the point sizes for PointHlsl, in registers fixed function leaves unused
+    if (!instances.empty()) vc = UploadBillboards(s, gw, gh, instances);
+    else if (points && !prog) {   // the point sizes for PointHlsl, in registers fixed function leaves unused
         auto v = s.vsc;
         float vh = s.viewport.h > 0 ? float(s.viewport.h) : float(gh);
         float mx = Bits(s.rs[kRsPointSizeMax]);
@@ -4778,12 +4842,12 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     // record: the uploads above may have submitted, so everything is set after them
     BeginRendering(rt, ds);
     BindPipeline(pipe);
-    VkDescriptorBufferInfo bvc{ring_, vc, sizeof(s.vsc)}, bdc{ring_, dc, sizeof(c)};
+    VkDescriptorBufferInfo bvc{ring_, vc, vc_reuse_.bytes.size()}, bdc{ring_, dc, sizeof(c)};
     VkDescriptorImageInfo img[4], smp[4];
     for (int i = 0; i < 4; i++) {
         if (i == 3 && bump_view) {
             img[i] = {VK_NULL_HANDLE, bump_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-            smp[i] = {bump_sampler_, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
+            smp[i] = {bump_sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
             continue;
         }
         VkImageView v = views[i];
@@ -4895,11 +4959,13 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
         vis_q_[slot_].push_back({vis_test_, sx * sy * float(rt ? rt->samples : ds->samples)});
         d_.vkCmdBeginQuery(cmd_, vis_pool_[slot_], visq, shared_ ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
     }
+    // Sparse Xbox indices are gathered into a non-indexed stream by Assemble.
+    const uint32_t instance_count = instances.empty() ? 1u : uint32_t(instances.size());
     if (a.index_count) {
         d_.vkCmdBindIndexBuffer(cmd_, index_buf, ioff, a.index16 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
-        d_.vkCmdDrawIndexed(cmd_, a.index_count, 1, 0, a.base_vertex, 0);
+        d_.vkCmdDrawIndexed(cmd_, a.index_count, instance_count, 0, a.base_vertex, 0);
     } else {
-        d_.vkCmdDraw(cmd_, a.draw_count, 1, 0, 0);
+        d_.vkCmdDraw(cmd_, a.draw_count, instance_count, 0, 0);
     }
     if (visq != ~0u) d_.vkCmdEndQuery(cmd_, vis_pool_[slot_], visq);
 #ifdef NGB_DIRECT3D
