@@ -1,6 +1,7 @@
 // Guest records are single writer. UI publishes immutable records with a
 // release store; never block either thread or write the SD during a sample.
 #include "mission_perf.h"
+#include "diagnostics_flag.h"
 #include "scanout.h"
 enum { MP_LIMIT = 2400 };
 typedef struct {
@@ -12,7 +13,7 @@ static MissionRow mp_rows[MP_LIMIT];
 static MissionDisplay mp_ui[MP_LIMIT];
 static unsigned mp_n, mp_written, mp_ui_written;
 static atomic_uint mp_ui_n, mp_ui_id, mp_exited;
-int ngb_mission_enabled, ngb_mission_gl_split;
+int ngb_mission_enabled;
 unsigned ngb_mission_guest_id;
 static unsigned mp_pub,mp_displayed;
 static uint64_t mp_last, mp_cpu, mp_entries, mp_polls, mp_switches;
@@ -61,10 +62,9 @@ void ngb_mission_dump(void){
     if(!ngb_mission_enabled)return;
     atomic_store(&mp_exited,1);
     unsigned u=atomic_load_explicit(&mp_ui_n,memory_order_acquire);
-    if(!ngb_mission_enabled || (mp_written==mp_n && mp_ui_written==u))return;
+    if(mp_written==mp_n && mp_ui_written==u)return;
     static int opened;
-    mkdir("sdmc:/switch/ngb-runtime/logs",0777);
-    FILE *f=fopen("sdmc:/switch/ngb-runtime/logs/mission-perf.csv",opened?"a":"w");
+    FILE *f=fopen(NGB_LOG_DIR "/menu-perf.csv",opened?"a":"w");
     if(!f)return;
     if(!opened){
         fputs("# M: iteration,state,update_us,draw_us,wait_call_us,update_cpu_us,draw_cpu_us,wait_cpu_us,cpu_rc,entries,polls,fiber_switches,strips,strip_us,gl_draws,gl_reads,read_us,read_px,fb_uploads,upload_us,upload_px,vk_draws,vk_presents,guest_flips,thumb_hit,thumb_miss,pad_reports,pad_bits,published,displayed,split_reads,finish_us,post_finish_read_us\n# D: iteration_at_acquire,acquire_us,blit_overlay_us,end_us\n",f);

@@ -1,4 +1,4 @@
-"""Summarize mission-perf.csv; phase and nested timings are not additive."""
+"""Summarize menu-perf.csv or a historical mission-perf.csv capture."""
 import argparse
 import csv
 from collections import Counter

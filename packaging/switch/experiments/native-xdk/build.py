@@ -198,7 +198,7 @@ elif sys.argv[1] == 'host':
     inputs += [root / 'src/d3d' / n for n in ('native_mesh.inc','native_simple.inc','gpu/prepared.h','gpu/backend.h')]
     inputs += [runtime / 'direct' / n for n in ('native_mesh.inc','native_model.inc','disc_archives.S','menu_profile.S','button_prompts.S')]
     inputs += [runtime / 'button_prompts.c']
-    inputs += [runtime / n for n in ('workers.inc','combat_perf.h','combat_perf.inc','files.c','files.h','files_bridge.c','files_bridge.h','disc_reads.inc','disc_names.inc','ohci_boot.c','ohci_boot.h','opening_movie.c','prologue_stream.inc','menu_profile.inc')]
+    inputs += [runtime / n for n in ('workers.inc','diagnostics_flag.h','combat_perf.h','combat_perf.inc','files.c','files.h','files_bridge.c','files_bridge.h','disc_reads.inc','disc_names.inc','ohci_boot.c','ohci_boot.h','opening_movie.c','prologue_stream.inc','menu_profile.inc')]
     inputs += [runtime / n for n in ('movie_audio.inc','audio_output.h','audio_output.inc')]
     if diagnostics:
         inputs += [experiment / 'story_gpu.inc']

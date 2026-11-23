@@ -14,6 +14,7 @@
 
 #ifdef __SWITCH__
 #include <switch.h>
+#include "diagnostics_flag.h"
 #include "player_diagnostics.h"
 int ngb_diagnostics_enabled;
 #include "loading.inc"
@@ -35,8 +36,14 @@ static atomic_uint commands;
 static u64 launch_tick;
 
 #ifdef NGB_DIRECT3D
-/* Sample one thread at a time. Both profiles stay in RAM until exit. */
 #include "direct/output.h"
+static Result thread_ticks(Handle handle, u64 *value)
+{
+    return svcGetInfo(value, hosversionAtLeast(13, 0, 0) ? InfoType_ThreadTickCount :
+                      InfoType_ThreadTickCountDeprecated, handle, TickCountInfo_Total);
+}
+
+/* Sample one thread at a time. Both profiles stay in RAM until exit. */
 extern char _start[];
 /* Boundaries are guest flips, so light scenes cannot dilute combat samples. */
 static const struct { unsigned first, last; } profile_windows[] = {
@@ -66,12 +73,6 @@ typedef struct { uint64_t wall, cpu, entries, polls, switches, skips; unsigned d
 static FrameMark frame_marks[PROFILE_WINDOWS][601];
 static unsigned mark_count[PROFILE_WINDOWS];
 
-static Result thread_ticks(Handle handle, u64 *value)
-{
-    return svcGetInfo(value, hosversionAtLeast(13, 0, 0) ? InfoType_ThreadTickCount :
-                      InfoType_ThreadTickCountDeprecated, handle, TickCountInfo_Total);
-}
-
 #ifdef NGB_PLAYER_BUILD
 #include "mission_perf.inc"
 #ifdef NGB_COMBAT_PERF
@@ -82,7 +83,7 @@ static Result thread_ticks(Handle handle, u64 *value)
 void ngb_profile_next_frame(unsigned frame, unsigned draws)
 {
     if (frame==1) atomic_store(&gameplay_controls,true);
-    if (!ngb_diagnostics_enabled) return;
+    if (!boot_log) return;
     unsigned active = 0;
     FrameMark mark = {0};
     for (unsigned i = 0; i < PROFILE_WINDOWS; ++i) {
@@ -177,8 +178,7 @@ static void mission_pc_tick(Thread *guest){
 }
 static void mission_pc_save(void){
     if(mp_pc_saved==mp_pc_count)return;
-    mkdir("sdmc:/switch/ngb-runtime/logs",0777);
-    FILE *f=fopen("sdmc:/switch/ngb-runtime/logs/mission-pc.csv",mp_pc_saved?"a":"w");
+    FILE *f=fopen(NGB_LOG_DIR "/menu-pc.csv",mp_pc_saved?"a":"w");
     if(!f)return;
     if(!mp_pc_saved)fputs("iteration,pc_offset,lr_offset,sample_us,rc\n",f);
     for(;mp_pc_saved<mp_pc_count;mp_pc_saved++){
@@ -444,9 +444,52 @@ static Result open_framebuffer(Framebuffer *surface){
     return rc;
 }
 
+static void start_diagnostics(void)
+{
+    const bool game = ngb_diagnostics_requested(NGB_RUNTIME_DIR NGB_DIAGNOSTICS_FLAG);
+    const bool boot = ngb_diagnostics_requested(NGB_RUNTIME_DIR NGB_BOOT_FLAG);
+    const bool menu = ngb_diagnostics_requested(NGB_RUNTIME_DIR NGB_MENU_PERF_FLAG);
+#ifdef NGB_GPU_PRESENT
+    /* Mesa consults these on first use, before opening its own file. */
+    unsetenv("MESA_LOG_FILE_AUTO");
+    if (boot) setenv("MESA_LOG_FILE",NGB_LOG_DIR "/nxvk-display.log",1);
+    else unsetenv("MESA_LOG_FILE");
+#endif
+    if (!game && !boot && !menu)
+        return;
+
+    mkdir(NGB_LOG_DIR, 0777);
+#if defined(NGB_PLAYER_BUILD) && defined(NGB_DIRECT3D) && defined(NGB_COMBAT_PERF)
+    if (game) {
+        ngb_game_diagnostics_requested = 1;
+        ngb_combat_enabled = combat_open(NGB_LOG_DIR "/" NGB_GAME_PERF_CSV) && combat_start_writer();
+    }
+#endif
+#if defined(NGB_PLAYER_BUILD) && defined(NGB_DIRECT3D)
+    ngb_mission_enabled = menu;
+    mp_pc_enabled = menu && envIsSyscallHinted(0x32) && envIsSyscallHinted(0x33);
+#endif
+    if (!boot) return;
+    const char *current_log = NGB_LOG_DIR "/boot.log";
+    const char *previous_log = NGB_LOG_DIR "/boot.previous.log";
+    struct stat last;
+    if (!stat(current_log,&last) && S_ISREG(last.st_mode) && last.st_size > 0) {
+        remove(previous_log);
+        rename(current_log,previous_log);
+    }
+    boot_log = fopen(current_log, "w");
+    ngb_diagnostics_enabled = boot_log != NULL;
+#ifdef NGB_DIRECT3D
+    if (boot_log) { fprintf(boot_log, "[CONFIG] kickoff_kib=%u\n", NGB_DIRECT_KICKOFF_KIB); fflush(boot_log); }
+#endif
+}
+
 int main(int argc,char **argv)
 {
     (void)argc;(void)argv;
+#ifdef NGB_PLAYER_BUILD
+    setenv("MESA_SHADER_CACHE_DIR", NGB_RUNTIME_DIR "cache", 1);
+#endif
     launch_tick=armGetSystemTick();
     padConfigureInput(1, HidNpadStyleSet_NpadStandard);
     PadState pad;
@@ -455,46 +498,11 @@ int main(int argc,char **argv)
     sample_pad(&pad, false);
     mkdir("sdmc:/switch", 0777);
     mkdir("sdmc:/switch/ngb-runtime", 0777);
+    start_diagnostics();
 #ifdef NGB_PLAYER_BUILD
     prefs_load();launch_aspect=pref(7);launch_thread=pref(30);
     ngb_quick_set_game_dir("sdmc:/switch/ngb-runtime/disc");
     bow_loaded=ngb_crosshair_picture(bow_art,64);
-#endif
-    struct stat flag;
-#if defined(NGB_PLAYER_BUILD) && defined(NGB_DIRECT3D)
-#ifdef NGB_COMBAT_PERF
-    if(combat_requested("sdmc:/switch/ngb-runtime/alma-perf.flag")){
-        mkdir("sdmc:/switch/ngb-runtime/logs",0777);
-        ngb_combat_enabled=combat_open("sdmc:/switch/ngb-runtime/logs/alma-perf.csv") && combat_start_writer();
-    }
-#endif
-    ngb_mission_enabled = stat("sdmc:/switch/ngb-runtime/mission-perf.flag",&flag)==0 && S_ISREG(flag.st_mode);
-    ngb_mission_gl_split = ngb_mission_enabled && stat("sdmc:/switch/ngb-runtime/mission-gl-sync.flag",&flag)==0 && S_ISREG(flag.st_mode);
-    mp_pc_enabled = ngb_mission_enabled && stat("sdmc:/switch/ngb-runtime/mission-pc.flag",&flag)==0 && S_ISREG(flag.st_mode);
-#endif
-    ngb_diagnostics_enabled = stat("sdmc:/switch/ngb-runtime/diagnostics.flag",&flag)==0 && S_ISREG(flag.st_mode);
-    if (ngb_diagnostics_enabled) {
-        mkdir("sdmc:/switch/ngb-runtime/logs", 0777);
-        const char *current_log = "sdmc:/switch/ngb-runtime/logs/boot.log";
-        const char *previous_log = "sdmc:/switch/ngb-runtime/logs/boot.previous.log";
-        struct stat last;
-        if (!stat(current_log,&last) && last.st_size > 0) {
-            remove(previous_log);
-            rename(current_log,previous_log);
-        }
-        boot_log = fopen(current_log, "w");
-        if (!boot_log) ngb_diagnostics_enabled=0;
-    }
-#ifdef NGB_GPU_PRESENT
-    bool log_display=ngb_diagnostics_enabled;
-#ifdef NGB_COMBAT_PERF
-    log_display|=ngb_combat_enabled;
-#endif
-    /* The driver records whether VI accepted its native GPU buffers. */
-    if(log_display)setenv("MESA_LOG_FILE","sdmc:/switch/ngb-runtime/logs/nxvk-display.log",0);
-#endif
-#ifdef NGB_DIRECT3D
-    if (boot_log) { fprintf(boot_log, "[CONFIG] kickoff_kib=%u\n", NGB_DIRECT_KICKOFF_KIB); fflush(boot_log); }
 #endif
     Result rc = romfsInit();
     Framebuffer surface = {0};
@@ -568,8 +576,7 @@ int main(int argc,char **argv)
             reported=true;
             atomic_store(&game_view,false);
             const char *why=startup_error ? startup_error : started ? ngb_boot_reason() : "Unable to start the game";
-            mkdir("sdmc:/switch/ngb-runtime/logs",0777);
-            FILE *err=fopen("sdmc:/switch/ngb-runtime/logs/error.log","a");
+            FILE *err=ngb_open_error_log();
             if (err) { fprintf(err,"[ERROR] %s (rc=%08x)\n",why,rc); fclose(err); }
 #ifdef NGB_GPU_PRESENT
             if (gpu_window) {ngb_display_close();gpu_window=false;}
@@ -660,7 +667,7 @@ int main(int argc,char **argv)
                 displayed=next; viewing=true; atomic_store(&game_view,true);
             }
 #ifdef NGB_DIRECT3D
-            if (ngb_diagnostics_enabled && !exiting) {
+            if (boot_log && !exiting) {
                 sample_guest_thread(&worker);
                 static bool saved;
                 if (!saved && atomic_load(&completed_windows)==PROFILE_WINDOWS) {

@@ -59,7 +59,7 @@ static void set_movie_input(const char *name)
 
 void ngb_movie_displayed(void)
 {
-    if (atomic_load(&playing)) atomic_fetch_add(&displayed, 1);
+    if (NGB_DIAG && atomic_load(&playing)) atomic_fetch_add(&displayed, 1);
 }
 
 void ngb_select_movie(uint32_t address)
@@ -84,7 +84,7 @@ void ngb_select_movie(uint32_t address)
 #ifdef NGB_DIRECT3D
                 if (guest_prologue) ngb_scene_begin_prologue();
 #endif
-                selected_ns=ngb_elapsed_ns();
+                if (NGB_DIAG) selected_ns=ngb_elapsed_ns();
                 break;
             }
             break;
@@ -165,7 +165,7 @@ static int present_frames(Movie *movie, AVPacket *packet)
                 frame->width,frame->height,AV_PIX_FMT_BGRA,SWS_POINT,NULL,NULL,NULL);
             if (!movie->colors) return AVERROR(ENOMEM);
             movie->start=ngb_elapsed_ns();
-            atomic_store(&playing,true);
+            if (NGB_DIAG) atomic_store(&playing,true);
         }
         if (ngb_stop_requested()) return AVERROR_EXIT;
         if (movie->start_edge!=ngb_movie_skip_edges()) { movie->skipped=true; return AVERROR_EXIT; }
@@ -173,7 +173,8 @@ static int present_frames(Movie *movie, AVPacket *packet)
         /* Decode reference pictures, but don't present a burst of expired frames
          * after an SD stall. Keep the original movie timeline. */
         if (movie->count && ngb_elapsed_ns()>deadline+movie->period) {
-            ++movie->late; ++movie->count; continue;
+            if (NGB_DIAG) ++movie->late;
+            ++movie->count; continue;
         }
         uint8_t *dest[4]={(uint8_t *)ngb_scanout_movie_buffer()};
         int strides[4]={4*NGB_SCAN_W};
@@ -183,10 +184,10 @@ static int present_frames(Movie *movie, AVPacket *packet)
         wait_frame(deadline);
         if (ngb_stop_requested()) return AVERROR_EXIT;
         if(movie->start_edge!=ngb_movie_skip_edges()){movie->skipped=true;return AVERROR_EXIT;}
-        if (ngb_elapsed_ns()>deadline+movie->period) ++movie->late;
+        if (NGB_DIAG && ngb_elapsed_ns()>deadline+movie->period) ++movie->late;
         ngb_scanout_publish_movie();
         ++movie->count;
-        if (movie->count==1) {
+        if (NGB_DIAG && movie->count==1) {
             uint64_t now=ngb_elapsed_ns(), press=ngb_warning_start_time();
             char log[128];
             snprintf(log,sizeof(log),"Opening movie startup start_to_frame_ms=%lld select_to_frame_ms=%llu",
@@ -195,11 +196,9 @@ static int present_frames(Movie *movie, AVPacket *packet)
             ngb_kernel_log(log);
         }
         if (movie->count==1 || movie->count==120) {
-            char log[112];
-            snprintf(log,sizeof(log),"Opening movie frame=%u elapsed_ms=%llu displayed=%u late=%u",
+            NGB_BOOT_LOGF("Opening movie frame=%u elapsed_ms=%llu displayed=%u late=%u",
                 movie->count,(unsigned long long)((ngb_elapsed_ns()-movie->start)/1000000),
                 atomic_load(&displayed),movie->late);
-            ngb_kernel_log(log);
         }
     }
     return result==AVERROR(EAGAIN) || result==AVERROR_EOF ? 0 : result;
@@ -281,19 +280,17 @@ uint32_t ngb_movie_status(uint32_t status)
     if (status==1) ngb_kernel_log("Opening movie native playback during guest prep");
     setvbuf(file,NULL,_IOFBF,128*1024);
     Movie movie={.start=ngb_elapsed_ns(),.start_edge=selection_edge};
-    atomic_store(&displayed,0);
+    if (NGB_DIAG) atomic_store(&displayed,0);
     bool complete=decode_intro(file,&movie);
     if (complete) wait_frame(movie.start+movie.count*movie.period);
-    atomic_store(&playing,false);
+    if (NGB_DIAG) atomic_store(&playing,false);
     set_movie_input(NULL);
     sws_freeContext(movie.colors);
     av_frame_free(&movie.frame);
     avcodec_free_context(&movie.codec);
     fclose(file);movie_audio_end();
-    char log[144];
-    snprintf(log,sizeof(log),"Opening movie %s frames=%u elapsed_ms=%llu displayed=%u late=%u",
+    NGB_BOOT_LOGF("Opening movie %s frames=%u elapsed_ms=%llu displayed=%u late=%u",
         ngb_stop_requested() ? "cancelled" : movie.skipped ? "skipped" : complete ? "EOF" : "fallback",movie.count,
         (unsigned long long)((ngb_elapsed_ns()-movie.start)/1000000),atomic_load(&displayed),movie.late);
-    ngb_kernel_log(log);
     return (complete || movie.skipped) && !ngb_stop_requested() ? 3 : status; /* MWPLY_STAT_PLAYEND */
 }

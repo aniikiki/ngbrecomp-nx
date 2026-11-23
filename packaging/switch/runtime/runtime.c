@@ -207,9 +207,7 @@ static void checkpoint_event(uint32_t va)
 #endif
         ngb_menu_draw(cursor);
         if (menu_cursor != cursor) {
-            char line[80];
-            snprintf(line, sizeof(line), "Main menu cursor=%u", cursor);
-            ngb_kernel_log(line);
+            NGB_BOOT_LOGF("Main menu cursor=%u", cursor);
             menu_cursor = cursor;
         }
     }
@@ -1435,6 +1433,17 @@ static void flush_scene_report(void)
 }
 void ngb_scene_log_begin(void) { scene_report.active=1; }
 void ngb_scene_log_end(void) { flush_scene_report(); scene_report.active=0; }
+void ngb_kernel_logf(const char *format, ...)
+{
+    if (!boot_log) return;
+    char message[1200];
+    va_list ap;
+    va_start(ap, format);
+    vsnprintf(message, sizeof(message), format, ap);
+    va_end(ap);
+    ngb_kernel_log(message);
+}
+
 void ngb_kernel_log(const char *message) {
     if (!boot_log) return;
     if (boot_log && log_lines>=2048 && (!strncmp(message,"DirectSound stop ",17) || !strncmp(message,"Disc read unavailable ",22) || !strncmp(message,"3D scene ",9) || !strncmp(message,"Main menu ",10) || !strncmp(message,"Opening movie ",14) || !strncmp(message,"Movie content changes=",21) || !strncmp(message,"Warning fade steps=",19) || !strncmp(message,"Buffered warning Start",22) || !strncmp(message,"scanout captured",16) || !strcmp(message,"First decoded movie frame drawn") || !strcmp(message,"First Start report delivered"))) {

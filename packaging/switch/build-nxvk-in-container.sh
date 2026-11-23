@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd /work
+cache_patch=/ngb/packaging/switch/nxvk-cache.patch
+if ! git apply --reverse --check "$cache_patch" 2>/dev/null; then
+    git apply "$cache_patch"
+fi
 # Upstream invokes Ninja from several scripts; keep all of them within the
 # memory budget of an 8 GiB Docker VM, including its native shader compiler.
 cat > /usr/local/bin/ninja <<'WRAPPER'

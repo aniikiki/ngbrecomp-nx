@@ -11,11 +11,12 @@ import json
 from pathlib import Path
 from statistics import mean, median
 from present_timing import gpu_ns_per_unit
+from perf_capture import game_capture
 
 
 def load(path):
     sessions = []
-    for line in csv.reader(Path(path).open()):
+    for line in csv.reader(game_capture(path).open()):
         if not line:
             continue
         kind, *values = line
@@ -118,7 +119,7 @@ def verify(s):
 def report(sessions, start=None, end=None):
     selected = [i for i, s in enumerate(sessions) if s['rows']['N']]
     if not selected:
-        raise ValueError('No native diagnostics in this capture; need the 0.57.1-diag package and alma-perf.flag.')
+        raise ValueError('Capture the session with diagnostics.flag present at startup to record native diagnostics.')
     index = selected[-1]
     s, r = sessions[index], sessions[index]['rows']
     guests = r['G']

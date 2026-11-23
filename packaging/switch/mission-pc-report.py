@@ -1,4 +1,4 @@
-"""Resolve Mission wall-time snapshots with symbols.gz from the SAME NRO build."""
+"""Resolve menu-pc.csv or a historical mission-pc.csv using symbols.gz from the matching NRO."""
 from argparse import ArgumentParser
 from bisect import bisect_right
 from collections import Counter

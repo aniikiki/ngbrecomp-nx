@@ -22,4 +22,8 @@ trap 'rm -rf "$tmp"' EXIT
 "$toolsdir-gcc" -D__SWITCH__ -fPIE -mtp=soft -ftls-model=local-exec -ffunction-sections -fdata-sections -I"$sdk/libnx/include" -c "$tree/switch/smoke/nvk_compat.c" -o "$tmp/compat.o"
 "$toolsdir-ld" -r -u vk_icdGetInstanceProcAddr "$tmp/compat.o" --whole-archive "$driver" --no-whole-archive --start-group "${libs[@]/#/$cross/}" --end-group -o "$tmp/driver.o"
 "$toolsdir-nm" --defined-only -g -P "$tmp/driver.o" | awk '$1 != "vk_icdGetInstanceProcAddr" && $2 !~ /^[uU]$/ {print $1}' > "$tmp/private"
+if ! grep -Fxq disk_cache_horizon_flush "$tmp/private"; then
+    echo "Rebuild the Switch driver with packaging/switch/build-nxvk.sh to include the SD cache fix." >&2
+    exit 1
+fi
 "$toolsdir-objcopy" --localize-symbols="$tmp/private" "$tmp/driver.o" "$output"

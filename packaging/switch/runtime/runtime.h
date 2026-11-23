@@ -3,6 +3,14 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#ifndef NGB_DIAG
+#ifdef __SWITCH__
+#include "player_diagnostics.h"
+#else
+#define NGB_DIAG 1
+#endif
+#endif
+
 /* Bootstrap statuses are intentionally distinct from a playable game. */
 enum { NGB_BOOT_RETURNED, NGB_BOOT_UNSUPPORTED, NGB_BOOT_ERROR, NGB_BOOT_CANCELLED };
 int ngb_boot(const char *xbe_path, FILE *log);
@@ -15,6 +23,9 @@ void ngb_poll(void);
 uint64_t ngb_elapsed_ns(void);
 void ngb_graphics_wait_until(uint64_t nanoseconds);
 void ngb_kernel_log(const char *message);
+void ngb_kernel_logf(const char *format, ...) __attribute__((format(printf, 1, 2)));
+/* Avoid preparing arguments or formatting a message for a disabled boot log. */
+#define NGB_BOOT_LOGF(...) do { if (NGB_DIAG) ngb_kernel_logf(__VA_ARGS__); } while (0)
 void ngb_scene_log_begin(void);
 void ngb_scene_log_end(void);
 uint32_t ngb_query_setting(uint32_t index, uint32_t type, uint32_t value,

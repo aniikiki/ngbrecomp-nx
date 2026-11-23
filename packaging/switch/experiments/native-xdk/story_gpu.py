@@ -9,10 +9,10 @@ def instrument(source, *, wave=True):
         assert source.count(before) == 1, before
         source = source.replace(before, after)
 
-    # Keep the playable binary caches live on every launch. Only the optional
-    # text journal shares the combat recorder's startup switch.
+    # The game flag enables this journal even if the game CSV fails to open.
+    # The playable binary caches have their own unconditional lifetime.
     journal = 'material_log_ = std::fopen((dir + "/materials.csv").c_str(), "a");'
-    replace(journal, 'if (ngb_combat_enabled) ' + journal)
+    replace(journal, 'if (ngb_game_diagnostics_requested) ' + journal)
     if not wave:
         return source
     # Preserve both endpoints on the device clock as well as the existing

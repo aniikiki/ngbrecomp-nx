@@ -50,10 +50,10 @@ an intervention, not a measurement of Switch GPU time or pure memory bandwidth.
 The opt-in player trace now counts guest flips, published snapshots, and frames
 displayed over the instrumented Mission loops. Compare totals over many loops;
 identical images may legitimately be suppressed. D rows separate display acquire,
-scaling/overlay, and framebufferEnd. PC/LR samples require mission-pc.flag, and
-the sparse GL finish/read split requires mission-gl-sync.flag, both in addition
-to mission-perf.flag. Capture the plain trace for baseline frame pacing before
-enabling intrusive probes. No generic tracing was added to the main menu.
+scaling/overlay, and framebufferEnd. From 0.57.52, an empty
+`/switch/ngb-runtime/menu-perf.flag` enables the Mission trace, PC/LR sampling
+and the sparse GL finish/read timing together. The player writes `logs/menu-perf.csv`
+and `logs/menu-pc.csv`. Remove the flag and restart for normal frame pacing.
 
 ## Switch 0.56.23: cold Mission vs. Mission after attract mode
 

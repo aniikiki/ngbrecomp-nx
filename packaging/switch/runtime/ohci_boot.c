@@ -192,12 +192,13 @@ void ngb_menu_draw(uint32_t cursor)
         }
     }
 #endif
-    if (!menu_entry_ns) menu_entry_ns=ngb_elapsed_ns();
     menu_drawn=true;
+    /* Settings and the gameplay recorder both route confirm by this cursor. */
     if (cursor!=last_cursor) {
-        change_ns=atomic_exchange(&direction_ns,0);
         last_cursor=cursor;
+        if (NGB_DIAG) change_ns=atomic_exchange(&direction_ns,0);
     }
+    if (NGB_DIAG && !menu_entry_ns) menu_entry_ns=ngb_elapsed_ns();
 }
 
 /* Publish one directional state per guest frame. Preserve a short tap if
@@ -210,11 +211,13 @@ static void sample_menu_frame(void)
         if (ngb_combat_enabled) ngb_combat_menu_visible(menu_drawn);
 #endif
         atomic_exchange(&menu_edges,0);
-        atomic_store(&direction_ns,0);
         atomic_store(&menu_input,menu_drawn);
-        menu_window_ns=ngb_elapsed_ns();
-        menu_flips=0;
-        change_ns=0;
+        if (NGB_DIAG) {
+            atomic_store(&direction_ns,0);
+            menu_window_ns=ngb_elapsed_ns();
+            menu_flips=0;
+            change_ns=0;
+        }
     }
 #ifdef NGB_DIRECT3D
     /* A menu draw or completed prologue can request ownership of the next
@@ -225,6 +228,8 @@ static void sample_menu_frame(void)
     unsigned edges=atomic_exchange(&menu_edges,0);
     unsigned held=reports[ngb_latest(&pad_samples)][2]&15;
     menu_dpad=((held&3)?held&3:edges&3) | ((held&12)?held&12:edges&12);
+    menu_drawn=false;
+    if (!NGB_DIAG) return;
     uint64_t now=ngb_elapsed_ns(), elapsed=now-menu_window_ns;
     char msg[112];
     if (change_ns && now>=change_ns) {
@@ -249,7 +254,6 @@ static void sample_menu_frame(void)
         }
         menu_window_ns=now; menu_flips=0;
     }
-    menu_drawn=false;
 }
 
 void ngb_pad_flip(void)
@@ -285,13 +289,13 @@ void ngb_ohci_pad_sample(uint16_t buttons, int16_t lx, int16_t ly, int16_t rx, i
     buttons &= ~logo_held;
     if (pressed & PAD_START) atomic_fetch_add(&start_presses,1);
     if (pressed & buttons & PAD_START) {
-        if (ngb_scanout_ready() && !atomic_load(&warning_press_ns))
+        if (NGB_DIAG && ngb_scanout_ready() && !atomic_load(&warning_press_ns))
             atomic_store(&warning_press_ns,ngb_elapsed_ns());
         atomic_store(&start_edge, true);
     }
     unsigned directions=pressed & 15;
     if (directions && atomic_load(&menu_input)) {
-        atomic_store(&direction_ns,ngb_elapsed_ns());
+        if (NGB_DIAG) atomic_store(&direction_ns,ngb_elapsed_ns());
         atomic_fetch_or(&menu_edges,directions);
     }
     pad_report[2]=(uint8_t)buttons;
@@ -420,10 +424,8 @@ static unsigned control_stage(uint32_t *td)
         reply_length=-1;
         reply_position=0;
         moved=size;
-        char line[100];
-        snprintf(line,sizeof(line),"OHCI0 SETUP request=%02x:%02x value=%04x length=%u",
-                 setup.bmRequestType,setup.bRequest,setup.wValue,setup.wLength);
-        ngb_kernel_log(line);
+        NGB_BOOT_LOGF("OHCI0 SETUP request=%02x:%02x value=%04x length=%u",
+                      setup.bmRequestType,setup.bRequest,setup.wValue,setup.wLength);
     } else if (!setup_pending) {
         ngb_stop("USB stage without SETUP", pid);
     } else if (pid==2) {

@@ -2,7 +2,8 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-extern int ngb_diagnostics_enabled; /* Set before starting either worker. */
+/* The retained renderer uses this symbol for the detailed boot.log probes. */
+extern int ngb_diagnostics_enabled;
 #ifdef __cplusplus
 }
 #endif

@@ -5,12 +5,11 @@
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/stat.h>
 #include <time.h>
 enum { CP_CAP=512, CP_COLS=32 };
 typedef struct {unsigned kind,n;uint64_t v[CP_COLS];} CombatRow;
 static struct {atomic_uint head,tail,lost;CombatRow rows[CP_CAP];} cp_ring[3];
-int ngb_combat_enabled;
+int ngb_game_diagnostics_requested, ngb_combat_enabled;
 static atomic_int cp_active;
 static atomic_uint_fast64_t cp_wait_ns;
 void ngb_combat_wait(int active){
@@ -131,10 +130,6 @@ void ngb_combat_guest(unsigned frame,unsigned id,unsigned mode,unsigned diff,uns
 #ifdef NGB_NATIVE_DIAG
  if(on && ram && maxhp)combat_player(frame,ram);
 #endif
-}
-static int combat_requested(const char *path){
- struct stat st;
- return stat(path,&st)==0 && S_ISREG(st.st_mode);
 }
 static int combat_open(const char *path){
  cp_file=fopen(path,"a+");if(!cp_file)return 0;

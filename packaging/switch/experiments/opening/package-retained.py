@@ -85,7 +85,7 @@ if '--opening-warm' in sys.argv:
  comp('vk/backend.cpp',warm['backend'](Path('/work/src/d3d/vk/backend.cpp').read_text()),['-DNGB_RIGID_CLIP'])""")
  replace("'checkpoint','backend-clip'", "'checkpoint'")
  replace("  if name=='main.c':s+=", """  if name=='runtime.c':
-   s=once(s,'        ngb_menu_gpu_prepare();','        ngb_menu_gpu_prepare(); extern void ngb_prepare_title_device(void); uint64_t start=ngb_elapsed_ns(); ngb_prepare_title_device(); char msg[96]; snprintf(msg,sizeof(msg),"3D scene [WARM_TITLE] elapsed_ms=%llu",(unsigned long long)((ngb_elapsed_ns()-start)/1000000)); ngb_kernel_log(msg);')
+   s=once(s,'        ngb_menu_gpu_prepare();','        ngb_menu_gpu_prepare(); extern void ngb_prepare_title_device(void); uint64_t start=NGB_DIAG ? ngb_elapsed_ns() : 0; ngb_prepare_title_device(); NGB_BOOT_LOGF("3D scene [WARM_TITLE] elapsed_ms=%llu",(unsigned long long)((ngb_elapsed_ns()-start)/1000000));')
   if name=='main.c':s+=""")
  replace("  shutil.copyfile(base/'romfs/.ngb-spirv',romfs/'.ngb-spirv')","""  seeds=base/'core-perf/opening-present-combined'
   for a,bname in [('opening-complete.spirv','.ngb-spirv'),('opening-120.recipes','.ngb-recipes')]:

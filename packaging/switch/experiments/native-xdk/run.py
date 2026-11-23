@@ -51,7 +51,7 @@ output = args.output.resolve()
 assert output.is_relative_to(root / 'build'), 'reports and scratch saves belong under build/'
 output.mkdir(parents=True, exist_ok=False)
 if args.diagnostics:
-    (output / 'alma-perf.flag').touch()
+    (output / 'diagnostics.flag').touch()
 seed = root / 'build/switch-runtime/core-perf/wide-start/newgame-hdd2'
 shutil.copytree(seed, output / 'hdd')
 base = root / 'build/switch-runtime/core-perf/native-xdk'

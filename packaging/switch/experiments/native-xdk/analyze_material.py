@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import random
 import statistics as stats
+from perf_capture import game_capture
 
 parser = argparse.ArgumentParser()
 parser.add_argument('directory', type=Path)
@@ -12,7 +13,7 @@ parser.add_argument('--mesh', action='store_true')
 args = parser.parse_args()
 path = args.directory
 tables, headers = {}, {}
-with (path / 'native-perf.csv').open() as file:
+with game_capture(path).open() as file:
     for row in csv.reader(file):
         if not row:
             continue

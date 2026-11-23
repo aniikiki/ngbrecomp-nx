@@ -85,10 +85,7 @@ static uint32_t create_device(const uint32_t *a)
     devices[slot].object = object;
     strcpy(devices[slot].name, name);
     store32(output, object);
-    char message[1200];
-    snprintf(message, sizeof(message), "created device name=%s type=%08x extension=%u object=%08x",
-             name, type, extension, object);
-    ngb_kernel_log(message);
+    NGB_BOOT_LOGF("created device name=%s type=%08x extension=%u object=%08x", name, type, extension, object);
     return 0;
 }
 
@@ -111,7 +108,6 @@ unsigned ngb_files_arg_count(uint32_t ordinal)
 uint32_t ngb_files_dispatch(uint32_t ordinal, const uint32_t *a)
 {
     uint32_t status = NGB_FS_UNSUPPORTED, done = 0, ios = 0;
-    char message[1200];
     if (ordinal == 65) return create_device(a);
     if (ordinal == 198) {
         if (!a[1]) return 0xc000000du;
@@ -130,8 +126,7 @@ uint32_t ngb_files_dispatch(uint32_t ordinal, const uint32_t *a)
         if (!status) status = name_at(a[1], target);
         if (!status) {
             status = ngb_file_link(name, target);
-            snprintf(message, sizeof(message), "link %.63s -> %.1023s status=%08x", name, target, status);
-            ngb_kernel_log(message);
+            NGB_BOOT_LOGF("link %.63s -> %.1023s status=%08x", name, target, status);
         }
         return status;
     }
@@ -145,8 +140,7 @@ uint32_t ngb_files_dispatch(uint32_t ordinal, const uint32_t *a)
         if (!status && u32(a[1])) ngb_stop("unsupported relative link root", u32(a[1]));
         if (!status) status = ngb_link_open(name, u32(a[1] + 8) & 0x40, &handle);
         store32(a[0], handle);
-        snprintf(message, sizeof(message), "open link %s status=%08x handle=%08x", name, status, handle);
-        ngb_kernel_log(message);
+        NGB_BOOT_LOGF("open link %s status=%08x handle=%08x", name, status, handle);
         return status;
     }
     if (ordinal == 215) {
@@ -161,8 +155,7 @@ uint32_t ngb_files_dispatch(uint32_t ordinal, const uint32_t *a)
         if (!buffer || max <= length) return 0xc0000023u;
         memcpy((void *)ngb_guest_pointer(buffer, length + 1), target, length + 1);
         store32(a[1], (max << 16) | length);
-        snprintf(message, sizeof(message), "query link handle=%08x target=%s bytes=%u", a[0], target, length);
-        ngb_kernel_log(message);
+        NGB_BOOT_LOGF("query link handle=%08x target=%s bytes=%u", a[0], target, length);
         return 0;
     }
     if (ordinal==207) {
@@ -172,8 +165,7 @@ uint32_t ngb_files_dispatch(uint32_t ordinal, const uint32_t *a)
         char pattern[1024]="";
         status=a[8] ? name_at(a[8],pattern) : 0;
         if (!status) status=ngb_file_directory(a[0],pattern,a[9],(void *)ngb_guest_pointer(a[5],a[6]),a[6],&done);
-        snprintf(message,sizeof(message),"directory query mask=%.255s status=%08x bytes=%u",pattern,status,done);
-        ngb_kernel_log(message);
+        NGB_BOOT_LOGF("directory query mask=%.255s status=%08x bytes=%u", pattern, status, done);
     } else if (ordinal == 196 || ordinal == 200) {
         ios = a[4];
         if (!ios) return 0xc000000du;
@@ -183,8 +175,7 @@ uint32_t ngb_files_dispatch(uint32_t ordinal, const uint32_t *a)
             if (a[7] || a[9]) status = NGB_FS_UNSUPPORTED;
             else status = ngb_file_dismount(a[0], a[5]);
         } else status = ngb_file_ioctl(a[0], a[5], (void *)ngb_guest_pointer(a[8], a[9]), a[9], &done);
-        snprintf(message, sizeof(message), "device control code=%08x out=%u status=%08x", a[5], a[9], status);
-        ngb_kernel_log(message);
+        NGB_BOOT_LOGF("device control code=%08x out=%u status=%08x", a[5], a[9], status);
     } else if (ordinal == 190 || ordinal == 202) {
         if (!a[0] || !a[2] || !a[3]) return 0xc000000du;
         (void)ngb_guest_pointer(a[0], 4);
@@ -209,12 +200,10 @@ uint32_t ngb_files_dispatch(uint32_t ordinal, const uint32_t *a)
         if (!status) {
             status = ngb_file_open(path, root, a[1], share, disposition, options, &handle, &done);
         }
-        snprintf(message, sizeof(message), "open path=%s root=%08x access=%08x disposition=%u options=%08x status=%08x handle=%08x",
-                 path, root, a[1], disposition, options, status, handle);
-        ngb_kernel_log(message);
+        NGB_BOOT_LOGF("open path=%s root=%08x access=%08x disposition=%u options=%08x status=%08x handle=%08x",
+                      path, root, a[1], disposition, options, status, handle);
         if (ordinal == 190 && status == NGB_FS_UNSUPPORTED) {
-            snprintf(message, sizeof(message), "create allocation=%lld attributes=%08x", (long long)(a[4] ? i64(a[4]) : 0), a[5]);
-            ngb_kernel_log(message);
+            NGB_BOOT_LOGF("create allocation=%lld attributes=%08x", (long long)allocation, a[5]);
         }
         store32(a[0], handle); ios = a[3];
     } else if (ordinal == 219 || ordinal == 236) {
@@ -224,10 +213,7 @@ uint32_t ngb_files_dispatch(uint32_t ordinal, const uint32_t *a)
         if (a[2]) ngb_stop("file completion APC not connected",ordinal);
         if (a[1] && !ngb_io_event(a[1],0)) return NGB_FS_INVALID_HANDLE;
         int64_t offset = a[7] ? i64(a[7]) : -2;
-        int timed = ngb_scene_active;
-#ifdef NGB_DIAG
-        timed = timed && NGB_DIAG;
-#endif
+        int timed = ngb_scene_active && NGB_DIAG;
 #if defined(NGB_NATIVE_DIAG) || defined(NGB_COMBAT_PERF)
         timed |= ngb_combat_enabled;
 #endif
@@ -254,14 +240,13 @@ uint32_t ngb_files_dispatch(uint32_t ordinal, const uint32_t *a)
 #endif
         }
         if (ordinal == 219 && status == NGB_FS_UNSUPPORTED) {
-            snprintf(message, sizeof(message), "Disc read unavailable file=%s offset=%lld bytes=%u",
-                     ngb_file_basename(a[0]), (long long)offset, a[6]);
-            ngb_kernel_log(message);
+            NGB_BOOT_LOGF("Disc read unavailable file=%s offset=%lld bytes=%u",
+                          ngb_file_basename(a[0]), (long long)offset, a[6]);
         }
         if (ordinal == 219 && !status && done)
             ngb_warning_file_read(ngb_file_basename(a[0]), offset);
-        snprintf(message, sizeof(message), "%s handle=%08x offset=%lld requested=%u transferred=%u status=%08x", ordinal == 219 ? "read" : "write", a[0], (long long)offset, a[6], done, status);
-        ngb_kernel_log(message);
+        NGB_BOOT_LOGF("%s handle=%08x offset=%lld requested=%u transferred=%u status=%08x",
+                      ordinal == 219 ? "read" : "write", a[0], (long long)offset, a[6], done, status);
     } else if (ordinal == 211 || ordinal == 218 || ordinal == 226) {
         ios = a[1];
         if (!ios) return 0xc000000du;
@@ -276,11 +261,9 @@ uint32_t ngb_files_dispatch(uint32_t ordinal, const uint32_t *a)
         else if (a[4] == 14 && a[3] >= 8) status = ngb_file_position(a[0], i64(a[2]));
         else if (a[4] == 19 || a[4] == 20) status = a[3] >= 8 ? ngb_file_resize(a[0], i64(a[2]), a[4] == 19) : 0xc0000004u;
         int native_errno = errno;
-        snprintf(message, sizeof(message), "file information ordinal=%u class=%u length=%u status=%08x", ordinal, a[4], a[3], status);
-        ngb_kernel_log(message);
+        NGB_BOOT_LOGF("file information ordinal=%u class=%u length=%u status=%08x", ordinal, a[4], a[3], status);
         if (status && native_errno) {
-            snprintf(message, sizeof(message), "file information native errno=%d", native_errno);
-            ngb_kernel_log(message);
+            NGB_BOOT_LOGF("file information native errno=%d", native_errno);
         }
     }
     if (status == NGB_FS_UNSUPPORTED) {

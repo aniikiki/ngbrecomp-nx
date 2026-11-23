@@ -5,6 +5,7 @@
 #include "scanout.h"
 #ifdef NGB_NATIVE_DIAG
 #include <pthread.h>
+#include "diagnostics_flag.h"
 #include "native_combat_perf.inc"
 static atomic_int replay_log_done;
 static void *replay_log_thread(void *unused) {
@@ -354,8 +355,9 @@ int main(int argc, char **argv)
     ngb_ohci_pad_present(1);
 #ifdef NGB_NATIVE_DIAG
     pthread_t logger;
-    if (combat_requested("alma-perf.flag")) {
-        ngb_combat_enabled = combat_open("native-perf.csv");
+    if (ngb_diagnostics_requested(NGB_DIAGNOSTICS_FLAG)) {
+        ngb_game_diagnostics_requested = 1;
+        ngb_combat_enabled = combat_open(NGB_GAME_PERF_CSV);
         if (!ngb_combat_enabled || pthread_create(&logger,NULL,replay_log_thread,NULL)) return 2;
     }
 #endif

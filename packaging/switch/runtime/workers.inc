@@ -125,7 +125,7 @@ static void idle_if_all_waiting(void)
             return;
     }
     struct timespec nap = {0, 250000};
-    uint64_t start = ngb_scene_active ? ngb_elapsed_ns() : 0;
+    uint64_t start = NGB_DIAG && ngb_scene_active ? ngb_elapsed_ns() : 0;
     nanosleep(&nap, NULL);
     if (start) ngb_scene_idle_time(ngb_elapsed_ns() - start);
 }

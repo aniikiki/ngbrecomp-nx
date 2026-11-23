@@ -117,6 +117,11 @@ Driving and watching a headless run:
 
 ## Conventions
 
+- The Switch player checks three independent empty files in `/switch/ngb-runtime/` at startup.
+  `diagnostics.flag` enables the game performance and material recorders.
+  `boot.flag` enables the boot and nxvk logs. `menu-perf.flag` enables the Missions menu
+  timing and thread samples. Gate sampling and diagnostic file I/O on the owning flag.
+  Write `logs/error.log` on errors in every mode. Keep normal shader cache loading and saving active.
 - Match the surrounding code: comments say why, in plain sentences; names and idioms as nearby.
 - A behaviour change gets checked in a headless run — measured (positions, timings, logs), not
   assumed — at the aspect ratios it touches (4:3, 16:9, 16:10, 21:9, 32:9).

@@ -61,6 +61,11 @@ def compatibility():
          '45afd0850fca1ecb36853828370f60b2beb633cb43e97b4ab6a7c3aa78c0f3f4',
          'db0389332911d8b987801d2cc3ea08fd10d121b7768f85d66c4fa9e7c401890b',
          '49e9804d6b13fe67dd11f861317cd1ac5988f6a8970390438fd0093583bb757f'),
+        # 0.57.52 only changes diagnostic counters and text logging.
+        ('59b2039b9d75d7098bc2527a31744d0d3d739b41872c5b2a46060542a925d0ca',
+         '45afd0850fca1ecb36853828370f60b2beb633cb43e97b4ab6a7c3aa78c0f3f4',
+         'db0389332911d8b987801d2cc3ea08fd10d121b7768f85d66c4fa9e7c401890b',
+         '49e9804d6b13fe67dd11f861317cd1ac5988f6a8970390438fd0093583bb757f'),
     }
     if tuple(sources[n] for n in (backend, shader, header, bounds)) in compatible:
         epoch_sources[bounds] = '85d57bb9ffe5ba6c70a954b0a9201fced94be865aa1f84e40f22b69d290f477e'

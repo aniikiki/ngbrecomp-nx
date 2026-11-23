@@ -5,7 +5,7 @@ enum { MP_STRIP, MP_READ, MP_UPLOAD, MP_GL_DRAW, MP_VK_DRAW, MP_VK_PRESENT, MP_F
 #ifdef __cplusplus
 extern "C" {
 #endif
-extern int ngb_mission_enabled, ngb_mission_gl_split;
+extern int ngb_mission_enabled;
 extern unsigned ngb_mission_guest_id; /* guest thread only */
 void ngb_mission_stage(unsigned stage, unsigned state);
 void ngb_mission_count(unsigned kind, uint64_t ns, unsigned amount);

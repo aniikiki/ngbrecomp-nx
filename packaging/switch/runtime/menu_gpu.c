@@ -124,9 +124,7 @@ static int initialize(void)
     glFinish();
     glDeleteTextures(1,&mask);
     if (glGetError() != GL_NO_ERROR) return 0;
-    char message[150];
-    snprintf(message,sizeof(message),"Main menu overlay renderer=%s",glGetString(GL_RENDERER));
-    ngb_kernel_log(message);
+    NGB_BOOT_LOGF("Main menu overlay renderer=%s", glGetString(GL_RENDERER));
     return 1;
 }
 
@@ -165,7 +163,7 @@ static GLuint alpha_mask(const uint8_t *src, unsigned w, unsigned h)
 void ngb_menu_gpu_flush(void)
 {
     if (!ngb_menu_dirty_end) return;
-    uint64_t start = ngb_elapsed_ns();
+    uint64_t start = NGB_DIAG ? ngb_elapsed_ns() : 0;
     glPixelStorei(GL_PACK_ROW_LENGTH,gpu.stride);
     // CPU pixels outside the overlay bounds still contain the uploaded input.
     // PACK_ROW_LENGTH retains the guest pitch even for a narrow subrectangle.
@@ -175,7 +173,7 @@ void ngb_menu_gpu_flush(void)
 #ifdef NGB_PLAYER_BUILD
         static unsigned sample_seq;
         uint64_t finished=0;
-        if(mt && ngb_mission_gl_split && (++sample_seq%61)==0){
+        if(mt && (++sample_seq%61)==0){
             glFinish();finished=ngb_elapsed_ns();
             MP_ADD(MP_FINISH,finished-mt,0);
         }
@@ -190,8 +188,10 @@ void ngb_menu_gpu_flush(void)
     ngb_menu_dirty_begin = ngb_menu_dirty_end = 0;
     GLenum error = glGetError();
     if (error) ngb_stop("menu overlay readback failed",error);
-    gpu.read_ns += ngb_elapsed_ns()-start;
-    ++gpu.batches;
+    if (NGB_DIAG) {
+        gpu.read_ns += ngb_elapsed_ns()-start;
+        ++gpu.batches;
+    }
 }
 
 void ngb_menu_gpu_prepare(void)
@@ -200,9 +200,7 @@ void ngb_menu_gpu_prepare(void)
         gpu.attempted = 1;
         gpu.ready = initialize();
         if (!gpu.ready) {
-            char msg[96];
-            snprintf(msg,sizeof(msg),"Main menu overlay renderer=CPU (EGL %04x)",eglGetError());
-            ngb_kernel_log(msg);
+            NGB_BOOT_LOGF("Main menu overlay renderer=CPU (EGL %04x)", eglGetError());
         }
     }
 }
@@ -269,7 +267,7 @@ int ngb_menu_gpu_overlay(const struct screen_vertex v[4], const uint8_t *texture
     glBlendFunc(GL_SRC_ALPHA,additive ? GL_ONE : GL_ONE_MINUS_SRC_ALPHA);
     glDrawArrays(GL_TRIANGLE_STRIP,0,4);
     MP_ADD(MP_GL_DRAW,0,0);
-    ++gpu.draws;
+    if (NGB_DIAG) ++gpu.draws;
     return 1;
 }
 

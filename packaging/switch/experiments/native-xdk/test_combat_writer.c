@@ -28,6 +28,7 @@ static void svcSleepThread(uint64_t ns) { struct timespec t={ns/1000000000,ns%10
 uint64_t ngb_elapsed_ns(void) { struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec*1000000000ull+t.tv_nsec; }
 #define __SWITCH__ 1
 #define NGB_NATIVE_DIAG 1
+#include "diagnostics_flag.h"
 #include "combat_perf.inc"
 
 static atomic_uint completed;
@@ -99,8 +100,8 @@ static void* produce(void* argument) {
     atomic_fetch_add(&completed,1);return NULL;
 }
 int main(int argc,char** argv) {
-    assert(argc==2 && !combat_requested(".") && !combat_requested("no-such-file/alma-perf.flag"));
-    assert(combat_open(argv[1]) && combat_requested(argv[1]));
+    assert(argc==2 && !ngb_diagnostics_requested(".") && !ngb_diagnostics_requested("no-such-file/" NGB_DIAGNOSTICS_FLAG));
+    assert(combat_open(argv[1]) && ngb_diagnostics_requested(argv[1]));
     flockfile(cp_file);
     assert(combat_start_writer());
     pthread_t producers[3];

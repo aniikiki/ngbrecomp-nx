@@ -353,9 +353,11 @@ static void activate_scene(void)
     nv2a_context_init();
     pgraph_init_thread(device);
 #endif
-    previous_flip = window_start = scene_epoch = ngb_elapsed_ns();
-    fifo_epoch = ngb_fifo_time_ns();
-    window_display = ngb_scanout_display_count();
+    if (NGB_DIAG) {
+        previous_flip = window_start = scene_epoch = ngb_elapsed_ns();
+        fifo_epoch = ngb_fifo_time_ns();
+        window_display = ngb_scanout_display_count();
+    }
 #ifndef NGB_DIRECT3D
     GLint timer_bits = 0;
     glGetQueryiv(GL_TIMESTAMP, GL_QUERY_COUNTER_BITS, &timer_bits);

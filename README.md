@@ -2,7 +2,7 @@
 
 这是原版 Xbox《忍者龙剑传 Black》的非官方 Switch 移植版，基于 [Ninja Gaiden Black Recompiled](https://github.com/gamboozino/ngbrecomp)。游戏通过 Switch 的 Homebrew Menu 启动。
 
-**当前版本为 0.57.26。** 游戏音效和过场动画使用 48 kHz 双声道输出，音量由 Switch 系统控制。
+**当前版本为 0.57.56。** 游戏音效和过场动画使用 48 kHz 双声道输出，音量由 Switch 系统控制。
 
 ## 首次安装
 

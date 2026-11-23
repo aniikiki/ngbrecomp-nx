@@ -18,7 +18,7 @@ args = p.parse_args()
 assert json.loads((args.report / 'result.json').read_text())['passed']
 spec = importlib.util.spec_from_file_location('diag', Path(__file__).with_name('analyze-diag.py'))
 diag = importlib.util.module_from_spec(spec); spec.loader.exec_module(diag)
-s = diag.load(args.report / 'native-perf.csv')[-1]; diag.verify(s)
+s = diag.load(args.report)[-1]; diag.verify(s)
 native = {n['native_frame']: n for n in s['rows']['N']}
 rows = [{k:int(v) for k,v in r.items()} for r in csv.DictReader((args.report / 'cpu-ab.csv').open())]
 alive = []

@@ -39,14 +39,13 @@ void ngb_pcm_render(int16_t *dst,unsigned n){
 }
 #ifdef __SWITCH__
 #include <switch.h>
-#include <sys/stat.h>
+#include "diagnostics_flag.h"
 static _Alignas(4096) int16_t speakers[3][2048];
 static AudioOutBuffer device_buffers[3];
 static Thread device_worker;
 static atomic_bool device_running;
 static void output_error(Result rc){
-    mkdir("sdmc:/switch/ngb-runtime/logs",0777);
-    FILE *f=fopen("sdmc:/switch/ngb-runtime/logs/error.log","a");
+    FILE *f=ngb_open_error_log();
     if(f){fprintf(f,"[AUDIO] audout error %08x\n",rc);fclose(f);}
 }
 static void play_pcm(void *arg){

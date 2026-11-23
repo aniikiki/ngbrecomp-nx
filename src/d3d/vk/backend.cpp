@@ -736,6 +736,13 @@ private:
     VkSampler bound_samplers_[4]{};
     bool descriptors_valid_{};
     uint64_t descriptor_requests_{}, descriptor_writes_{};
+    bool FrameCountersEnabled() const {
+#ifdef NGB_COMBAT_PERF
+        return NGB_DIAG || cp_on;
+#else
+        return NGB_DIAG;
+#endif
+    }
     uint32_t ChangedDrawBindings(VkWriteDescriptorSet* writes);
     bool async_submit_ = true;
     uint32_t chunk_draws_ = 0, frame_kicks_ = 0, last_draw_target_ = 0;
@@ -978,7 +985,7 @@ bool VulkanBackend::CreateInstance() {
 #ifdef NGB_GPU_PRESENT
     std::vector<const char*> extensions;
 #ifdef __SWITCH__
-    extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    if (NGB_DIAG) extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     const char* window_ext = "VK_NN_vi_surface";
 #else
     const char* window_ext = "VK_KHR_xcb_surface";
@@ -1001,8 +1008,10 @@ bool VulkanBackend::CreateInstance() {
     ci.ppEnabledExtensionNames = extensions.data();
 #elif defined(__SWITCH__) && defined(NGB_DIRECT3D)
     const char *extensions[] = {VK_EXT_DEBUG_UTILS_EXTENSION_NAME};
-    ci.enabledExtensionCount = 1;
-    ci.ppEnabledExtensionNames = extensions;
+    if (NGB_DIAG) {
+        ci.enabledExtensionCount = 1;
+        ci.ppEnabledExtensionNames = extensions;
+    }
 #elif defined(__APPLE__)
     const char *extensions[] = {VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME};
     ci.enabledExtensionCount = 1;
@@ -1020,9 +1029,11 @@ bool VulkanBackend::CreateDevice() {
     uint32_t n = 0;
     VKCHECK(vkEnumeratePhysicalDevices(inst_, &n, nullptr));
 #ifdef NGB_DIRECT3D
-    char device_info[384];
-    std::snprintf(device_info, sizeof(device_info), "3D scene Vulkan physical devices=%u", n);
-    ngb_kernel_log(device_info);
+    if (NGB_DIAG) {
+        char device_info[384];
+        std::snprintf(device_info, sizeof(device_info), "3D scene Vulkan physical devices=%u", n);
+        ngb_kernel_log(device_info);
+    }
 #endif
     if (n == 0) {
         ReportVulkanError("empty physical device list", VK_ERROR_INCOMPATIBLE_DRIVER);
@@ -1035,10 +1046,13 @@ bool VulkanBackend::CreateDevice() {
         VkPhysicalDeviceProperties pr;
         vkGetPhysicalDeviceProperties(p, &pr);
 #ifdef NGB_DIRECT3D
-        std::snprintf(device_info, sizeof(device_info), "3D scene Vulkan candidate=%s API=%u.%u.%u",
-                      pr.deviceName, VK_API_VERSION_MAJOR(pr.apiVersion), VK_API_VERSION_MINOR(pr.apiVersion),
-                      VK_API_VERSION_PATCH(pr.apiVersion));
-        ngb_kernel_log(device_info);
+        if (NGB_DIAG) {
+            char device_info[384];
+            std::snprintf(device_info, sizeof(device_info), "3D scene Vulkan candidate=%s API=%u.%u.%u",
+                          pr.deviceName, VK_API_VERSION_MAJOR(pr.apiVersion), VK_API_VERSION_MINOR(pr.apiVersion),
+                          VK_API_VERSION_PATCH(pr.apiVersion));
+            ngb_kernel_log(device_info);
+        }
 #endif
         if (pr.apiVersion < VK_API_VERSION_1_3) continue;
         if (!phys_ || pr.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) phys_ = p;
@@ -1179,7 +1193,7 @@ bool VulkanBackend::FinishDevice() {
     vkGetPhysicalDeviceFormatProperties(phys_, VK_FORMAT_D24_UNORM_S8_UINT, &fp);
     ds_format_ = !d32 && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)
                      ? VK_FORMAT_D24_UNORM_S8_UINT : VK_FORMAT_D32_SFLOAT_S8_UINT;
-    std::fprintf(stderr, "[D3D] depth: %s\n", ds_format_ == VK_FORMAT_D32_SFLOAT_S8_UINT ? "32-bit float" : "24-bit");
+    if (NGB_DIAG) std::fprintf(stderr, "[D3D] depth: %s\n", ds_format_ == VK_FORMAT_D32_SFLOAT_S8_UINT ? "32-bit float" : "24-bit");
     VkPhysicalDeviceProperties pr;
     vkGetPhysicalDeviceProperties(phys_, &pr);
     ringAlign_ = std::max<VkDeviceSize>(pr.limits.minUniformBufferOffsetAlignment, 16);
@@ -1187,7 +1201,7 @@ bool VulkanBackend::FinishDevice() {
     vkGetPhysicalDeviceFeatures(phys_, &feat);   // both devices enable it when it is there
     anisotropy_ = feat.samplerAnisotropy == VK_TRUE;
     bc_ = feat.textureCompressionBC == VK_TRUE;
-    if (!bc_) std::fprintf(stderr, "[D3D] no DXT on this GPU: decoded to BGRA as they are made\n");
+    if (NGB_DIAG && !bc_) std::fprintf(stderr, "[D3D] no DXT on this GPU: decoded to BGRA as they are made\n");
     wide_lines_ = feat.wideLines == VK_TRUE;
     line_max_ = pr.limits.lineWidthRange[1];
     point_max_ = feat.largePoints == VK_TRUE ? pr.limits.pointSizeRange[1] : 1.0f;
@@ -1196,11 +1210,13 @@ bool VulkanBackend::FinishDevice() {
     ms_counts_ = pr.limits.framebufferColorSampleCounts & pr.limits.framebufferDepthSampleCounts &
                  pr.limits.framebufferStencilSampleCounts;
     ReadQuality();
-    std::fprintf(stderr, "[D3D] vulkan: %s%s\n", pr.deviceName, shared_ ? " (the NV2A renderer's device)" : "");
+    if (NGB_DIAG) std::fprintf(stderr, "[D3D] vulkan: %s%s\n", pr.deviceName, shared_ ? " (the NV2A renderer's device)" : "");
 #ifdef NGB_DIRECT3D
-    char driver[192];
-    std::snprintf(driver, sizeof(driver), "3D scene Vulkan device=%s", pr.deviceName);
-    ngb_kernel_log(driver);
+    if (NGB_DIAG) {
+        char driver[192];
+        std::snprintf(driver, sizeof(driver), "3D scene Vulkan device=%s", pr.deviceName);
+        ngb_kernel_log(driver);
+    }
 #endif
     return true;
 }
@@ -1333,7 +1349,7 @@ bool VulkanBackend::Init(uint32_t, uint32_t) {
                            VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
         info.pfnUserCallback = LogSwitchDriverMessage;
         VkDebugUtilsMessengerEXT messenger{};
-        if (vkCreateDebugUtilsMessengerEXT && vkDestroyDebugUtilsMessengerEXT)
+        if (NGB_DIAG && vkCreateDebugUtilsMessengerEXT && vkDestroyDebugUtilsMessengerEXT)
             vkCreateDebugUtilsMessengerEXT(inst_, &info, nullptr, &messenger);
 #endif
         bool ready = CreateDevice();
@@ -1479,7 +1495,7 @@ bool VulkanBackend::Init(uint32_t, uint32_t) {
 #endif
     if (!disabled && !std::getenv("NGB_D3D_NO_CACHE")) Prewarm();
     else std::vector<uint8_t>().swap(learned_recipes_);
-    frame_source_compiles_ = source_compiles_;
+    if (material_log_) frame_source_compiles_ = source_compiles_;
 #endif
 #ifdef NGB_GPU_PRESENT
     if (can_present_) switch_display::attach(inst_, phys_, dev_, queue_, qfam_, d_, vma_);
@@ -1500,11 +1516,13 @@ VulkanBackend::~VulkanBackend() {
     if (compiler_.joinable()) compiler_.join();
     if (saver_.joinable()) saver_.join();
     CacheSavePipelines();
-    char cache_end[160];
-    std::snprintf(cache_end, sizeof(cache_end), "END,frames=%u,modules=%zu,pipelines=%zu,lost=%llu,io_errors=%llu\n",
-                  presents_, modules_.size(), pipelines_.size(), (unsigned long long)cache_writer_.Lost(),
-                  (unsigned long long)cache_writer_.Errors());
-    CacheLog(cache_end);
+    if (material_log_) {
+        char cache_end[160];
+        std::snprintf(cache_end, sizeof(cache_end), "END,frames=%u,modules=%zu,pipelines=%zu,lost=%llu,io_errors=%llu\n",
+                      presents_, modules_.size(), pipelines_.size(), (unsigned long long)cache_writer_.Lost(),
+                      (unsigned long long)cache_writer_.Errors());
+        CacheLog(cache_end);
+    }
     cache_writer_.Stop();
     if (cache_writer_.Lost() || cache_writer_.Errors())
         std::fprintf(stderr, "[D3D] cache writer: lost=%llu errors=%llu\n",
@@ -1635,10 +1653,13 @@ uint32_t VulkanBackend::ChangedDrawBindings(VkWriteDescriptorSet* writes) {
 bool VulkanBackend::PushSet(uint32_t n, VkWriteDescriptorSet* w) {
     if (push_) {
 #ifdef NGB_DIRECT3D
-        descriptor_requests_ += n;
+        const uint32_t requested = n;
         if (n == 10) n = ChangedDrawBindings(w);
         else descriptors_valid_ = false; // a resolve or post-processing pass rewrites part of set zero
-        descriptor_writes_ += n;
+        if (FrameCountersEnabled()) {
+            descriptor_requests_ += requested;
+            descriptor_writes_ += n;
+        }
         if (!n) return true;
 #endif
         d_.vkCmdPushDescriptorSetKHR(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe_layout_, 0, n, w);
@@ -2032,7 +2053,7 @@ void VulkanBackend::FlushGeometry() {
 }
 
 VkDeviceSize VulkanBackend::UploadGeometry(const void* data, uint32_t bytes, uint32_t align, VkBuffer& buffer) {
-    geometry_requested_ += bytes;
+    if (FrameCountersEnabled()) geometry_requested_ += bytes;
     auto& g = geometry_[slot_];
     buffer = ring_;
     if (bytes < 256 || bytes > kGeometryCapacity || !geometry_cpu_) return Upload(data, bytes, align);
@@ -2042,7 +2063,7 @@ VkDeviceSize VulkanBackend::UploadGeometry(const void* data, uint32_t bytes, uin
     VkDeviceSize base = slot_ * kGeometryCapacity;
     if (e.source == data && e.bytes == bytes && !std::memcmp(geometry_cpu_ + base + e.offset, data, bytes)) {
         e.last_frame = frame_;
-        geometry_reused_ += bytes;
+        if (FrameCountersEnabled()) geometry_reused_ += bytes;
         buffer = geometry_buffer_;
         return base + e.offset;
     }
@@ -2787,7 +2808,7 @@ VkImageView VulkanBackend::BindTexture(const State& s, int stage, TexInfo& info,
         if (TargetStamp(tit->second, now) && now != tit->second.stamp) {
             Target& t = tit->second;
             static int told;
-            if (told < 32 && ++told)
+            if (NGB_DIAG && told < 32 && ++told)
                 std::fprintf(stderr, "[D3D] target @%08X %ux%u: memory rewritten since drawn, read as texture fmt %X %ux%u\n",
                              t.addr, t.gw, t.gh, d.format, d.width, d.height);
             Retire(t.img);
@@ -2799,12 +2820,12 @@ VkImageView VulkanBackend::BindTexture(const State& s, int stage, TexInfo& info,
     }
     if (tit != targets_.end() && !d.cube && d.depth == 1 && never_target) {
         static std::set<uint32_t> told;
-        if (told.size() < 32 && told.insert(d.data).second)
+        if (NGB_DIAG && told.size() < 32 && told.insert(d.data).second)
             std::fprintf(stderr, "[D3D] texture @%08X fmt %X %ux%u levels %u: a target's memory (%ux%u), read as the texture\n",
                          d.data, d.format, d.width, d.height, d.levels, tit->second.gw, tit->second.gh);
     } else if (tit != targets_.end() && !d.cube && d.depth == 1) {
         Target& t = tit->second;
-        if ((d.width != t.gw || d.height != t.gh) && told_size_.size() < 32 && told_size_.insert(d.data).second)
+        if (NGB_DIAG && (d.width != t.gw || d.height != t.gh) && told_size_.size() < 32 && told_size_.insert(d.data).second)
             std::fprintf(stderr, "[D3D] texture @%08X fmt %X %ux%u reads a target of %ux%u\n", d.data, d.format, d.width,
                          d.height, t.gw, t.gh);
         if (&t == bound_rt_ || &t == bound_ds_) EndRendering();
@@ -2817,7 +2838,7 @@ VkImageView VulkanBackend::BindTexture(const State& s, int stage, TexInfo& info,
                 from_target = true;
                 return t.fb.view;
             }
-            if (!t.fb.image && told_size_.size() < 64 && told_size_.insert(d.data | 1).second)
+            if (NGB_DIAG && !t.fb.image && told_size_.size() < 64 && told_size_.insert(d.data | 1).second)
                 std::fprintf(stderr, "[D3D] target @%08X %ux%u read by a draw into it: from a copy\n", d.data, t.gw, t.gh);
             if (t.fb.image && (t.fb.w != t.img.w || t.fb.h != t.img.h)) Retire(t.fb);
             if (!t.fb.image && !CreateImage(t.fb, t.img.format, t.img.w, t.img.h, 1, 1, false, false,
@@ -2932,9 +2953,14 @@ VkImageView VulkanBackend::BindTexture(const State& s, int stage, TexInfo& info,
         if(it!=prepared_.end()){
             if(tx.img.image)Retire(tx.img);
             tx=std::move(it->second.tex);tx.used=frame_;prep_bytes_-=it->second.bytes;
-            prepared_.erase(it);++prep_hits_;if(NGB_DIAG && frame_<120)++tex_detail_[frame_].hits;return tx.img.view;
+            prepared_.erase(it);
+            if (NGB_DIAG) {
+                ++prep_hits_;
+                if (frame_ < 120) ++tex_detail_[frame_].hits;
+            }
+            return tx.img.view;
         }
-        ++prep_misses_;
+        if (NGB_DIAG) ++prep_misses_;
     }
     if (!NGB_DIAG
 #ifdef NGB_COMBAT_PERF
@@ -2947,11 +2973,15 @@ VkImageView VulkanBackend::BindTexture(const State& s, int stage, TexInfo& info,
 #ifdef NGB_COMBAT_PERF
     if(cp_on){++cp.uploads;cp.tex_us+=us;if(uint64_t(us)>=cp.max_tex){cp.max_tex=us;cp.w=d.width;cp.h=d.height;cp.fmt=d.format;}}
 #endif
-    if(frame_<120){
-        auto& detail=tex_detail_[frame_];++detail.uploads;detail.us+=us;
-        if(uint64_t(us)>=detail.max_us){detail.max_us=us;detail.fmt=d.format;detail.w=d.width;detail.h=d.height;}
+    if (NGB_DIAG) {
+        if (frame_ < 120) {
+            auto& detail=tex_detail_[frame_];++detail.uploads;detail.us+=us;
+            if(uint64_t(us)>=detail.max_us){detail.max_us=us;detail.fmt=d.format;detail.w=d.width;detail.h=d.height;}
+        }
+        live_us_+=us;
+        frame_live_us_+=us;
     }
-    live_us_+=us;frame_live_us_+=us;return view;
+    return view;
 }
 VkImageView VulkanBackend::MakeStatic(Tex& tx,const TextureDesc& d,const uint8_t* guest,const uint32_t* palette,
     uint64_t sig,uint64_t key,bool bc,bool mip_candidate,bool bump_src,TexInfo& info,bool preparing){
@@ -3180,12 +3210,14 @@ void VulkanBackend::PumpTextures(bool title){
         v.bytes=alloc.size;v.order=++prep_made_;prep_bytes_+=v.bytes;prepared_.emplace(k,std::move(v));++made;
     }
     if(title && made){
-        prep_title_+=made;Submit();
+        if (NGB_DIAG) prep_title_+=made;
+        Submit();
         // Both slots are idle. Title scanouts do not advance the 3D frame counter.
         for(auto& v:graveyard_){if(v.view)d_.vkDestroyImageView(dev_,v.view,nullptr);DestroyImage(v.img);}
         graveyard_.clear();
     }
-    prep_us_+=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-start).count();
+    if (NGB_DIAG)
+        prep_us_+=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-start).count();
 }
 #endif
 void VulkanBackend::BumpCheck(Tex& tx, const char* when) {
@@ -3354,7 +3386,7 @@ bool VulkanBackend::Compile(const std::string& hlsl, bool vertex, std::vector<ui
     {
         std::lock_guard<std::mutex> g(compile_mu_);
         ok = vkr::Compile(hlsl, vertex, spirv, &log);
-        ++source_compiles_;
+        if (NGB_DIAG || material_log_) ++source_compiles_;
     }
     if (!ok) {
         static int n;
@@ -3732,7 +3764,9 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
             RigidMatrices(s,vp,rigid_wv,rigid_clip);
             checked_rigid=true;
             if (OutsideRigidClip(a,rigid_clip)) {
-                ++rigid_skipped_;
+                if (NGB_DIAG) {
+                    ++rigid_skipped_;
+                }
                 return;
             }
         }
@@ -5439,7 +5473,7 @@ void VulkanBackend::QueueScanout(const Surface& front) {
             DestroyImage(screen_picture_);
             switch_display::disable();
             ngb_kernel_log("3D scene 720p game picture unavailable; using software framebuffer");
-        } else {
+        } else if (NGB_DIAG) {
             char line[112];
             std::snprintf(line, sizeof(line), "3D scene GPU scanout %ux%u -> %ux%u, no CPU readback",
                           t->img.w, t->img.h, width, unsigned(NGB_SCREEN_H));
@@ -5513,8 +5547,8 @@ void VulkanBackend::Present(const Surface& front, void (*consumed)(void*), void*
         const auto& d=readback_diag_;
         uint64_t b[]={frame_+1,ngb_elapsed_ns()/1000,d.requests,d.targets,d.bytes,d.wall,d.cpu,d.submit,d.max};
         ngb_combat_row('B',b,sizeof b/sizeof *b);
+        readback_diag_={};
     }
-    readback_diag_={};
 #endif
 #ifdef NGB_DIRECT3D
     uint64_t present_start = (NGB_DIAG
@@ -5531,7 +5565,7 @@ void VulkanBackend::Present(const Surface& front, void (*consumed)(void*), void*
     }
     presents_++;
 #ifdef NGB_RIGID_CLIP
-    if (!(presents_ % 120)) {
+    if (NGB_DIAG && !(presents_ % 120)) {
         char msg[100];
         std::snprintf(msg,sizeof(msg),"3D scene rigid clip skipped=%u in last 120 presents",rigid_skipped_);
         ngb_kernel_log(msg);
@@ -5779,20 +5813,28 @@ void VulkanBackend::Present(const Surface& front, void (*consumed)(void*), void*
         cp.targets,cp.small,cp.blend,cp.indices,cp.samples,cp.draw_us,cp.draw_cpu,
         unsigned(bool(ts_pool_[0]))+unsigned(bool(ts_pool_[1])),ngb_combat_wait_us()};
         ngb_combat_row('R',v,sizeof v/sizeof *v);cp={};}
+#endif
+    if (NGB_DIAG) {
+        ngb_direct_binding_counts(descriptor_requests_, descriptor_writes_);
+        ngb_direct_geometry_bytes(geometry_requested_, geometry_reused_);
+        ngb_direct_present_time(ngb_elapsed_ns() - present_start, direct_draws, direct_drawn, published);
+    }
+    if (FrameCountersEnabled()) {
+        geometry_requested_ = geometry_reused_ = 0;
+        descriptor_requests_ = descriptor_writes_ = 0;
+    }
+#ifdef NGB_COMBAT_PERF
     cp_on=ngb_combat_enabled && ngb_combat_active();
 #endif
-    ngb_direct_binding_counts(descriptor_requests_, descriptor_writes_);
-    ngb_direct_geometry_bytes(geometry_requested_, geometry_reused_);
-    geometry_requested_ = geometry_reused_ = 0;
-    descriptor_requests_ = descriptor_writes_ = 0;
-    if (NGB_DIAG) ngb_direct_present_time(ngb_elapsed_ns() - present_start, direct_draws, direct_drawn, published);
 #endif
     // after the frame is on the queue: the presenter's blit, later on the same queue, waits for it
     // (its barrier on the picture)
     if (show) nv2a_present_set_external(show->image, show->w, show->h);
 #ifdef NGB_TEXTURE_PRELOAD
-    if(frame_live_us_>worst_live_us_){worst_live_us_=frame_live_us_;worst_live_frame_=frame_+1;}
-    frame_live_us_=0;
+    if (NGB_DIAG) {
+        if(frame_live_us_>worst_live_us_){worst_live_us_=frame_live_us_;worst_live_frame_=frame_+1;}
+        frame_live_us_=0;
+    }
     PumpTextures(false);
 #endif
 #ifdef NGB_TEXTURE_PRELOAD
@@ -5915,9 +5957,11 @@ void VulkanBackend::CacheOpen() {
         auto seed = ReadFile(packaged);
         if (seed.size() >= 8 && !std::memcmp(seed.data(), kCacheMagic, 8)) {
             import_spirv(seed);
-            char line[96];
-            std::snprintf(line, sizeof(line), "3D scene Direct3D loaded %zu packaged shaders", spirv_by_src_.size());
-            ngb_kernel_log(line);
+            if (NGB_DIAG) {
+                char line[96];
+                std::snprintf(line, sizeof(line), "3D scene Direct3D loaded %zu packaged shaders", spirv_by_src_.size());
+                ngb_kernel_log(line);
+            }
         }
     }
 #endif
@@ -5998,11 +6042,13 @@ void VulkanBackend::CacheOpen() {
     cache_writer_.Own(seed_out_);
     cache_writer_.Own(material_log_);
     cache_writer_.Start();
-    char line[256];
-    std::snprintf(line, sizeof(line), "#SESSION,%s,spirv=%zu,device_cache_bytes=%zu\n"
-                  "#M,present,time_us,draws,module_misses,pipeline_misses,source_compiles,compile_us\n",
-                  NGB_D3D_CACHE_EPOCH, spirv_by_src_.size(), pc.size());
-    CacheLog(line);
+    if (material_log_) {
+        char line[256];
+        std::snprintf(line, sizeof(line), "#SESSION,%s,spirv=%zu,device_cache_bytes=%zu\n"
+                      "#M,present,time_us,draws,module_misses,pipeline_misses,source_compiles,compile_us\n",
+                      NGB_D3D_CACHE_EPOCH, spirv_by_src_.size(), pc.size());
+        CacheLog(line);
+    }
 #ifdef NGB_DIRECT3D
     async_ = false; // Every draw, including the first use of each material.
 #else
@@ -6226,9 +6272,10 @@ void VulkanBackend::Prewarm() {
             }
     }
     std::vector<uint8_t> xbe;
-    auto t0 = std::chrono::steady_clock::now();
+    const bool report = NGB_DIAG || material_log_;
+    auto t0 = report ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     uint32_t made = 0, pipes = 0, failed = 0;
-    const uint64_t sources_before = source_compiles_;
+    const uint64_t sources_before = report ? source_compiles_.load() : 0;
     for (int pass = 0; pass < 2; pass++)   // the modules, then the pipelines
         for (const Rec& r : recs) {
             if (stop_) return;
@@ -6332,8 +6379,9 @@ void VulkanBackend::Prewarm() {
                 made++;
             }
         }
-    std::fprintf(stderr, "[D3D] shader cache: %u shaders and %u pipelines made ahead in %.1f s\n", made, pipes,
-                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    if (NGB_DIAG)
+        std::fprintf(stderr, "[D3D] shader cache: %u shaders and %u pipelines made ahead in %.1f s\n", made, pipes,
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     // the pipelines again for the anti-aliasing in use: each was kept with the sample count it was made
     // for (the shipped seed's without MSAA), and a pipeline is one sample count's only
     int sc = 1, ms = 1;
@@ -6344,15 +6392,17 @@ void VulkanBackend::Prewarm() {
     // Keep the newly built device programs even when no gameplay misses occur.
     // This runs during loading, before the game's renderer is started.
     if (pipes) CacheSavePipelines();
-    char line[256];
-    std::snprintf(line, sizeof(line), "W,seed_records=%zu,learned_records=%zu,modules=%u,pipelines=%u,failed=%u,source_compiles=%llu,us=%llu\n",
-                  from_seed, recs.size() - from_seed, made, pipes, failed,
-                  (unsigned long long)(source_compiles_ - sources_before),
-                  (unsigned long long)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
-    CacheLog(line);
+    if (report) {
+        char line[256];
+        std::snprintf(line, sizeof(line), "W,seed_records=%zu,learned_records=%zu,modules=%u,pipelines=%u,failed=%u,source_compiles=%llu,us=%llu\n",
+                      from_seed, recs.size() - from_seed, made, pipes, failed,
+                      (unsigned long long)(source_compiles_ - sources_before),
+                      (unsigned long long)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+        if (material_log_) CacheLog(line);
 #ifdef NGB_DIRECT3D
-    ngb_kernel_log(line);
+        if (NGB_DIAG) ngb_kernel_log(line);
 #endif
+    }
     prewarm_done_ = 1;
 }
 
@@ -6369,7 +6419,7 @@ void VulkanBackend::WarmSamples(uint32_t samples) {
                 if (!pipelines_.count(v)) keys.push_back(v);
             }
     }
-    auto t0 = std::chrono::steady_clock::now();
+    auto t0 = NGB_DIAG ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     uint32_t n = 0;
     for (const PipeKey& k : keys) {
         if (stop_ || warm_want_ != samples) return;
@@ -6392,7 +6442,7 @@ void VulkanBackend::WarmSamples(uint32_t samples) {
             n++;
         }
     }
-    if (n)
+    if (NGB_DIAG && n)
         std::fprintf(stderr, "[D3D] shader cache: %u pipelines made for %ux anti-aliasing in %.1f s\n", n, samples,
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
 }

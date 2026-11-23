@@ -129,6 +129,7 @@ extern "C" void ngb_direct_render_event(int renderer, int active) {
     (renderer ? rendering : waiting) = active;
 }
 extern "C" void ngb_direct_reset_stats(void) {
+    if (!NGB_DIAG) return;
     std::lock_guard lock(timing_mutex);
     render_ns = wait_ns = overlap_ns = 0;
     rendering = waiting = false;

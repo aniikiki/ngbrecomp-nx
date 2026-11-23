@@ -5,7 +5,8 @@ extern "C" {
 #endif
 void ngb_combat_wait(int active);
 uint64_t ngb_combat_wait_us(void);
-extern int ngb_combat_enabled; /* immutable once workers start */
+extern int ngb_game_diagnostics_requested; /* Includes the independent material journal. */
+extern int ngb_combat_enabled; /* The game CSV and its writer are ready. */
 int ngb_combat_active(void);
 #ifdef NGB_NATIVE_DIAG
 void ngb_combat_menu_visible(int visible);

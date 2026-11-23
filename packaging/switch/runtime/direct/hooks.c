@@ -90,6 +90,7 @@ void ngb_direct_timing_flip(unsigned completed)
 
 void ngb_direct_mesh_scope(int enter)
 {
+    if (!NGB_DIAG) return;
     charge_scope();
     if (enter) { ++index_time.mesh_depth; ++ngb_native_material_meshes; }
     else --index_time.mesh_depth;
@@ -153,8 +154,10 @@ int ngb_direct_try_indexed(uint64_t *reference_start)
     /* HLE has already captured this strip. Only take the path where SetStateVB
      * is also taken, the PUT reservation fits, and no fence needs servicing. */
     if (!ngb_direct_index_capture_ready(esp)) return 0;
-    unsigned sample = index_time.attempted++ % 32;
-    uint64_t start = sample == 1 ? ngb_elapsed_ns() : 0;
+    /* The timed reference draw is only for boot.log. */
+    enum { REFERENCE_SAMPLE, NATIVE_SAMPLE, NO_SAMPLE };
+    unsigned sample = NGB_DIAG ? index_time.attempted++ % 32 : NO_SAMPLE;
+    uint64_t start = sample == NATIVE_SAMPLE ? ngb_elapsed_ns() : 0;
     uint32_t device = MEM32(0x3D83C8);
     uint32_t *dev = ngb_ram_span(device, 32);
     if (!dev || ((esp | device) & 3)) return 0;
@@ -168,7 +171,7 @@ int ngb_direct_try_indexed(uint64_t *reference_start)
     uintptr_t a = (uintptr_t)dev, b = (uintptr_t)ring, c = (uintptr_t)stack;
     if ((a < b + 16 && b < a + 32) || (b < c + 48 && c < b + 16) ||
         (a < c + 48 && c < a + 32)) return 0;
-    if (sample == 0) {
+    if (sample == REFERENCE_SAMPLE) {
         *reference_start = ngb_elapsed_ns();
         return 0;
     }
@@ -192,8 +195,8 @@ int ngb_direct_try_indexed(uint64_t *reference_start)
     dev[0] = put + 16;
     dev[2] = edx;
     esp += 16;
-    ++index_time.native;
-    if (sample == 1) {
+    if (NGB_DIAG) ++index_time.native;
+    if (sample == NATIVE_SAMPLE) {
         index_time.native_ns += ngb_elapsed_ns() - start;
         ++index_time.sampled;
     }
@@ -202,6 +205,7 @@ int ngb_direct_try_indexed(uint64_t *reference_start)
 
 static void track_draw_call(int fn, int entering)
 {
+    if (!NGB_DIAG) return;
     unsigned *depth;
     if (fn == D3DF_D3DDevice_DrawIndexedVertices) depth = &index_time.index_depth;
     else if (material_call(fn)) depth = &index_time.material_depth;

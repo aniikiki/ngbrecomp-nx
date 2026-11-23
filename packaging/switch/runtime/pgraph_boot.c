@@ -52,9 +52,7 @@ static void release(uint32_t instance, uint32_t offset, uint32_t value)
     void *dst = ngb_contiguous_pointer(XBOX_CONTIG_BASE + phys, 4);
     if (!dst) ngb_stop("unmapped semaphore target", (uint32_t)phys);
     memcpy(dst, &value, 4);
-    char line[104];
-    snprintf(line, sizeof(line), "PGRAPH semaphore physical=%08x value=%08x", (uint32_t)phys, value);
-    ngb_kernel_log(line);
+    NGB_BOOT_LOGF("PGRAPH semaphore physical=%08x value=%08x", (uint32_t)phys, value);
 }
 
 /* Rectangles and pitches are in logical framebuffer coordinates, as in
@@ -99,10 +97,8 @@ static void clear_plane(uint32_t *r, uint32_t bits, int color)
         uint32_t *row = (uint32_t *)(dst+(size_t)y*pitch);
         for (unsigned x=x0; x<x1; ++x) row[x] = (row[x]&~mask) | (value&mask);
     }
-    char line[160];
-    snprintf(line,sizeof(line),"PGRAPH clear %s base=%08x pitch=%u rect=%u,%u..%u,%u value=%08x mask=%08x",
-        color?"color":"depth", (uint32_t)base,pitch,x0,y0,x1,y1,value,mask);
-    ngb_kernel_log(line);
+    NGB_BOOT_LOGF("PGRAPH clear %s base=%08x pitch=%u rect=%u,%u..%u,%u value=%08x mask=%08x",
+                  color?"color":"depth", (uint32_t)base,pitch,x0,y0,x1,y1,value,mask);
 }
 
 /* Retain state-only writes for later draw dispatch. No draw, report,

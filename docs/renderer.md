@@ -171,8 +171,8 @@ debug knobs out once it is the default.
   With MSAA off, all three resolutions also use a hardware discard rectangle inside the mission
   border's transparent centre. The renderer verifies the decoded
   palette, the sampled atlas region and the blend before excluding pixels from the draw. With
-  `/switch/ngb-runtime/alma-perf.flag` present, the diagnostic build records main-menu GPU and
-  presentation timings in `logs/alma-perf.csv`.
+  `/switch/ngb-runtime/diagnostics.flag` present, the player records main-menu GPU and
+  presentation timings in `logs/game-perf.csv`.
 
 - The Tairon drawbridge towers (chapter 8): two map sections lay rubble and blocks in one plane, cut into
   different triangles, and their depths tie within a few steps either way -- in xemu's renderer too, the
