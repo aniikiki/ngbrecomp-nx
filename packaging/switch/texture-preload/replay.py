@@ -10,13 +10,11 @@ for n in ('files','scanout','identity','opening_movie','pgraph_boot','ohci_boot'
     old=next(i for i,v in enumerate(q.link) if v.endswith('/'+n+'.c.o'))
     q.link[old]=q.compile(n+'.c',(RUNTIME/(n+'.c')).read_text(),flags)
 q.link.insert(1,q.compile('threaded.cpp',(ROOT/'src/d3d/gpu/threaded.cpp').read_text(),flags))
-warm=runpy.run_path(str(p.parent/'experiments/opening/hardware-prewarm.py'))
-q.link[q.link.index(str(REGS/'backend-host-clip.o'))]=q.compile('vk/backend.cpp',(ROOT/'src/d3d/vk/backend.cpp').read_text().replace('    CacheOpen();','    CacheOpen(); Prewarm();'),flags+['-DNGB_RIGID_CLIP'])
-q.link.insert(1,q.compile('hle.cpp',warm['hle']((ROOT/'src/d3d/hle.cpp').read_text()),flags))
-# Runtime included in host-driver; use the same movie teardown trigger as Horizon.
+q.link[q.link.index(str(REGS/'backend-host-clip.o'))]=q.compile('vk/backend.cpp',(ROOT/'src/d3d/vk/backend.cpp').read_text(),flags+['-DNGB_RIGID_CLIP'])
+q.link.insert(1,q.compile('hle.cpp',(ROOT/'src/d3d/hle.cpp').read_text(),flags))
+# Run the same pre-guest device initialization as the player.
+(q.out/'host-runtime.inc').write_text((RUNTIME/'runtime.c').read_text().replace('RECOMP_TLS RecompRegs g_regs;', 'RecompRegs g_regs;'))
 s=(REGS/'host-driver.c').read_text()
-k='    __real_ngb_kernel_log(message);';assert s.count(k)==1
-s=s.replace(k,k+'\n    if(!strncmp(message,"Main menu overlay renderer=",27)){extern void ngb_prepare_title_device(void);ngb_prepare_title_device();}')
 # Capture actual completed wide scanouts, not the 4:3 title signature.
 k='void __real_ngb_kernel_log'
 s=s.replace(k,r"""

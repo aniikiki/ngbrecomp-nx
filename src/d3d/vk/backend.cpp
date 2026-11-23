@@ -40,6 +40,7 @@
 #include <deque>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -874,7 +875,7 @@ private:
     std::deque<Job> jobs_;
     std::unordered_map<uint64_t, bool> pending_mods_;
     std::unordered_map<PipeKey, bool, PipeHash> pending_pipes_;
-    std::unordered_map<PipeKey, bool, PipeHash> known_pipes_;   // the seed's and earlier sessions' (cache_mu_)
+    std::unordered_set<PipeKey, PipeHash> known_pipes_;   // prevents deferral during asynchronous prewarming
     bool async_ = true;      // the setting
     bool async_now_ = false; // for the draw being made (the backend's own passes make theirs at once)
     uint64_t compile_budget_us_ = 4000;
@@ -892,6 +893,7 @@ private:
     void CacheSavePipelinesSoon();
     void CacheWritePipelines();
     void Prewarm();
+    bool WarmPipeline(const PipeKey& key, uint32_t& created);
     void WarmSamples(uint32_t samples);
     uint32_t warmed_samples_ = 0;
     std::atomic<uint32_t> warm_want_{0};   // the sample count being warmed: another stops the one under way
@@ -1482,6 +1484,7 @@ bool VulkanBackend::Init(uint32_t, uint32_t) {
     Barrier(null3d_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 #ifdef NGB_DIRECT3D
     async_ = false;
+    ngb_loading_set_progress(0, NGB_LOADING_READ_CACHE);
 #endif
     CacheOpen();
 #ifdef NGB_DIRECT3D
@@ -1494,7 +1497,10 @@ bool VulkanBackend::Init(uint32_t, uint32_t) {
     }
 #endif
     if (!disabled && !std::getenv("NGB_D3D_NO_CACHE")) Prewarm();
-    else std::vector<uint8_t>().swap(learned_recipes_);
+    else {
+        std::vector<uint8_t>().swap(learned_recipes_);
+        ngb_loading_set_progress(0, 0);
+    }
     if (material_log_) frame_source_compiles_ = source_compiles_;
 #endif
 #ifdef NGB_GPU_PRESENT
@@ -6262,133 +6268,145 @@ void VulkanBackend::Prewarm() {
     size_t from_seed = recs.size();
     parse(learned_recipes_);
     std::vector<uint8_t>().swap(learned_recipes_);
-    {   // what is known, before any of it is made: a draw needing one makes it at once (Pipeline)
+    // Resolve the complete list once so duplicate records and MSAA variants share a slot.
+    std::vector<PipeKey> plan;
+    {
         std::lock_guard<std::recursive_mutex> g(cache_mu_);
-        for (const Rec& r : recs)
-            if (r.kind == 'K' && r.data.size() == sizeof(PipeKey)) {
-                PipeKey k;
-                std::memcpy(&k, r.data.data(), sizeof(k));
-                known_pipes_[k] = true;
-            }
+#ifdef NGB_DIRECT3D
+        // The renderer is handed off after this call. Release the duplicate filter before creating pipelines.
+        std::unordered_set<PipeKey, PipeHash> seen;
+#else
+        auto& seen = known_pipes_;
+#endif
+        auto add = [&](const PipeKey& key) {
+            if (seen.insert(key).second && !pipelines_.count(key))
+                plan.push_back(key);
+        };
+        for (const Rec& r : recs) {
+            if (r.kind != 'K' || r.data.size() != sizeof(PipeKey)) continue;
+            PipeKey key;
+            std::memcpy(&key, r.data.data(), sizeof(key));
+            add(key);
+#ifdef NGB_DIRECT3D
+            key.samples = uint32_t(msaa_);
+            add(key);
+#endif
+        }
     }
     std::vector<uint8_t> xbe;
     const bool report = NGB_DIAG || material_log_;
     auto t0 = report ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     uint32_t made = 0, pipes = 0, failed = 0;
     const uint64_t sources_before = report ? source_compiles_.load() : 0;
-    for (int pass = 0; pass < 2; pass++)   // the modules, then the pipelines
-        for (const Rec& r : recs) {
-            if (stop_) return;
-            if ((r.kind == 'K') != (pass == 1)) continue;
-            if (r.kind == 'K') {
-                if (r.data.size() != sizeof(PipeKey)) continue;
-                PipeKey k;
-                std::memcpy(&k, r.data.data(), sizeof(k));
-                VkShaderModule vs, ps;
-                {
-                    std::lock_guard<std::recursive_mutex> g(cache_mu_);
-                    if (pipelines_.count(k)) continue;
-                    auto a = modules_.find(k.vs), b = modules_.find(k.ps);
-                    if (a == modules_.end() || b == modules_.end() || !a->second || !b->second) { ++failed; continue; }
-                    vs = a->second;
-                    ps = b->second;
-                }
-                VkPipeline p = MakePipeline(k, vs, ps);
-                if (!p) { ++failed; continue; }  // Leave first use free to retry.
-                std::lock_guard<std::recursive_mutex> g(cache_mu_);
-                if (pipelines_.count(k)) {
-                    if (p) d_.vkDestroyPipeline(dev_, p, nullptr);
-                } else {
-                    pipelines_[k] = p;
-                    pipes++;
-                }
-                continue;
-            }
-            {
-                std::lock_guard<std::recursive_mutex> g(cache_mu_);
-                if (modules_.count(r.key)) continue;
-            }
-            std::string hlsl;
-            bool vertex = true;
-            const uint8_t* d = r.data.data();
-            if (r.kind == 'S') {
-                if (r.data.size() != 9 || d[8] > 1) { ++failed; continue; }
-                uint64_t source;
-                std::memcpy(&source, d, 8);
-                std::lock_guard<std::recursive_mutex> g(cache_mu_);
-                auto it = spirv_by_src_.find(source);
-                if (it == spirv_by_src_.end()) { ++failed; continue; }
-                VkShaderModule m = MakeModule(it->second);
-                if (m) { modules_[r.key] = m; ++made; }
-                else ++failed;
-                continue;
-            }
-            if ((r.kind == 'V' && r.data.size() >= 15) || (r.kind == 'W' && r.data.size() == 19)) {
-                uint16_t regs;
-                uint64_t decode;
-                uint32_t n;
-                std::memcpy(&regs, d, 2);
-                std::memcpy(&decode, d + 2, 8);
-                std::vector<uint32_t> words;
-                if (r.kind == 'V') {
-                    std::memcpy(&n, d + 11, 4);
-                    if (r.data.size() != 15 + size_t(n) * 4) continue;
-                    words.resize(n);
-                    std::memcpy(words.data(), d + 15, size_t(n) * 4);
-                } else {
-                    uint32_t off;
-                    std::memcpy(&off, d + 11, 4);
-                    std::memcpy(&n, d + 15, 4);
-                    if (xbe.empty())
-                        if (const char* xp = std::getenv("NV2A_SHADER_SEED_XBE")) xbe = ReadFile(xp);
-                    if (size_t(off) + size_t(n) * 4 > xbe.size()) continue;
-                    words.resize(n);
-                    std::memcpy(words.data(), &xbe[off], size_t(n) * 4);
-                }
-                // the key as Draw makes it: a different copy of the game makes no match, and is skipped
-                uint64_t key = Hash(&decode, 8, (Hash(words.data(), words.size() * 4) | 1) ^ regs);
-                if (d[10]) key ^= 0xC3C30000;
-                if (key != r.key) continue;
-                hlsl = VertexProgramHlsl(words, regs, decode);
-                if (d[10]) hlsl = QuadHlsl(std::move(hlsl));   // as Draw makes a screen quad's
-            } else if (r.kind == 'F' && r.data.size() == 11 + sizeof(FixedKey)) {
-                uint16_t regs;
-                uint64_t decode;
-                FixedKey fk;
-                std::memcpy(&regs, d, 2);
-                std::memcpy(&decode, d + 3, 8);
-                std::memcpy(&fk, d + 11, sizeof(fk));
-                hlsl = FixedVertexHlsl(regs, d[2] != 0, decode, fk);
-                if (d[2]) hlsl = QuadHlsl(std::move(hlsl));    // pretransformed: as Draw makes it
-            } else if (r.kind == 'P' && r.data.size() == sizeof(PixelKey)) {
-                PixelKey pk;
-                std::memcpy(&pk, d, sizeof(pk));
-                hlsl = PixelHlsl(pk);
-                vertex = false;
-            } else {
-                continue;
-            }
-            std::vector<uint32_t> spirv;
-            VkShaderModule m = Compile(hlsl, vertex, spirv) ? MakeModule(spirv) : VK_NULL_HANDLE;
-            if (!m) continue;  // Leave first use free to retry.
+    for (const Rec& r : recs) {
+        if (stop_) return;
+#ifdef NGB_DIRECT3D
+        if (ngb_stop_requested()) return;
+#endif
+        if (r.kind == 'K') continue;
+        {
             std::lock_guard<std::recursive_mutex> g(cache_mu_);
-            if (modules_.count(r.key)) {
-                if (m) d_.vkDestroyShaderModule(dev_, m, nullptr);
-            } else {
-                modules_[r.key] = m;
-                made++;
-            }
+            if (modules_.count(r.key)) continue;
         }
+        std::string hlsl;
+        bool vertex = true;
+        const uint8_t* d = r.data.data();
+        if (r.kind == 'S') {
+            if (r.data.size() != 9 || d[8] > 1) { ++failed; continue; }
+            uint64_t source;
+            std::memcpy(&source, d, 8);
+            std::lock_guard<std::recursive_mutex> g(cache_mu_);
+            auto it = spirv_by_src_.find(source);
+            if (it == spirv_by_src_.end()) { ++failed; continue; }
+            VkShaderModule m = MakeModule(it->second);
+            if (m) { modules_[r.key] = m; ++made; }
+            else ++failed;
+            continue;
+        }
+        if ((r.kind == 'V' && r.data.size() >= 15) || (r.kind == 'W' && r.data.size() == 19)) {
+            uint16_t regs;
+            uint64_t decode;
+            uint32_t n;
+            std::memcpy(&regs, d, 2);
+            std::memcpy(&decode, d + 2, 8);
+            std::vector<uint32_t> words;
+            if (r.kind == 'V') {
+                std::memcpy(&n, d + 11, 4);
+                if (r.data.size() != 15 + size_t(n) * 4) continue;
+                words.resize(n);
+                std::memcpy(words.data(), d + 15, size_t(n) * 4);
+            } else {
+                uint32_t off;
+                std::memcpy(&off, d + 11, 4);
+                std::memcpy(&n, d + 15, 4);
+                if (xbe.empty())
+                    if (const char* xp = std::getenv("NV2A_SHADER_SEED_XBE")) xbe = ReadFile(xp);
+                if (size_t(off) + size_t(n) * 4 > xbe.size()) continue;
+                words.resize(n);
+                std::memcpy(words.data(), &xbe[off], size_t(n) * 4);
+            }
+            // the key as Draw makes it: a different copy of the game makes no match, and is skipped
+            uint64_t key = Hash(&decode, 8, (Hash(words.data(), words.size() * 4) | 1) ^ regs);
+            if (d[10]) key ^= 0xC3C30000;
+            if (key != r.key) continue;
+            hlsl = VertexProgramHlsl(words, regs, decode);
+            if (d[10]) hlsl = QuadHlsl(std::move(hlsl));   // as Draw makes a screen quad's
+        } else if (r.kind == 'F' && r.data.size() == 11 + sizeof(FixedKey)) {
+            uint16_t regs;
+            uint64_t decode;
+            FixedKey fk;
+            std::memcpy(&regs, d, 2);
+            std::memcpy(&decode, d + 3, 8);
+            std::memcpy(&fk, d + 11, sizeof(fk));
+            hlsl = FixedVertexHlsl(regs, d[2] != 0, decode, fk);
+            if (d[2]) hlsl = QuadHlsl(std::move(hlsl));    // pretransformed: as Draw makes it
+        } else if (r.kind == 'P' && r.data.size() == sizeof(PixelKey)) {
+            PixelKey pk;
+            std::memcpy(&pk, d, sizeof(pk));
+            hlsl = PixelHlsl(pk);
+            vertex = false;
+        } else {
+            continue;
+        }
+        std::vector<uint32_t> spirv;
+        VkShaderModule m = Compile(hlsl, vertex, spirv) ? MakeModule(spirv) : VK_NULL_HANDLE;
+        if (!m) continue;  // Leave first use free to retry.
+        std::lock_guard<std::recursive_mutex> g(cache_mu_);
+        if (modules_.count(r.key)) {
+            if (m) d_.vkDestroyShaderModule(dev_, m, nullptr);
+        } else {
+            modules_[r.key] = m;
+            made++;
+        }
+    }
+#ifdef NGB_DIRECT3D
+    uint32_t ready = 0;
+    ngb_loading_set_progress(0, uint32_t(plan.size()));
+#endif
+    for (const PipeKey& k : plan) {
+        if (stop_) return;
+#ifdef NGB_DIRECT3D
+        if (ngb_stop_requested()) return;
+#endif
+        if (!WarmPipeline(k, pipes)) { ++failed; continue; }
+#ifdef NGB_DIRECT3D
+        ngb_loading_set_progress(++ready, uint32_t(plan.size()));
+#endif
+    }
     if (NGB_DIAG)
         std::fprintf(stderr, "[D3D] shader cache: %u shaders and %u pipelines made ahead in %.1f s\n", made, pipes,
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
-    // the pipelines again for the anti-aliasing in use: each was kept with the sample count it was made
-    // for (the shipped seed's without MSAA), and a pipeline is one sample count's only
-    int sc = 1, ms = 1;
-    nv2a_quality_get(&sc, &sc, &sc, &ms);
-    while (ms > 1 && !(ms_counts_ & uint32_t(ms))) ms /= 2;
-    warm_want_ = uint32_t(ms);
-    WarmSamples(uint32_t(ms));
+#ifdef NGB_DIRECT3D
+    warmed_samples_ = uint32_t(msaa_);
+    warm_want_ = warmed_samples_;
+#else
+    // Desktop draws can create additional pipelines during asynchronous prewarming.
+    int scale, aniso, shadow, samples;
+    nv2a_quality_get(&scale, &aniso, &shadow, &samples);
+    while (samples > 1 && !(ms_counts_ & uint32_t(samples))) samples /= 2;
+    warm_want_ = uint32_t(samples);
+    WarmSamples(uint32_t(samples));
+#endif
     // Keep the newly built device programs even when no gameplay misses occur.
     // This runs during loading, before the game's renderer is started.
     if (pipes) CacheSavePipelines();
@@ -6404,6 +6422,27 @@ void VulkanBackend::Prewarm() {
 #endif
     }
     prewarm_done_ = 1;
+}
+
+// Leave unsuccessful keys available for a later draw to retry. Desktop draws may race this work.
+bool VulkanBackend::WarmPipeline(const PipeKey& k, uint32_t& created) {
+    VkShaderModule vs, ps;
+    {
+        std::lock_guard<std::recursive_mutex> g(cache_mu_);
+        auto existing = pipelines_.find(k);
+        if (existing != pipelines_.end()) return existing->second != VK_NULL_HANDLE;
+        auto a = modules_.find(k.vs), b = modules_.find(k.ps);
+        if (a == modules_.end() || b == modules_.end() || !a->second || !b->second) return false;
+        vs = a->second;
+        ps = b->second;
+    }
+    VkPipeline pipeline = MakePipeline(k, vs, ps);
+    if (!pipeline) return false;
+    std::lock_guard<std::recursive_mutex> g(cache_mu_);
+    auto [entry, inserted] = pipelines_.emplace(k, pipeline);
+    if (inserted) ++created;
+    else d_.vkDestroyPipeline(dev_, pipeline, nullptr);
+    return entry->second != VK_NULL_HANDLE;
 }
 
 // Every pipeline made so far again for a sample count (anti-aliasing), in the background: a change of
@@ -6423,24 +6462,7 @@ void VulkanBackend::WarmSamples(uint32_t samples) {
     uint32_t n = 0;
     for (const PipeKey& k : keys) {
         if (stop_ || warm_want_ != samples) return;
-        VkShaderModule vs, ps;
-        {
-            std::lock_guard<std::recursive_mutex> g(cache_mu_);
-            if (pipelines_.count(k)) continue;
-            auto a = modules_.find(k.vs), b = modules_.find(k.ps);
-            if (a == modules_.end() || b == modules_.end() || !a->second || !b->second) continue;
-            vs = a->second;
-            ps = b->second;
-        }
-        VkPipeline p = MakePipeline(k, vs, ps);
-        if (!p) continue;  // Leave first use free to retry.
-        std::lock_guard<std::recursive_mutex> g(cache_mu_);
-        if (pipelines_.count(k)) {
-            if (p) d_.vkDestroyPipeline(dev_, p, nullptr);
-        } else {
-            pipelines_[k] = p;
-            n++;
-        }
+        WarmPipeline(k, n);
     }
     if (NGB_DIAG && n)
         std::fprintf(stderr, "[D3D] shader cache: %u pipelines made for %ux anti-aliasing in %.1f s\n", n, samples,

@@ -110,15 +110,15 @@ elif sys.argv[1] == 'host':
                 source = (root / 'src/d3d/vk/backend.cpp').read_text()
                 at = source.index('void VulkanBackend::Prewarm() {')
                 before, warm = source[:at], source[at:]
-                needle = '                if (m) { modules_[r.key] = m; ++made; }'
+                needle = '            if (m) { modules_[r.key] = m; ++made; }'
                 assert warm.count(needle) == 1
-                warm = warm.replace(needle, "                if (m) { modules_[r.key] = m; ++made; CacheRecord('S', r.key, d, 9); }")
-                needle = '            if (!m) continue;  // Leave first use free to retry.'
+                warm = warm.replace(needle, "            if (m) { modules_[r.key] = m; ++made; CacheRecord('S', r.key, d, 9); }")
+                needle = '        if (!m) continue;  // Leave first use free to retry.'
                 assert warm.count(needle) == 1
-                warm = warm.replace(needle, needle + '\n            CacheModule(r.key, hlsl, vertex);')
-                needle = '                    pipes++;'
+                warm = warm.replace(needle, needle + '\n        CacheModule(r.key, hlsl, vertex);')
+                needle = '        if (!WarmPipeline(k, pipes)) { ++failed; continue; }'
                 assert warm.count(needle) == 1
-                warm = warm.replace(needle, needle + "\n                    CacheRecord('K', 0, &k, sizeof(k));")
+                warm = warm.replace(needle, needle + "\n        CacheRecord('K', 0, &k, sizeof(k));")
                 source = before + warm
         if diagnostics:
             if name == 'vk/backend.cpp':

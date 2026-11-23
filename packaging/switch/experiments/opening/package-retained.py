@@ -80,13 +80,9 @@ if '--opening-warm' in sys.argv:
  # Increment the patch number for the next Switch package built on this baseline.
  warm_version='0.56.0'
  replace("version='0.55.7-pipe2';out=", f"version='{warm_version}';out=")
- replace(" comp('hle.cpp',s)", """ warm=runpy.run_path(str(p/'hardware-prewarm.py'))
- comp('hle.cpp',warm['hle'](s))
- comp('vk/backend.cpp',warm['backend'](Path('/work/src/d3d/vk/backend.cpp').read_text()),['-DNGB_RIGID_CLIP'])""")
+ replace(" comp('hle.cpp',s)", """ comp('hle.cpp',s)
+ comp('vk/backend.cpp',Path('/work/src/d3d/vk/backend.cpp').read_text(),['-DNGB_RIGID_CLIP'])""")
  replace("'checkpoint','backend-clip'", "'checkpoint'")
- replace("  if name=='main.c':s+=", """  if name=='runtime.c':
-   s=once(s,'        ngb_menu_gpu_prepare();','        ngb_menu_gpu_prepare(); extern void ngb_prepare_title_device(void); uint64_t start=NGB_DIAG ? ngb_elapsed_ns() : 0; ngb_prepare_title_device(); NGB_BOOT_LOGF("3D scene [WARM_TITLE] elapsed_ms=%llu",(unsigned long long)((ngb_elapsed_ns()-start)/1000000));')
-  if name=='main.c':s+=""")
  replace("  shutil.copyfile(base/'romfs/.ngb-spirv',romfs/'.ngb-spirv')","""  seeds=base/'core-perf/opening-present-combined'
   for a,bname in [('opening-complete.spirv','.ngb-spirv'),('opening-120.recipes','.ngb-recipes')]:
    shutil.copyfile(seeds/a,romfs/bname)""")
@@ -119,8 +115,8 @@ if '--player' in sys.argv:
   flags=[*flags,'-DNGB_PLAYER_BUILD','-include',str(root/'player_diagnostics.h')]""")
  replace(" comp('threaded.cpp',renderer", " comp('menu_gpu.c',(root/'menu_gpu.c').read_text())\n comp('audio_boot.c',(root/'audio_boot.c').read_text())\n comp('shaders.cpp',Path('/work/src/d3d/gpu/shaders.cpp').read_text())\n comp('files_bridge.c',(root/'files_bridge.c').read_text())\n comp('direct/platform.cpp',(root/'direct/platform.cpp').read_text())\n comp('threaded.cpp',renderer")
  # These probes are on the guest-side direct HLE entry points, not the Vulkan worker.
- replace(" comp('hle.cpp',warm['hle'](s))", """ s=once(s,'bool measure = ngb_direct_detail_frame','MP_ADD(MP_VK_DRAW,0,0); bool measure = ngb_direct_detail_frame')
- comp('hle.cpp',warm['hle'](s))""")
+ replace(" comp('hle.cpp',s)", """ s=once(s,'bool measure = ngb_direct_detail_frame','MP_ADD(MP_VK_DRAW,0,0); bool measure = ngb_direct_detail_frame')
+ comp('hle.cpp',s)""")
  replace("bd_present_mark(); g_backend->Present", "MP_ADD(MP_VK_PRESENT,0,0); if(NGB_DIAG) bd_present_mark(); g_backend->Present")
  replace("pt_flip(f);", "if(!NGB_DIAG)return;pt_flip(f);")
  replace("sdk/'libnx/default_icon.jpg'", "base/'branding/ngb-icon.jpg'")

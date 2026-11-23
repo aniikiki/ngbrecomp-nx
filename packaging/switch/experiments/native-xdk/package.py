@@ -11,7 +11,7 @@ import sys
 from material_cache import compatibility
 
 root = Path('/work')
-version = '0.57.56'
+version = '0.57.57'
 (root / 'build/switch-runtime/history').mkdir(parents=True, exist_ok=True)
 assert '--seed' in sys.argv, 'supply the validated portable material seed with --seed'
 seed = Path(sys.argv[sys.argv.index('--seed') + 1]).resolve()
@@ -94,7 +94,8 @@ inputs += [root / 'packaging/switch/runtime/direct/acquire_trace.inc']
 inputs += [root / 'packaging/switch/nxvk-cache.patch', root / 'packaging/switch/runtime/direct/link-nvk.sh',
            root / 'build/switch-runtime/switch/direct/nvk.o']
 inputs += [root / 'build/switch-runtime/core-perf/native-xdk/retained-inputs.txt']
-inputs += [root / 'src/d3d/vk/cache_writer.h', root / 'src/d3d/vk/quick_menu.inc', opening / 'hardware-prewarm.py', opening / 'package-retained.py']
+inputs += [root / 'src/d3d/vk/cache_writer.h', root / 'src/d3d/vk/quick_menu.inc', opening / 'package-retained.py']
+inputs += [root / 'packaging/switch/runtime' / n for n in ('loading.inc', 'loading_labels.h')]
 inputs += [opening / n for n in ('command-record.py', 'batch-bytes.py')]
 inputs += [seed / n for n in ('materials.recipes','materials.spirv','manifest.json')]
 manifest = {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in inputs}

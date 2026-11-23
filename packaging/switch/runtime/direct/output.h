@@ -25,6 +25,15 @@ void ngb_graphics_callback(uint32_t routine, uint32_t argument);
 uint32_t ngb_graphics_guest_call(uint32_t routine, const uint32_t *arguments, unsigned count);
 void ngb_graphics_wait_until(uint64_t nanoseconds);
 void ngb_scanout_direct(const void *bgra);
+int ngb_prepare_title_device(void);
+int ngb_stop_requested(void);
+/* A zero total is the ordinary splash. The cache has no count until its recipes are read. */
+#define NGB_LOADING_READ_CACHE UINT32_MAX
+typedef struct { uint32_t ready, total; } NgbLoadingProgress;
+void ngb_loading_set_progress(uint32_t ready, uint32_t total);
+NgbLoadingProgress ngb_loading_progress(void);
+void ngb_enable_title_display(void);
+int ngb_title_display_enabled(void);
 void ngb_direct_close(void);
 void ngb_direct_park_prologue(void);
 void ngb_direct_wait_texture(uint32_t header);

@@ -86,7 +86,23 @@ static uint32_t current_va, recent[32];
 static uint64_t entries;
 #endif
 static uint32_t thunk_ordinals[512], pending_ordinal;
-static uint64_t start_ns;
+static _Atomic uint64_t start_ns;
+#ifdef NGB_DIRECT3D
+/* The guest thread publishes one consistent snapshot; only the loading UI reads it. */
+static _Atomic(NgbLoadingProgress) loading_progress = {0, NGB_LOADING_READ_CACHE};
+static atomic_bool title_display_enabled;
+void ngb_loading_set_progress(uint32_t ready, uint32_t total)
+{
+    NgbLoadingProgress next = {ready, total};
+    atomic_store_explicit(&loading_progress, next, memory_order_relaxed);
+}
+NgbLoadingProgress ngb_loading_progress(void)
+{
+    return atomic_load_explicit(&loading_progress, memory_order_relaxed);
+}
+void ngb_enable_title_display(void) { atomic_store(&title_display_enabled, true); }
+int ngb_title_display_enabled(void) { return atomic_load(&title_display_enabled); }
+#endif
 /* Zero once the game reaches its interactive title, where the player may wait indefinitely. */
 static uint64_t startup_deadline;
 uint64_t ngb_guest_polls;
@@ -125,7 +141,18 @@ static uint64_t now_ns(void)
 
 static int startup_expired(void) { return startup_deadline && now_ns() >= startup_deadline; }
 
-uint64_t ngb_elapsed_ns(void) { return now_ns() - start_ns; }
+static void start_guest_clock(void)
+{
+    uint64_t origin = now_ns();
+    atomic_store_explicit(&start_ns, origin, memory_order_relaxed);
+    startup_deadline = origin + BOOT_BUDGET_NS;
+}
+
+uint64_t ngb_elapsed_ns(void)
+{
+    uint64_t origin = atomic_load_explicit(&start_ns, memory_order_relaxed);
+    return origin ? now_ns() - origin : 0;
+}
 
 #ifdef __SWITCH__
 int ngb_mmio_trace_enabled(void) { return boot_log && log_lines < 2048; }
@@ -215,6 +242,10 @@ static void checkpoint_event(uint32_t va)
         startup_deadline = 0;
         ngb_kernel_log("Opening movie guest teardown");
         ngb_menu_gpu_prepare();
+#ifdef NGB_DIRECT3D
+        /* Keep the opening movie on its original framebuffer until the title takes over. */
+        ngb_enable_title_display();
+#endif
     }
     if (va == 0x003cc310u) note("[D3D] Direct3D_CreateDevice entry=%08x", va);
     if (entries <= 48) note("[ENTER] %08x", va);
@@ -324,7 +355,7 @@ uintptr_t ngb_guest_pointer(uint32_t va, size_t bytes)
         if (offset < NGB_VM_END && (uint64_t)offset + bytes > NGB_VM_BEGIN &&
             !ngb_vm_access(offset, bytes)) ngb_stop("uncommitted guest allocation", va);
         if (offset >= GUEST_TICK_COUNT && offset < GUEST_TICK_COUNT + 4) {
-            uint32_t elapsed_ms = (uint32_t)((now_ns() - start_ns) / 1000000);
+            uint32_t elapsed_ms = (uint32_t)(ngb_elapsed_ns() / 1000000);
             memcpy(ram + GUEST_TICK_COUNT, &elapsed_ms, sizeof(elapsed_ms));
         }
         return (uintptr_t)(ram + offset);
@@ -517,7 +548,7 @@ void ngb_graphics_wait_until(uint64_t nanoseconds)
 {
     // VBlank callers include background game workers. Parking the whole host
     // thread here would also stop the main game fiber for every wait.
-    uint64_t end = (start_ns + nanoseconds) / 100;
+    uint64_t end = (atomic_load_explicit(&start_ns, memory_order_relaxed) + nanoseconds) / 100;
     uint64_t previous = workers[running_worker].wake_tick;
     workers[running_worker].wake_tick = end;
     while (now_ns() / 100 < end) {
@@ -1171,7 +1202,7 @@ void recomp_unimpl(const char *text, uint32_t va)
     ngb_stop("unimplemented instruction", va);
 }
 void recomp_debug_service(uint32_t service, uint32_t va) { note("[DEBUG] service=%u arg=%08x", service, va); }
-uint64_t xbox_ReadTimeStampCounter(void) { uint64_t n = now_ns() - start_ns; return n / 1000000000u * 733333333u + n % 1000000000u * 733333333u / 1000000000u; }
+uint64_t xbox_ReadTimeStampCounter(void) { uint64_t n = ngb_elapsed_ns(); return n / 1000000000u * 733333333u + n % 1000000000u * 733333333u / 1000000000u; }
 static uint8_t encoder_gpio;
 uint32_t xbox_PortIn(uint32_t port, int size)
 {
@@ -1351,6 +1382,12 @@ int ngb_boot(const char *path, FILE *log)
     stopped_status = NGB_BOOT_UNSUPPORTED;
     snprintf(stopped_reason, sizeof(stopped_reason), "not started");
     atomic_store(&cancel, false);
+#ifdef NGB_DIRECT3D
+    atomic_store_explicit(&start_ns, 0, memory_order_relaxed);
+    startup_deadline = 0;
+    ngb_loading_set_progress(0, NGB_LOADING_READ_CACHE);
+    atomic_store(&title_display_enabled, false);
+#endif
     entries = 0; ngb_guest_polls = 0; ngb_poll_mask = 3; thread_count = 0; thunk_count = 0;
     g_xbox_code_lo = g_xbox_code_hi = 0;
     g_icall_count = g_icall_trace_idx = 0;
@@ -1373,8 +1410,9 @@ int ngb_boot(const char *path, FILE *log)
     g_fs_base = 0x4000;
     g_fp_control_word = 0x37f;
     g_fp_cc = 0x4000;
-    start_ns = now_ns();
-    startup_deadline = start_ns + BOOT_BUDGET_NS;
+#ifndef NGB_DIRECT3D
+    start_guest_clock();
+#endif
     #ifdef NGB_RIGID_CLIP
     note("[BOOT] NGB Switch startup adapter 0.51.0-rc1; ARM guest registers and rigid clip");
 #elif defined(NGB_REGISTER_PACKAGE)
@@ -1388,6 +1426,19 @@ int ngb_boot(const char *path, FILE *log)
         } else {
             ngb_vm_init(ram);
             initialize_thread();
+#ifdef NGB_DIRECT3D
+            int prepared = ngb_prepare_title_device();
+            if (ngb_stop_requested()) {
+                stopped_status = NGB_BOOT_CANCELLED;
+                ngb_stop("cancel requested", 0);
+            }
+            if (!prepared) {
+                stopped_status = NGB_BOOT_ERROR;
+                ngb_stop("Unable to prepare the game renderer", 0);
+            }
+            /* Start movie, input and guest timers after the last pipeline and cache save. */
+            start_guest_clock();
+#endif
             g_esp = BOOT_STACK_TOP;
             PUSH32(g_esp, 0);
             note("[BOOT] executing recompiled xbe_entry_point=0032b385; functions=%zu", recomp_get_count());

@@ -4,6 +4,9 @@
 #include "frontend_input.h"
 #include "scanout.h"
 #include "direct/display.h"
+#ifdef NGB_DIRECT3D
+#include "direct/output.h"
+#endif
 #include "files.h"
 #include "ohci_boot.h"
 #include <string.h>
@@ -17,11 +20,11 @@
 #include "diagnostics_flag.h"
 #include "player_diagnostics.h"
 int ngb_diagnostics_enabled;
-#include "loading.inc"
 #ifdef NGB_PLAYER_BUILD
 static atomic_uint commands;
 #include "settings_panel.inc"
 #endif
+#include "loading.inc"
 static atomic_bool finished;
 static int boot_status;
 static FILE *boot_log;
@@ -36,7 +39,6 @@ static atomic_uint commands;
 static u64 launch_tick;
 
 #ifdef NGB_DIRECT3D
-#include "direct/output.h"
 static Result thread_ticks(Handle handle, u64 *value)
 {
     return svcGetInfo(value, hosversionAtLeast(13, 0, 0) ? InfoType_ThreadTickCount :
@@ -557,7 +559,7 @@ int main(int argc,char **argv)
         bool failed=!started || (done && (boot_status==NGB_BOOT_ERROR || boot_status==NGB_BOOT_UNSUPPORTED));
 #ifdef NGB_GPU_PRESENT
         if(!failed && !done && !exiting && !gpu_window && surface_open &&
-           ngb_scanout_visible() && ngb_display_pending()){
+           ngb_title_display_enabled() && ngb_scanout_visible() && ngb_display_pending()){
             framebufferClose(&surface);
             surface_open=false;
             gpu_window=ngb_display_open(nwindowGetDefault());
@@ -593,7 +595,8 @@ int main(int argc,char **argv)
         if(started && !done && !exiting && mp_pc_enabled)mission_pc_tick(&worker);
         if(ngb_mission_enabled && atomic_exchange(&mp_exited,0))mission_pc_save();
 #endif
-        if (atomic_exchange(&commands,0)&EXIT_GAME) { ngb_request_stop(); exiting=true; }
+        if (atomic_exchange(&commands,0)&EXIT_GAME) exiting=true;
+        if (exiting) ngb_request_stop();
         if (exiting && (!started || done)) break;
         if (done && !failed) break;
 #ifdef NGB_PLAYER_BUILD

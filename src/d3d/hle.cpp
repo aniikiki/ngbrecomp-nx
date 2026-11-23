@@ -801,6 +801,22 @@ bool g_started;
 #ifdef NGB_DIRECT3D
 // Keep the device and its caches while Sofdec uses the guest framebuffer.
 std::unique_ptr<gpu::Backend> prologue_backend;
+static std::unique_ptr<gpu::Backend> title_device;
+
+extern "C" int ngb_prepare_title_device(void) {
+    if (title_device || g_backend || prologue_backend) return 1;
+    auto device = gpu::CreateBackend();
+    if (!device || !device->Init(640, 480)) return 0;
+    title_device = std::move(device);
+    return 1;
+}
+
+#ifdef NGB_TEXTURE_PRELOAD
+extern "C" void ngb_texture_idle_backend(gpu::Backend*);
+extern "C" void ngb_texture_title_tick(void) {
+    if (title_device && ngb_title_display_enabled() && !ngb_scene_active) ngb_texture_idle_backend(title_device.get());
+}
+#endif
 #endif
 
 void Start() {
@@ -815,13 +831,19 @@ void Start() {
     // the surfaces, shader handles and state needed for the first 3D draw.
     g_mirror = false;
     if (!ngb_scene_active) return;
+    ngb_enable_title_display();
     if (prologue_backend) {
         g_backend = std::move(prologue_backend);
         return;
     }
-#endif
+    bool prepared = bool(title_device);
+    ngb_kernel_log(prepared ? "3D scene [WARM_ADOPT] title_device=1" : "3D scene [WARM_ADOPT] title_device=0");
+    g_backend = prepared ? std::move(title_device) : gpu::CreateBackend();
+#else
+    constexpr bool prepared = false;
     g_backend = gpu::CreateBackend();
-    if (g_backend && !g_backend->Init(640, 480)) {
+#endif
+    if (g_backend && !prepared && !g_backend->Init(640, 480)) {
         g_backend.reset();
         if (gpu::g_init_retry) {   // the NV2A renderer's device is not up yet: at the next call
             gpu::g_init_retry = false;
@@ -1061,6 +1083,7 @@ extern "C" void ngb_direct_close(void)
     compact_indices = compact_draws = 0;
     ngb_direct_index_close();
     prologue_backend.reset();
+    title_device.reset();
     g_backend.reset();
     ngb_render_threaded = 0;
     g_state = gpu::State{};
