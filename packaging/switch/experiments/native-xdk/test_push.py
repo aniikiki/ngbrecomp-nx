@@ -10,8 +10,8 @@ import tempfile
 
 root = Path(__file__).resolve().parents[4]
 source = (root / 'src/d3d/hle.cpp').read_text()
-start = source.index('void RunPushBuffer(uint32_t pb,')
-parser = source[start:source.index('\n}', start) + 2]
+start = source.index('template<class Emit>\nvoid DecodePushBuffer')
+parser = source[start:source.index('// The hooked functions', start)]
 code = r'''
 #include <cstdint>
 #include <cstdio>
@@ -20,8 +20,16 @@ code = r'''
 #include <iterator>
 #include <stdexcept>
 #include <vector>
-#include "gpu/prepared.h"
 #define NGB_DIRECT3D 1
+#include "gpu/backend.h"
+gpu::IndexBounds gpu::IndexRange(const uint8_t* data, uint32_t count) {
+    IndexBounds b{UINT16_MAX,0};
+    for (unsigned i=0;i<count;++i) {
+        uint16_t v; std::memcpy(&v,data+2*i,2);
+        b.first=std::min<uint32_t>(b.first,v); b.last=std::max<uint32_t>(b.last,v);
+    }
+    return b;
+}
 static std::vector<uint8_t> header(20), payload;
 static bool ngb_d3d_native_enabled() { return true; }
 [[noreturn]] static void ngb_stop(const char* reason, uint32_t) { throw std::runtime_error(reason); }
@@ -32,7 +40,10 @@ static void* HostPtr(uint32_t a, size_t n=4) {
 }
 static uint32_t R32(uint32_t a) { uint32_t v; std::memcpy(&v, HostPtr(a), 4); return v; }
 static std::vector<uint32_t> draws;
-static void Draw(uint32_t prim, uint32_t start, uint32_t count, const uint8_t* data, bool prepared, gpu::CombatEffect effect) {
+static std::shared_ptr<const gpu::IndexSnapshot> last_snapshot;
+static void Draw(uint32_t prim, uint32_t start, uint32_t count, const uint8_t* data, bool prepared, gpu::CombatEffect effect,
+                 const std::shared_ptr<const gpu::IndexSnapshot>& snapshot = {}) {
+    last_snapshot = snapshot;
     if (prepared != (effect == gpu::CombatEffect::Transparent)) throw std::runtime_error("lost effect role");
     draws.insert(draws.end(), {prim,start,count});
     for (unsigned i=0;i<count;++i) { uint16_t v; std::memcpy(&v,data+i*2,2); draws.push_back(v); }
@@ -58,6 +69,36 @@ int main(int argc, char** argv) {
     setup({0x417fc,6,0x40081800,0x00070003,0});
     if(!fails("truncated native index push buffer") || !draws.empty())return 3;
     setup({0x40100,0,0}); if(!fails("unsupported native index push method"))return 4;
+    // In-place edits, identical packets with a new footer, and an older
+    // version still held by the render thread.
+    setup({0x417fc,6,0x41800,0x00090001,0x417fc,0,0});
+    RunPushBuffer(0x80001000); auto first = last_snapshot;
+    setup({0x417fc,6,0x41800,0x00090001,0x417fc,0,123});
+    RunPushBuffer(0x80001000); if (!first || first != last_snapshot) return 8;
+    setup({0x417fc,6,0x41800,0x00090005,0x417fc,0,123});
+    RunPushBuffer(0x80001000);
+    if (first == last_snapshot || first->indices[0]!=1 || last_snapshot->indices[0]!=5) return 9;
+    setup({0x417fc,6,0x41800,0x00020001,0x417fc,0,0x417fc,2,0x41808,9,0});
+    RunPushBuffer(0x80001000); if(draws!=std::vector<uint32_t>{6,0,2,1,2,2,0,1,9})return 10;
+    // Four live command streams that share a lookup bucket, followed by an
+    // eviction. A queued render must keep the evicted stream's exact indices.
+    setup({0x417fc,6,0x41800,0,0x417fc,0,0});
+    const auto packet = payload;
+    payload.resize(0x480 + packet.size());
+    std::array<std::shared_ptr<const gpu::IndexSnapshot>, 4> live;
+    auto select = [&](unsigned i) {
+        uint32_t addr = 0x80002000 + i * 0x120;
+        std::memcpy(header.data()+4,&addr,4);
+        RunPushBuffer(0x80001000);
+    };
+    for (unsigned i=0; i<5; ++i) {
+        std::memcpy(payload.data()+i*0x120,packet.data(),packet.size());
+        std::memcpy(payload.data()+i*0x120+12,&i,4);
+        if (i < 4) { select(i); live[i]=last_snapshot; }
+    }
+    for (unsigned i=0; i<4; ++i) { select(i); if (last_snapshot!=live[i]) return 11; }
+    select(4);
+    if (last_snapshot->indices[0]!=4 || live[0]->indices[0]!=0) return 12;
     for(uint32_t invalid : {0u,3u,7u}) {
         setup({0,0});std::memcpy(header.data()+12,&invalid,4);
         if(!fails("invalid native push buffer size"))return 5;
@@ -77,5 +118,5 @@ int main(int argc, char** argv) {
 with tempfile.TemporaryDirectory(prefix='ngb-push-') as temp:
     cpp = Path(temp) / 'test.cpp'; cpp.write_text(code)
     exe = Path(temp) / 'test'
-    subprocess.run(['c++', '-std=c++17', '-O2', '-I', str(root/'src/d3d'), str(cpp), '-o', str(exe)], check=True)
+    subprocess.run(['c++', '-std=c++20', '-O2', '-I', str(root/'src/d3d'), str(cpp), '-o', str(exe)], check=True)
     subprocess.run([str(exe), *sys.argv[1:]], check=True)

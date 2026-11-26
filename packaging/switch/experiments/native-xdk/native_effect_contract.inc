@@ -73,6 +73,38 @@ static void NativeEffectContract() {
     }
     std::fprintf(stderr, "[ALPHA-CONTRACT-PASS] blend alpha state switches and texture-stage kill\n");
 
+    // Load the output again before every strip so a wrongly discarded
+    // attachment is observable outside the scissor and on masked channels.
+    Vertex strip[] = {{-.5f,-.5f,0,1,~0u,0,0}, {7.5f,-.5f,0,1,~0u,8,0},
+                      {-.5f,3.5f,0,1,~0u,0,4}, {7.5f,3.5f,0,1,~0u,8,4}};
+    std::memcpy(HostPtr(scratch + 512, sizeof strip), strip, sizeof strip);
+    W32(scratch + 132, scratch + 512);
+    s.tss[0][gpu::kTssAlphaKill] = 0;
+    struct CopyCase { unsigned weight; bool reverse, scissor, red_only, alpha_test; };
+    for (CopyCase test : {CopyCase{255,false,false,false,false}, {0,true,false,false,false},
+                          {0,false,false,false,false}, {255,false,true,false,false},
+                          {255,false,false,true,false}, {255,false,false,false,true}}) {
+        s.simple[gpu::kMSrcBlend >> 2] = test.reverse ? 0x8004 : 0x8003;
+        s.simple[gpu::kMDestBlend >> 2] = test.reverse ? 0x8003 : 0x8004;
+        s.simple[gpu::kMBlendColor >> 2] = test.weight << 24;
+        s.simple[gpu::kMColorWriteEnable >> 2] = test.red_only ? 0x00010000 : 0x01010101;
+        s.simple[gpu::kMAlphaTestEnable >> 2] = test.alpha_test;
+        s.simple[gpu::kMAlphaFunc >> 2] = 0x204;
+        s.scissor_count = test.scissor; s.scissors = {0,0,4,4};
+        g_backend->Clear(s,0,nullptr,gpu::kClearTarget,background,1,0);
+        g_backend->Sync(d.data,gpu::TotalSize(d));
+        g_backend->Draw(s,6,0,4,nullptr);
+        g_backend->Sync(d.data,gpu::TotalSize(d));
+        for (unsigned y = 0; y < 4; ++y) for (unsigned x = 0; x < 8; ++x) {
+            bool copy = (test.reverse || test.weight == 255) && !test.alpha_test && (!test.scissor || x < 4);
+            uint32_t mask = test.red_only ? 0xff0000 : ~0u;
+            uint32_t want = copy ? (transparent & mask) | (background & ~mask) : background;
+            require(R32(d.data + y*d.pitch + 4*x) == want, 0x400 + y*8 + x);
+        }
+    }
+    s.scissor_count = 0;
+    std::fprintf(stderr, "[CROSSFADE-CONTRACT-PASS] exact endpoints, partial coverage, write mask and alpha test\n");
+
     // Reuse one target address at different sizes while older frames still
     // own its images. The latest colour survives; validation checks retirement.
     uint32_t changing = NativeHeader(20), data = NativeData(4096);
@@ -90,6 +122,76 @@ static void NativeEffectContract() {
     for (unsigned y = 0; y < d.height; ++y) for (unsigned x = 0; x < d.width; ++x)
         require(R32(d.data + y * d.pitch + x * 4) == 0xff123407u, 0x200 + y * 16 + x);
     std::fprintf(stderr, "[EFFECT-CONTRACT-PASS] feedback aliases, fresh contents, in-flight resize\n");
+}
+
+// Compare interleaved scene, UP lines and particles with the ordinary draw
+// path. A visibility query forces individual draws in the reference pass.
+static void NativeMixedStateContract(const gpu::State& particle, const gpu::TextureDesc& target) {
+    constexpr unsigned width = 16, height = 8;
+    struct ScreenVertex { float x, y, z, w; uint32_t colour; };
+    const uint32_t scratch = NativePool(256), vertices = scratch + 32, report = scratch + 160;
+    W32(scratch, 0x80000001); W32(scratch + 4, vertices);
+    gpu::State screen{};
+    screen.rt = particle.rt; screen.zs = particle.zs; screen.viewport = particle.viewport;
+    screen.vs_handle = 0x44; screen.streams[0] = {scratch, sizeof(ScreenVertex)};
+    screen.simple[gpu::kMColorWriteEnable / 4] = 0x01010101;
+    screen.tss[0][gpu::kTssColorOp] = screen.tss[0][gpu::kTssAlphaOp] = 2;
+    const uint32_t texture = particle.textures[0], original = R32(texture + 4);
+    const uint32_t black = NativeData(16);
+    std::array<uint32_t, width * height> reference{};
+    const uint16_t indices[] = {0, 1, 2, 3};
+    for (bool individual : {true, false}) {
+        gpu::State live = particle;
+        g_backend->Clear(live, 0, nullptr, gpu::kClearTarget | gpu::kClearZ, 0xff102030, 1, 0);
+        if (individual) g_backend->VisibilityBegin();
+        uint64_t revision = 0;
+        for (unsigned i = 0; i < 6; ++i) {
+            // The screen draw changes the view; the next particle inherits it
+            // without advertising a view change on its own revision.
+            const float shift = i & 1 ? .5f : -.5f;
+            const float x = 1.0f + i, y = 1.0f + (i % 4);
+            const ScreenVertex triangle[] = {{x,y,.5f,1,0xffa05010}, {x+6,y,.5f,1,0xffa05010},
+                                             {x,y+3,.5f,1,0xffa05010}};
+            live = screen;
+            live.transforms[2] = particle.transforms[2]; live.transforms[3] = particle.transforms[3];
+            live.transforms[2][12] = shift;
+            std::memcpy(HostPtr(vertices, sizeof triangle), triangle, sizeof triangle);
+            g_backend->DrawPrepared(live, 5, 0, 3, nullptr, {++revision, ~0u});
+            for (unsigned n = 0; n < 3; ++n) {
+                // The same texture object changes backing between otherwise
+                // batchable strips. Earlier draws must see the earlier header.
+                W32(texture + 4, n == 1 ? black : original);
+                live = particle;
+                live.transforms[2][12] = shift;
+                live.transforms[256][12] = .12f * n;
+                live.rs[gpu::kRsTextureFactor] = 0x70583028 + n * 0x00021303;
+                live.simple[gpu::kMColorWriteEnable / 4] = 0x01010101;
+                const uint32_t changed = individual ? ~0u : n == 0 ? ~gpu::PreparedState::ViewMatrices :
+                    gpu::PreparedState::InstanceValues | gpu::PreparedState::HeaderWrite(texture);
+                g_backend->DrawPrepared(live, 6, 0, 4, reinterpret_cast<const uint8_t*>(indices),
+                                        {++revision, changed});
+            }
+            live = screen;
+            const ScreenVertex ends[] = {{1,y,.25f,1,0xff80f040}, {14,y+1,.25f,1,0xff80f040}};
+            std::memcpy(HostPtr(vertices, sizeof ends), ends, sizeof ends);
+            g_backend->DrawPrepared(live, 2, 0, 2, nullptr, {++revision, ~0u});
+            if (i == 2) { g_backend->Fence(); ++revision; }
+        }
+        if (individual) g_backend->VisibilityEnd(report);
+        g_backend->Sync(target.data, gpu::TotalSize(target));
+        unsigned painted = 0;
+        for (unsigned y = 0; y < height; ++y) for (unsigned x = 0; x < width; ++x) {
+            const uint32_t pixel = R32(target.data + y * target.pitch + x * 4);
+            painted += pixel != 0xff102030;
+            if (individual) reference[y*width+x] = pixel;
+            else if (reference[y*width+x] != pixel) ngb_stop("interleaved recorder pixels", y*width+x);
+        }
+        if (!painted || painted == reference.size()) ngb_stop("interleaved recorder coverage", painted);
+    }
+    W32(texture + 4, original);
+    if (!ngb_contiguous_free(black | 0x80000000u)) ngb_stop("interleaved texture cleanup", black);
+    ngb_graphics_pool_free(scratch);
+    std::fprintf(stderr, "[MIXED-STATE-PASS] interleaved scene, lines and translucent particles, mutable vertices, inherited view, fence\n");
 }
 
 // Compare the recorder and Vulkan instance path with individual draws. Sparse
@@ -138,23 +240,27 @@ static void NativeBillboardContract() {
     tint[gpu::kTssResultArg] = 1;
     gpu::TextureDesc output;
     if (!gpu::Describe(surface, output)) ngb_stop("billboard contract target", surface);
-    auto check = [&](uint16_t last, unsigned mask, bool can_batch, uint32_t background = 0) {
+    auto check = [&](uint16_t last, unsigned mask, bool can_batch, uint32_t background = 0, bool zero_last = false, bool long_strip = false) {
         if (gpu::FixedTextureSampleMask(s) != mask) ngb_stop("billboard contract sampler mask", mask);
-        const uint16_t indices[] = {0, 1, 2, last};
-        auto strip = reinterpret_cast<const uint8_t*>(indices);
+        uint16_t indices[] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, last};
+        const unsigned count = long_strip ? std::size(indices) : 4;
+        auto strip = reinterpret_cast<const uint8_t*>(indices + std::size(indices) - count);
         std::array<uint32_t, width * height> reference{};
         for (bool batch : {false, true}) {
             uint64_t before = ngb_test_instanced_draws(last == 3);
             g_backend->Clear(s, 0, nullptr, gpu::kClearTarget | gpu::kClearZ, background, 1, 0);
             for (unsigned i = 0; i < gpu::kBillboardsPerDraw + 7; ++i) {
+                // Same guest address and count, different final triangle and fetch bounds.
+                if (long_strip) indices[std::size(indices) - 1] = (i / 4) % 2 ? 0 : last;
                 s.transforms[256][12] = i % 2 ? .45f : -.45f;
                 s.rs[gpu::kRsTextureFactor] = 0x2008050bu + (i % 3) * 0x04020100u;
+                if (zero_last && i == gpu::kBillboardsPerDraw + 6) s.rs[gpu::kRsTextureFactor] &= 0xffffff;
                 s.simple[gpu::kMColorWriteEnable / 4] = i < gpu::kBillboardsPerDraw + 2 ? 0x01010101 : 0x00010000;
-                if (i % 2) g_backend->DrawPrepared(s, 6, 0, 4, strip, {0, ~0u});
-                else g_backend->Draw(s, 6, 0, 4, strip);
+                if (i % 2) g_backend->DrawPrepared(s, 6, 0, count, strip, {0, ~0u});
+                else g_backend->Draw(s, 6, 0, count, strip);
                 if (!batch) g_backend->Fence(); // submit individually through the same API
             }
-            g_backend->Draw(s, 6, 0, 4, strip); // state inherited from the last instance
+            g_backend->Draw(s, 6, 0, count, strip); // state inherited from the last instance
             g_backend->Sync(output.data, gpu::TotalSize(output));
             if ((ngb_test_instanced_draws(last == 3) != before) != (batch && can_batch))
                 ngb_stop("billboard contract draw path", last);
@@ -170,7 +276,9 @@ static void NativeBillboardContract() {
             })) ngb_stop("billboard contract drew no translucent colour", last);
         return reference;
     };
+    NativeMixedStateContract(s, output);
     auto plain = check(3, 1, true);
+    check(3, 1, true, 0, false, true);
     tint[gpu::kTssTexCoordIndex] = 0x30001;
     tint[gpu::kTssTextureTransformFlags] = 0x102;
     s.tss[2][gpu::kTssTexCoordIndex] = 0x20002;
@@ -193,6 +301,45 @@ static void NativeBillboardContract() {
     tex[gpu::kTssTexCoordIndex] = 0;
     s.textures[0] = surface;
     check(3, 1, false, 0xa0603018); // each particle reads the previous one's rendered colour
+    // A BC3 strip with visible texels on both sides of a repeat seam. Compare
+    // individual draws and mixed-opacity instances with the generic material.
+    bytes = NativeTextureHeader(32, 16, 1, 1, 0x0f, 0, false, false, texture + 12, texture + 16);
+    W32(texture + 4, NativeData(bytes));
+    block = R32(texture + 4) | 0x80000000u;
+    std::memset(HostPtr(block, bytes), 0, bytes);
+    for (unsigned i = 0; i < 32; ++i) {
+        if (i % 8 == 0 || i % 8 == 7) W32(block + i * 16, 255);
+        W32(block + i * 16 + 8, 0xffff);
+    }
+    s.textures[0] = texture;
+    tex[gpu::kTssColorOp] = tex[gpu::kTssAlphaOp] = 4;
+    tex[gpu::kTssColorArg2] = tex[gpu::kTssAlphaArg2] = 1;
+    tex[gpu::kTssAddressU] = tex[gpu::kTssAddressV] = 1;
+    tex[gpu::kTssMinFilter] = tex[gpu::kTssMagFilter] = 2;
+    tex[gpu::kTssTextureTransformFlags] = 2;
+    s.transforms[16][0] = .5f;
+    s.transforms[16][8] = -.25f;
+    tint[gpu::kTssColorOp] = 3;
+    tint[gpu::kTssColorArg2] = 1;
+    // Swap MODULATE's operands to render the same material on the generic path.
+    std::swap(tex[gpu::kTssColorArg1],tex[gpu::kTssColorArg2]);
+    auto reference = check(3, 1, true, 0, true);
+    std::swap(tex[gpu::kTssColorArg1],tex[gpu::kTssColorArg2]);
+    if (check(3, 1, true, 0, true) != reference) ngb_stop("sparse additive repeat seam or instance fade", 1);
+    std::fprintf(stderr, "[ADDITIVE-CONTRACT-PASS] filtered repeat seams and per-instance opacity\n");
+    s.rs[gpu::kRsFogEnable] = 1;
+    s.rs[gpu::kRsFogTableMode] = 3;
+    s.rs[gpu::kRsFogColor] = 0xff3f78be;
+    s.transforms[3][2] = .25f; // clip Z varies across the strip
+    for (float near : {2.0f,.5f,.1f}) {
+        float far = near + 1;
+        std::memcpy(&s.rs[gpu::kRsFogStart], &near, sizeof(near));
+        std::memcpy(&s.rs[gpu::kRsFogEnd], &far, sizeof(far));
+        std::swap(tex[gpu::kTssColorArg1],tex[gpu::kTssColorArg2]);
+        auto generic = check(3, 1, true, 0x281e344c, true);
+        std::swap(tex[gpu::kTssColorArg1],tex[gpu::kTssColorArg2]);
+        if (check(3, 1, true, 0x281e344c, true) != generic) ngb_stop("linear fog changed particle pixels", 1);
+    }
     std::fprintf(stderr, "[BILLBOARD-CONTRACT-PASS] automatic batching, sampler dependencies, reflected and translucent pixels\n");
 }
 
@@ -320,6 +467,40 @@ static void NativeCombatContract() {
     }
     if (visible<20 || visible>width*height/3) ngb_stop("UT visible stripe",visible);
     std::fprintf(stderr,"[UT-CONTRACT-PASS] %u RGBA pixels, %u visible, split depth\n",width*height,visible);
+
+    // One whole triangle has zero alpha. The adjacent triangle must keep
+    // its soft gradient. The unused second sampler aliases the destination.
+    V gradient[4];
+    std::memcpy(gradient,vertices,sizeof gradient);
+    for (unsigned i=0;i<3;++i) gradient[i].colour &= 0xffffff;
+    uint32_t grad_vb = NativePool(256);
+    W32(grad_vb,0x80000001); W32(grad_vb+4,grad_vb+32);
+    std::memcpy(HostPtr(grad_vb+32,sizeof gradient),gradient,sizeof gradient);
+    s.streams[0]={grad_vb,sizeof(V)};
+    s.textures[1]=colour;
+    const uint32_t report = NativePool(32);
+    for (uint32_t dst : {1u,0x303u}) for (int threshold : {-1,0,65}) {
+        s.simple[kMDestBlend/4]=dst;
+        s.simple[kMAlphaTestEnable/4]=threshold >= 0;
+        s.simple[kMAlphaFunc/4]=0x204;
+        s.simple[kMAlphaRef/4]=threshold < 0 ? 0 : uint32_t(threshold);
+        unsigned painted=0;
+        for (bool reference : {true,false}) {
+            g_backend->Clear(s,0,nullptr,kClearTarget|kClearZ|kClearStencil,background,1,0);
+            if (reference) g_backend->VisibilityBegin();
+            g_backend->Draw(s,6,0,4,nullptr);
+            if (reference) g_backend->VisibilityEnd(report);
+            g_backend->Flush(); g_backend->Sync(target.data,TotalSize(target));
+            for (unsigned y=0;y<height;++y) for (unsigned x=0;x<width;++x) {
+                unsigned i=y*width+x;
+                uint32_t p=R32(target.data+y*target.pitch+x*4);
+                if (reference) { expected[i]=p; painted+=p!=background; }
+                else if (p!=expected[i]) ngb_stop("source-alpha blend RGBA mismatch",i);
+            }
+        }
+        if (!painted || painted==width*height) ngb_stop("source-alpha gradient missing",painted);
+    }
+    std::fprintf(stderr,"[ALPHA-CULL-CONTRACT-PASS] both blends, threshold off / 0 / 65, gradient and feedback alias\n");
 }
 
 struct NativePresentProbe {

@@ -6,6 +6,7 @@
 #include <random>
 #include <vector>
 #include "gpu/state.h"
+#include "gpu/prepared.h"
 
 std::vector<uint32_t> memory(0x400000 / 4);
 constexpr uint32_t kRenderState = 0x3d83d8, kSimpleEncode = 0x3e9278;
@@ -17,6 +18,7 @@ uint32_t R32(uint32_t address) {
 }
 void W32(uint32_t address, uint32_t value) { memory.at(address / 4) = value; }
 gpu::State g_state;
+uint32_t native_mesh_changed;
 extern "C" { uint32_t ngb_native_mesh_enabled = 1; }
 #include "native_simple.inc"
 #include "reference_simple.inc"
@@ -59,6 +61,40 @@ int main() {
         auto before = g_state.simple;
         NativeSyncSimpleReference();
         auto expected = g_state.simple;
+        g_state.simple = before;
+        NativeSyncSimple();
+        assert(g_state.simple == expected);
+        for (unsigned method = 0x300; method < 0x400; method += 4) {
+            unsigned i = native_simple_table.first[method / 4];
+            if (i == NativeSimpleTable::end) continue;
+            // The material path writes just one guest index, even for an
+            // encoding with multiple aliases. Guest edits still win in order.
+            uint32_t written = rng();
+            W32(kRenderState + i * 4, written);
+            g_state.simple[method / 4] = written;
+            RememberSimpleWrite(i, method, written);
+            if (native_simple_table.next[i] == NativeSimpleTable::end) {
+                assert(native_simple_table.last_input[i] == written);
+                assert(native_simple_table.last_output[(method - 0x300) / 4] == written);
+            }
+            unsigned external = (i + 1) % gpu::kRsDeferredFirst;
+            W32(kRenderState + external * 4, rng());
+            before = g_state.simple;
+            NativeSyncSimpleReference(); expected = g_state.simple;
+            g_state.simple = before; NativeSyncSimple();
+            assert(g_state.simple == expected);
+            g_state.simple[method / 4] ^= 1;
+            before = g_state.simple;
+            NativeSyncSimpleReference(); expected = g_state.simple;
+            g_state.simple = before; NativeSyncSimple();
+            assert(g_state.simple == expected);
+        }
+        // The Xbox input table can stay still while a direct setter changes
+        // the effective output. Hydration must recover exactly the old state.
+        g_state.simple[0x300/4] ^= 1;
+        before = g_state.simple;
+        NativeSyncSimpleReference();
+        expected = g_state.simple;
         g_state.simple = before;
         NativeSyncSimple();
         assert(g_state.simple == expected);

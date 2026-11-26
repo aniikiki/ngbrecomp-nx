@@ -3,9 +3,8 @@
  * game effects cross back into recompiled code. Included by hooks.c. */
 extern uint32_t ngb_native_mesh_enabled;
 int ngb_d3d_mesh_allowed(uint32_t material);
-void ngb_d3d_mesh_invalidate(void);
 void ngb_d3d_mesh_scope(int enter);
-void ngb_d3d_mesh_fixed(uint32_t material);
+int ngb_d3d_mesh_fixed(uint32_t material, uint32_t return_slot);
 int ngb_d3d_mesh_texture(unsigned stage, uint32_t texture);
 unsigned ngb_d3d_model_suspend(void);
 void ngb_d3d_model_resume(unsigned depth);
@@ -15,16 +14,11 @@ void ngb_d3d_mesh_unbind(unsigned stage);
 void ngb_d3d_mesh_modulate(unsigned stage, uint32_t color);
 void ngb_d3d_mesh_draw(uint32_t material);
 
-/* A poll may run a different fiber, an interrupt, or a graphics callback.
- * No claim about unchanged render state survives that boundary. */
+/* The runtime isolates native state around actual interrupts, guest callbacks
+ * and full scheduler polls. A short poll with no callback preserves it. */
 static void mesh_poll(void)
 {
-    uint64_t ticket = ++ngb_guest_polls;
-    if (!(ticket & ngb_poll_mask) || ngb_pending_dpcs) {
-        ngb_d3d_mesh_invalidate();
-        ngb_poll_due(ticket);
-        ngb_d3d_mesh_invalidate();
-    }
+    ngb_guest_block_poll();
 }
 
 #define MESH_GAME_CALL(fn, ret) do { \
@@ -38,9 +32,72 @@ static void mesh_poll(void)
     ngb_d3d_model_resume(mesh_owner); \
 } while (0)
 
-static void mesh_commands(void)
+static int mesh_next_entry_can_yield(void)
 {
+    return ngb_pending_dpcs || !((ngb_guest_polls + 1) & ngb_poll_mask);
+}
+
+// The particle callback reads three overrides. With all three disabled it
+// only touches guest registers and its two stack spills. Let the real callback
+// execute, retaining the renderer state already prepared for the next draw.
+static int mesh_particle_uses_defaults(uint32_t particle)
+{
+    if (mesh_next_entry_can_yield()) return 0;
+    if (!particle) return 1;
+    const uint8_t *flags = (const uint8_t *)ngb_ram_span(particle + 0x222, 10);
+    const void *spill = ngb_ram_span(esp - 8, 8);
+    if (!flags || !spill) return 0;
+    uintptr_t f = (uintptr_t)flags, s = (uintptr_t)spill;
+    if (s < f + 10 && f < s + 8) return 0;
+    uint16_t blend_mode, blend_op;
+    memcpy(&blend_mode, flags, sizeof blend_mode);
+    memcpy(&blend_op, flags + 2, sizeof blend_op);
+    return blend_mode == 6 && blend_op == 2 && !flags[9];
+}
+
+static void mesh_global_command(void)
+{
+    PUSH32(esp, 0x0030C27Du);
+    // The guest jump table is live. If another worker can run at the
+    // decoder's entry, let the decoder read the opcode after that checkpoint.
+    const uint8_t *opcode = (const uint8_t *)ngb_ram_span(eax + 1, 1);
+    if (mesh_next_entry_can_yield() || !opcode || *opcode != 10 || MEM32(0x30c360) != 0x0030C32Eu) {
+        unsigned owner = ngb_d3d_model_suspend();
+        sub_0030C2A0();
+        ngb_d3d_model_resume(owner);
+        return;
+    }
+    RECOMP_ENTRY(0x0030C2A0u);
+    ecx = MEM32(eax + 8);
+    uint32_t before = esp;
+    PUSH32(esp, ecx);
+    uint32_t callback = MEM32(eax + 4);
+    PUSH32(esp, 0x0030C335u);
+    // 001D7800 only stores its argument in the model's lighting context.
+    int preserves_state = callback == 0x001D7800u ||
+        (callback == 0x00127290u && mesh_particle_uses_defaults(MEM32(esp + 4)));
+    unsigned owner = preserves_state ? 0 : ngb_d3d_model_suspend();
+    RECOMP_ICALL_SAFE_AT(callback, before, 0x0030C332u);
+    if (!preserves_state) ngb_d3d_model_resume(owner);
+    POP32(esp, ecx);
+    esp += 4;
+}
+
+static void mesh_command_call(uint32_t ret)
+{
+    PUSH32(esp, ret);
     RECOMP_ENTRY(0x0030C240u);
+    // Even an empty list reaches the guest scheduler. After that checkpoint
+    // its only visible work is spilling ESI below the return address.
+    if (!eax) {
+        void *spill = ngb_ram_span(esp - 4, sizeof(uint32_t));
+        if (spill) {
+            uint32_t saved = esi;
+            memcpy(spill, &saved, sizeof saved);
+            esp += 4;
+            return;
+        }
+    }
     PUSH32(esp, esi);
     esi = eax;
     while (esi) {
@@ -65,7 +122,7 @@ static void mesh_commands(void)
             mesh_poll();
             if (LO8(eax) == 0xff) {
                 eax = esi;
-                MESH_GAME_CALL(sub_0030C2A0, 0x0030C27Du);
+                mesh_global_command();
             } else {
                 eax = (uint32_t)(int32_t)(int8_t)LO8(eax); ecx = esi;
                 MESH_GAME_CALL(sub_0030C370, 0x0030C289u);
@@ -75,12 +132,6 @@ static void mesh_commands(void)
     }
     POP32(esp, esi);
     esp += 4;
-}
-
-static void mesh_command_call(uint32_t ret)
-{
-    PUSH32(esp, ret);
-    mesh_commands();
 }
 
 static void mesh_body(void)
@@ -120,18 +171,28 @@ static void mesh_body(void)
             }
         }
         PUSH32(esp, 0x0030BD57u);
-        ngb_d3d_mesh_fixed(esi); esp += 4;
-        ecx = MEM32(esp + 0x1c); eax = MEM32(ecx + 8);
-        edi = eax ? ecx + 0x60 + (MEM32(ecx + 0x20) ? 0x50 : 0) : 0;
-        while (bp < eax) {
-            mesh_poll(); eax = bp;
-            PUSH32(esp, 0x0030BD7Eu);
-            if (ngb_d3d_mesh_texture(eax, edi)) esp += 4;
-            else {
-                unsigned owner = ngb_d3d_model_suspend(); sub_0030BA30(); ngb_d3d_model_resume(owner);
+        int stage_ready = ngb_d3d_mesh_fixed(esi, esp);
+        esp += 4;
+        ecx = MEM32(esp + 0x1c);
+        if (stage_ready && ecx == esi && !ngb_pending_dpcs && ((ngb_guest_polls + 1) & ngb_poll_mask)) {
+            // One texture-stage poll, with no scheduled callback. Preserve
+            // the texture call's stack spill and the loop's exit registers.
+            ++ngb_guest_polls;
+            MEM32(esp - 4) = 0x0030BD7Eu;
+            eax = bp = 1; edi = ecx + 0xa0;
+        } else {
+            eax = MEM32(ecx + 8);
+            edi = eax ? ecx + 0x60 + (MEM32(ecx + 0x20) ? 0x50 : 0) : 0;
+            while (bp < eax) {
+                mesh_poll(); eax = bp;
+                PUSH32(esp, 0x0030BD7Eu);
+                if (ngb_d3d_mesh_texture(eax, edi)) esp += 4;
+                else {
+                    unsigned owner = ngb_d3d_model_suspend(); sub_0030BA30(); ngb_d3d_model_resume(owner);
+                }
+                ecx = MEM32(esp + 0x1c); eax = MEM32(ecx + 8);
+                ++bp; edi += 0x40;
             }
-            ecx = MEM32(esp + 0x1c); eax = MEM32(ecx + 8);
-            ++bp; edi += 0x40;
         }
         esi = MEM32(esp + 0x10); edi = 1;
         if (esi == 1) {

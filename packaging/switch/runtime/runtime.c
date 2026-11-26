@@ -22,6 +22,9 @@
 #include "timers.h"
 #include "files.h"
 #include "files_bridge.h"
+#ifdef NGB_NATIVE_DIAG
+#include "combat_perf.h"
+#endif
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -264,20 +267,14 @@ void ngb_checkpoint(uint32_t va)
 
 void ngb_poll_due(uint64_t ticket)
 {
+    if (interrupt_enabled && !delivering_callback &&
+        (usb_interrupt || gpu_interrupt || apu_interrupt || ac97_interrupt || ngb_pending_dpcs))
+        poll_callbacks();
+    // Short polls often find no pending interrupt. Only a callback that runs
+    // guest code can invalidate a renderer-owned state snapshot here.
+    if (ticket & 255u) return;
 #ifdef NGB_DIRECT3D
-    extern unsigned ngb_d3d_model_suspend(void);
-    extern void ngb_d3d_model_resume(unsigned);
     unsigned model_owner = ngb_d3d_model_suspend();
-#endif
-    if (interrupt_enabled && !delivering_callback && (usb_interrupt || gpu_interrupt || apu_interrupt || ac97_interrupt || ngb_pending_dpcs)) poll_callbacks();
-    if ((ticket & 255u) != 0) {
-#ifdef NGB_DIRECT3D
-        ngb_d3d_model_resume(model_owner);
-#endif
-        return;
-    }
-#ifdef NGB_DIRECT3D
-    extern void ngb_d3d_native_poll(void);
     ngb_d3d_native_poll();
 #endif
     ngb_audio_poll();
@@ -488,7 +485,20 @@ static uint32_t run_callback(uint32_t routine, uint8_t irql, const uint32_t *arg
     g_esp = 0x03eff000;
     for (unsigned i = count; i; --i) PUSH32(g_esp, args[i - 1]);
     PUSH32(g_esp, 0);
+#ifdef NGB_DIRECT3D
+    unsigned model_owner = ngb_d3d_model_suspend();
+#endif
+#ifdef NGB_NATIVE_DIAG
+    unsigned interrupted = NGB_CPU_OTHER;
+    if (ngb_combat_enabled) interrupted = ngb_native_cpu_resume(NGB_CPU_INTERRUPT);
+#endif
     fn();
+#ifdef NGB_NATIVE_DIAG
+    if (ngb_combat_enabled) ngb_native_cpu_resume(interrupted);
+#endif
+#ifdef NGB_DIRECT3D
+    ngb_d3d_model_resume(model_owner);
+#endif
     if (g_esp != 0x03eff000) ngb_stop("unbalanced guest callback stack", routine);
     uint32_t result = g_eax;
     g_regs = saved;

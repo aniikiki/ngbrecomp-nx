@@ -4,6 +4,9 @@
 #include "ohci_boot.h"
 #include "scanout.h"
 #include "nv2a_boot.h"
+#ifdef NGB_DIRECT3D
+#include "direct/output.h"
+#endif
 #include "pgraph_boot.h"
 #include "menu_gpu.h"
 #include "runtime.h"
@@ -626,7 +629,13 @@ static void service_dma(void)
     uint64_t gate = atomic_load(&render_gate);
     uint32_t actual = fifo_regs[NV_PFIFO_CACHE1_DMA_PUT/4];
     uint32_t limit = (gate >> 32) ? (uint32_t)gate : actual;
-    if (fifo_regs[NV_PFIFO_CACHE1_DMA_GET/4] != limit) submit_dma(limit);
+    if (fifo_regs[NV_PFIFO_CACHE1_DMA_GET/4] != limit) {
+        // An interrupt check can drain deferred GPU work before delivering
+        // an IRQ. Keep that submission outside any prepared draw scope.
+        unsigned owner = ngb_d3d_model_suspend();
+        submit_dma(limit);
+        ngb_d3d_model_resume(owner);
+    }
     deferred_dma = fifo_regs[NV_PFIFO_CACHE1_DMA_GET/4] != actual;
     servicing_dma = false;
 }

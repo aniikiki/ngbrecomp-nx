@@ -11,6 +11,7 @@
 #include <vulkan/vulkan_core.h>
 
 #include "gpu/vertex.h"
+#include "gpu/shaders.h"
 
 namespace gpu {
 
@@ -19,20 +20,60 @@ struct CombatHull {
     bool useful = false;
 };
 
+// Treat an interpolated BC3 alpha as zero only when the endpoints guarantee it
+// independently of the implementation's rounding.
+inline bool Bc3AlphaIsZero(const uint8_t* blocks, unsigned w, unsigned x, unsigned y) {
+    const uint8_t* b = blocks + 16 * ((y / 4) * ((w + 3) / 4) + x / 4);
+    unsigned bit = 3 * ((y % 4) * 4 + x % 4);
+    unsigned bits = b[2 + bit / 8] | (unsigned(b[3 + bit / 8]) << 8);
+    unsigned i = (bits >> (bit % 8)) & 7;
+    return (i == 0 && !b[0]) || (i == 1 && !b[1]) ||
+           (i == 6 && b[0] <= b[1]) || (i >= 2 && i <= 5 && !b[0] && !b[1]);
+}
+
+struct AlphaTiles {
+    std::array<uint32_t,8> words{};
+    bool sparse = false;
+    bool empty = false;
+    bool transparent_regions = false;
+};
+
+// One bit per 1/16 by 1/16 texture tile. A clear bit covers every sample in
+// that tile, including the complete bilinear footprint across repeat seams.
+inline AlphaTiles FilteredAlphaTiles(const uint8_t* blocks, unsigned w, unsigned h) {
+    AlphaTiles result;
+    if (w < 16 || h < 16 || (w & (w-1)) || (h & (h-1))) return result;
+    unsigned occupied = 0;
+    const unsigned tw = w/16, th = h/16;
+    for (unsigned by = 0; by < 16; ++by) {
+        for (unsigned bx = 0; bx < 16; ++bx) {
+            const unsigned x0 = bx*tw, y0 = by*th;
+            bool hit = !Bc3AlphaIsZero(blocks,w,x0+tw/2,y0+th/2);
+            for (unsigned dy = 0; !hit && dy < th+2; ++dy) {
+                const unsigned y = (y0 + dy - 1) & (h-1);
+                for (unsigned dx = 0; dx < tw+2; ++dx) {
+                    if (!Bc3AlphaIsZero(blocks,w,(x0 + dx - 1) & (w-1),y)) { hit = true; break; }
+                }
+            }
+            if (hit) {
+                result.words[by/2] |= 1u << (16*(by%2) + bx);
+                if (++occupied > 224) return result;
+            }
+        }
+    }
+    result.transparent_regions = true;
+    result.sparse = occupied <= 192;
+    result.empty = occupied == 0;
+    return result;
+}
+
 // Bounds of all nonzero BC3 texels, including the complete bilinear footprint.
 // BC3 interpolation can round differently across GPUs. A code is considered
 // zero only when the format guarantees it from the endpoints, before rounding.
 inline CombatHull CombatAlphaHull(const uint8_t* blocks, unsigned w, unsigned h) {
     CombatHull hull;
     if (!w || !h) return hull;
-    auto transparent = [&](unsigned x, unsigned y) {
-        const uint8_t* b = blocks + 16 * ((y / 4) * ((w + 3) / 4) + x / 4);
-        unsigned bit = 3 * ((y % 4) * 4 + x % 4);
-        unsigned bits = b[2 + bit / 8] | (unsigned(b[3 + bit / 8]) << 8);
-        unsigned i = (bits >> (bit % 8)) & 7;
-        return (i == 0 && !b[0]) || (i == 1 && !b[1]) ||
-               (i == 6 && b[0] <= b[1]) || (i >= 2 && i <= 5 && !b[0] && !b[1]);
-    };
+    auto transparent = [&](unsigned x, unsigned y) { return Bc3AlphaIsZero(blocks,w,x,y); };
     // Four occupied corners already span every axis. Most solid textures
     // need only four texel inspections at upload.
     if (!transparent(0,0) && !transparent(w-1,0) && !transparent(0,h-1) && !transparent(w-1,h-1)) return hull;
@@ -72,6 +113,81 @@ inline bool CombatQuadIsInvisible(const Assembled& a) {
     for (unsigned i=0; i<4; ++i)
         if (b.src[e.offset+i*b.stride+3]) return false;
     return true;
+}
+
+// Equal components at every vertex have the same perspective
+// interpolation, even when a mathematically constant one rounds below one.
+inline uint8_t SharedUnlitInputs(const Assembled& a, bool fog_off) {
+    if (!a.vertex_count || a.vertex_count > 512) return 0;
+    if (!(a.regs & (1u << 3))) return kEqualVertexRGBA | (fog_off ? kFogFromVertexAlpha : 0);
+    const auto& e = a.elements[3];
+    if (e.format != 87 || e.buffer >= a.buffer_count) return 0;
+    const auto& b = a.buffers[e.buffer];
+    if (!b.src || e.offset + 4u > b.stride ||
+        size_t(e.offset) + (a.vertex_count - 1) * size_t(b.stride) + 4 > b.bytes) return 0;
+    bool gray = true, equal_alpha = true, black = true, opaque = fog_off;
+    for (unsigned i = 0; i < a.vertex_count && (gray || opaque); ++i) {
+        const uint8_t* v = b.src + i * b.stride + e.offset;
+        gray &= v[0] == v[1] && v[1] == v[2];
+        equal_alpha &= v[2] == v[3];
+        black &= !(v[0] | v[1] | v[2]);
+        opaque &= v[3] == 255;
+    }
+    return (black ? kBlackVertexRGB : gray ? (equal_alpha ? kEqualVertexRGBA : kEqualVertexRGB) : 0) |
+           (opaque ? kFogFromVertexAlpha : 0);
+}
+
+// FixedHlsl computes (end - abs(clip.z)) / (end - start) per vertex.
+// Positive perspective weights keep the interpolated factor inside the four
+// endpoint values. Leave room for the dot product and varying interpolation.
+inline bool BeforeLinearFog(const Assembled& a, const float* clip, float start, float end) {
+    if (!(start > 0 && end > start && std::isfinite(end)) || a.vertex_count != 4) return false;
+    const auto& e = a.elements[0];
+    if (e.format != 6 || e.buffer >= a.buffer_count) return false; // R32G32B32_SFLOAT
+    const auto& b = a.buffers[e.buffer];
+    if (!b.src || e.offset + 12u > b.stride || size_t(e.offset) + 3 * size_t(b.stride) + 12 > b.bytes) return false;
+    const double limit = start - (double(end) - start) / 256.0;
+    double min_w = INFINITY, max_w = 0;
+    for (unsigned i = 0; i < 4; ++i) {
+        float p[3];
+        std::memcpy(p, b.src + i * b.stride + e.offset, sizeof(p));
+        for (unsigned row : {8u,12u}) {
+            double x = double(p[0])*clip[row], y = double(p[1])*clip[row+1], z = double(p[2])*clip[row+2];
+            double value = x + y + z + clip[row+3];
+            double error = (std::abs(x) + std::abs(y) + std::abs(z) + std::abs(clip[row+3]) + 1) * 4e-6;
+            if (row == 8) {
+                if (!(std::abs(value) + error < limit)) return false;
+            } else {
+                if (!(value > error)) return false;
+                min_w = std::min(min_w, value - error);
+                max_w = std::max(max_w, value + error);
+            }
+        }
+    }
+    return max_w <= 2 * min_w;
+}
+
+// XYZRHW strip with four distinct corners on the target edges. The middle
+// two vertices must form its diagonal or the two triangles can overlap.
+inline bool CoversColorTarget(const Assembled& a, unsigned width, unsigned height) {
+    if (!a.pretransformed || !a.strip || a.topology != Topology::Triangles ||
+        a.index_count || a.draw_count != 4 || a.vertex_count != 4) return false;
+    const auto& pos = a.elements[0];
+    if (pos.format != 2 || pos.buffer >= a.buffer_count) return false; // R32G32B32A32_SFLOAT
+    const auto& b = a.buffers[pos.buffer];
+    if (!b.src || pos.offset + 16u > b.stride ||
+        size_t(pos.offset) + 3 * size_t(b.stride) + 16 > b.bytes) return false;
+    unsigned seen = 0, corner[4];
+    for (unsigned i = 0; i < 4; ++i) {
+        float p[4];
+        std::memcpy(p, b.src + i * b.stride + pos.offset, sizeof(p));
+        if ((p[0] != -0.5f && p[0] != float(width) - 0.5f) ||
+            (p[1] != -0.5f && p[1] != float(height) - 0.5f) ||
+            !(p[2] >= 0 && p[2] <= 0.99999f) || p[3] != 1) return false;
+        corner[i] = unsigned(p[0] >= 0) | (unsigned(p[1] >= 0) << 1);
+        seen |= 1u << corner[i];
+    }
+    return seen == 15 && (corner[1] ^ corner[2]) == 3;
 }
 
 // Both colour and alpha modulate their argument with CURRENT and feed the next stage.

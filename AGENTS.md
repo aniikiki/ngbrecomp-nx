@@ -117,6 +117,8 @@ Driving and watching a headless run:
 
 ## Conventions
 
+- Commit the exact source for every numbered Switch build locally before distributing the NRO or
+  starting the next version. Include the version number in the commit message.
 - The Switch player checks three independent empty files in `/switch/ngb-runtime/` at startup.
   `diagnostics.flag` enables the game performance and material recorders.
   `boot.flag` enables the boot and nxvk logs. `menu-perf.flag` enables the Missions menu

@@ -12,7 +12,6 @@ static bool NativeMeshEnabled() {
     return mode == 2 ? phase == 1 || phase == 2 : mode;
 }
 
-extern "C" void ngb_d3d_mesh_invalidate(void) { native_mesh_coherent = false; }
 // The token lives on the current host/fiber stack. A callback or another guest
 // worker must not inherit ownership of its caller's model traversal.
 extern "C" unsigned ngb_d3d_model_suspend(void) {
@@ -30,13 +29,13 @@ extern "C" void ngb_d3d_model_scope(int enter) {
 }
 extern "C" void ngb_d3d_model_world(uint32_t matrix) {
     W32(0x977bd4, matrix);
-    const auto* p = static_cast<const uint32_t*>(HostPtr(matrix, 64));
+    const auto* p = static_cast<const uint32_t*>(ReadPtr(matrix, 64));
     auto* d = static_cast<uint32_t*>(HostPtr(R32(kDevicePtr) + 0xde0, 64));
     // The original rep movsd copies forwards even for overlapping inputs.
     for (unsigned i = 0; i < 16; ++i) d[i] = p[i];
     W32(0x3d83d0, R32(0x3d83d0) | 0x200);
     std::memcpy(g_state.transforms[256].data(), d, 64);
-    native_mesh_changed |= gpu::PreparedState::WorldMatrices;
+    native_mesh_changed |= gpu::PreparedState::InstanceValues;
 }
 extern "C" void ngb_d3d_mesh_scope(int enter) {
     if (!native_model_depth) native_mesh_coherent = false;
@@ -46,10 +45,11 @@ extern "C" int ngb_d3d_mesh_allowed(uint32_t address) {
     ++native_mesh_attempts;
     return ngb_native_mesh_enabled && NativeMeshEnabled() && R32(address + 8) <= 4;
 }
-extern "C" void ngb_d3d_mesh_fixed(uint32_t address) {
+extern "C" int ngb_d3d_mesh_fixed(uint32_t address, uint32_t return_slot) {
     NativeFlush(); NativeDiagScope diag(ND_STATE);
-    material::Fixed<true>(address);
     ++material_batches;
+    return material::PrepareMesh(address, return_slot) && !native_flushing &&
+        (!native_push || R32(kNativeDevice) == native_read);
 }
 extern "C" int ngb_d3d_mesh_texture(unsigned stage, uint32_t address) {
     if (stage >= 4) return 0;
@@ -58,11 +58,14 @@ extern "C" int ngb_d3d_mesh_texture(unsigned stage, uint32_t address) {
     return 1;
 }
 extern "C" void ngb_d3d_mesh_simple(uint32_t cache, unsigned state, unsigned method, uint32_t value) {
-    if (R32(cache) != value) NativeFlush();
+    if (R32(cache) == value) return;
+    NativeFlush();
     material::Tables<true> t;
     t.Simple(cache, state, method, value);
 }
 extern "C" void ngb_d3d_mesh_disable(unsigned stage) {
+    const auto* ops = static_cast<const uint32_t*>(HostPtr(0x9779a8 + stage * 128, 5 * sizeof(uint32_t)));
+    if (ops[0] == 1 && ops[4] == 1) return;
     material::Tables<true> t;
     t.Texture(stage, 0x9779a8, 12, 1, 0x800);
     t.Texture(stage, 0x9779b8, 16, 1, 0x800);
@@ -75,42 +78,35 @@ extern "C" void ngb_d3d_mesh_unbind(unsigned stage) {
     NativeBind(R32(kNativeDevice + 0xf88 + stage * 4), 0);
     W32(kNativeDevice + 0xf88 + stage * 4, 0);
     g_state.textures[stage] = 0;
-    native_mesh_changed |= gpu::PreparedState::Bindings | gpu::PreparedState::ResourceHeaders;
+    native_mesh_changed |= Groups::TexturesAndPalettes | Groups::HeaderBindings;
 }
 extern "C" void ngb_d3d_mesh_modulate(unsigned stage, uint32_t color) {
+    // Fading particles reuse the same stage and change only its colour.
+    constexpr uint32_t base = 0x9779a8;
+    const auto* ops = static_cast<const uint32_t*>(HostPtr(base + stage * 128, 8 * sizeof(uint32_t)));
+    if (ops[0] != 3 || ops[3] != 1 || ops[4] != 4 || ops[6] != 3 || ops[7] != 1) {
+        material::Tables<true> t;
+        t.Texture(stage, 0x9779b4, 15, 1, 0x800);
+        t.Texture(stage, 0x9779a8, 12, 3, 0x800);
+        t.Texture(stage, 0x9779c0, 18, 3, 0x800);
+        t.Texture(stage, 0x9779c4, 19, 1, 0x800);
+        t.Texture(stage, 0x9779b8, 16, 4, 0x800);
+    }
+    if (R32(0x977920) == color) return;
+    NativeFlush();
     material::Tables<true> t;
-    t.Texture(stage, 0x9779b4, 15, 1, 0x800);
-    t.Texture(stage, 0x9779a8, 12, 3, 0x800);
-    t.Texture(stage, 0x9779c0, 18, 3, 0x800);
-    t.Texture(stage, 0x9779c4, 19, 1, 0x800);
-    t.Texture(stage, 0x9779b8, 16, 4, 0x800);
-    if (R32(0x977920) != color) NativeFlush();
     t.Complex(0x977920, gpu::kRsTextureFactor, color);
 }
 extern "C" void ngb_d3d_mesh_draw(uint32_t address) {
     if (!R32(address + 0x1c)) return;
     NativeFlush();
-    if (!native_mesh_coherent) {
-        SyncDeferred();
-        native_mesh_coherent = true;
-        ++native_mesh_syncs;
-    } else ++native_mesh_reused;
-    static const bool verify = std::getenv("NGB_NATIVE_MESH_VERIFY") != nullptr;
-    if (verify) {
-        gpu::State saved = g_state;
-        uint32_t changes = native_mesh_changed;
-        SyncDeferred();
-        if (saved.simple != g_state.simple || saved.rs != g_state.rs || saved.tss != g_state.tss ||
-            saved.textures != g_state.textures || saved.palettes != g_state.palettes ||
-            std::memcmp(saved.transforms.data(), g_state.transforms.data(), sizeof(saved.transforms)) ||
-            std::memcmp(saved.vsc.data(), g_state.vsc.data(), sizeof(saved.vsc)) ||
-            std::memcmp(saved.material.data(), g_state.material.data(), sizeof(saved.material)))
-            ngb_stop("native mesh state differs from guest state", address);
-        g_state = std::move(saved);
-        native_mesh_changed = changes;
-    }
+    if (native_mesh_coherent) ++native_mesh_reused;
+    else ++native_mesh_syncs;
+    SyncOwnedState(address);
     ++native_mesh_draws;
-    uint32_t kind = R32(address + 0x10), data = R32(address + 0x14);
+    uint32_t geometry[3];
+    std::memcpy(geometry, ReadPtr(address + 0x10, sizeof geometry), sizeof geometry);
+    uint32_t kind = geometry[0], data = geometry[1];
     // The game's screen-history controller owns bit 2 while the trail is active.
     // Its additive mesh layers come through this material boundary before Vulkan.
     gpu::CombatEffect effect = gpu::CombatEffect::None;
@@ -119,10 +115,10 @@ extern "C" void ngb_d3d_mesh_draw(uint32_t address) {
         effect = gpu::CombatEffect::Transparent;
     if (!kind) RunPushBuffer(data, true, effect);
     else {
-        uint32_t count = R32(address + 0x18) / 2;
+        uint32_t count = geometry[2] / 2;
         uint32_t indices = kind == 1 ? R32(data + 4) + 12 :
             R32(R32(R32(address + 4) + 0x18) + 4) + data;
-        if (indices) Draw(6, 0, count, static_cast<const uint8_t*>(HostPtr(indices, size_t(count) * 2)), true, effect);
+        if (indices) Draw(6, 0, count, static_cast<const uint8_t*>(ReadPtr(indices, size_t(count) * 2)), true, effect);
     }
 }
 extern "C" void ngb_d3d_mesh_stats(uint64_t out[8]) {

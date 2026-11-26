@@ -8,6 +8,9 @@ extern "C" {
 extern int ngb_scene_active;
 int ngb_d3d_native_enabled(void);
 int ngb_d3d_native_entry(uint32_t address);
+int ngb_d3d_light_enable_ready(uint32_t index, uint32_t stack);
+int ngb_d3d_set_light_ready(uint32_t stack);
+int ngb_d3d_lights_already_disabled(unsigned first);
 int ngb_d3d_material_fixed(uint32_t address);
 int ngb_d3d_material_texture(unsigned stage, uint32_t address);
 void ngb_d3d_material_stats(uint64_t out[4]);

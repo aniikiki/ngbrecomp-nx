@@ -11,7 +11,7 @@ import sys
 from material_cache import compatibility
 
 root = Path('/work')
-version = '0.57.60'
+version = '0.57.75'
 (root / 'build/switch-runtime/history').mkdir(parents=True, exist_ok=True)
 assert '--seed' in sys.argv, 'supply the validated portable material seed with --seed'
 seed = Path(sys.argv[sys.argv.index('--seed') + 1]).resolve()
@@ -54,17 +54,21 @@ replace(" def comp(name,s,flags=[]):", """ def comp(name,s,flags=[]):
   if name=='main.c':
    (d/'native_combat_perf.inc').write_text((root/'combat_perf.inc').read_text().replace('#SESSION,0.56.25,','#SESSION,@VERSION@,'))
    s=s.replace('#include \\"combat_perf.inc\\"','#include \\"native_combat_perf.inc\\"')""")
+replace(" for name in ['runtime.c','main.c']:", " comp('nv2a_boot.c',(root/'nv2a_boot.c').read_text())\\n for name in ['runtime.c','main.c']:")
 replace(" regs=[]", " from disc_archives import link_disc_archives\\n disc_hooks=link_disc_archives(Path('/work'),d,link)\\n regs=[]")
 replace(" elf=d/'idx.elf';", """ from menu_profile import link_button_prompts, link_menu_profile
  link_menu_profile(Path('/work'),d,link,next(shlex.split(c) for c in commands if c.endswith('/runtime.c')),b,sdk/'devkitA64/bin/aarch64-none-elf-objcopy')
  link_button_prompts(Path('/work'),d,link,sdk/'devkitA64/bin/aarch64-none-elf-objcopy')
+ from particle_guest import link_profile
+ link_profile(Path('/work'),d,link,sdk/'devkitA64/bin/aarch64-none-elf-gcc')
  elf=d/'idx.elf';""")
 replace(" handlers=[n for n in table", " assert all(n in table for n in [*disc_hooks,'ngb_encode_menu_profile','ngb_queue_menu_profile','ngb_retail_profile_encoder','ngb_retail_register_sprites','ngb_switch_xy_prompts'])\\n handlers=[n for n in table")
-replace("  regs.append(obj)", "  if u in (28,44,45): obj=base/'core-perf/native-xdk'/f'recomp_{u:04}.c.o'\\n  regs.append(obj)")
+replace("  regs.append(obj)", "  if u in (9,28,44,45): obj=base/'core-perf/native-xdk'/f'recomp_{u:04}.c.o'\\n  regs.append(obj)")
 replace(" assert (out/'linked-inputs.txt').read_bytes()==(base/'core-perf/opening-pixel-link-audit/linked-inputs.txt').read_bytes()", """ reference={Path(line.split()[1]).name:line for line in (base/'core-perf/native-xdk/retained-inputs.txt').read_text().splitlines()}
  actual={Path(line.split()[1]).name:line for line in (out/'linked-inputs.txt').read_text().splitlines()}
- assert len(actual)==47 and all(actual[n]==reference[n] for n in actual if n not in ('recomp_0028.c.o','recomp_0044.c.o','recomp_0045.c.o'))
- assert all('core-perf/native-xdk/' in actual[n] for n in ('recomp_0028.c.o','recomp_0044.c.o','recomp_0045.c.o'))""")
+ replacements = ('recomp_0009.c.o','recomp_0028.c.o','recomp_0044.c.o','recomp_0045.c.o')
+ assert len(actual)==47 and all(actual[n]==reference[n] for n in actual if n not in replacements)
+ assert all('core-perf/native-xdk/' in actual[n] for n in replacements)""")
 '''
 inject = inject.replace('@VERSION@', version)
 source = source.replace(anchor, inject + '\n' + anchor)
@@ -76,13 +80,15 @@ exec(compile(source, str(opening / 'package-retained.py'), 'exec'), {'__file__':
 out = root / 'build/switch-runtime/history' / version
 inputs = [root / 'src/d3d/native_device.inc', root / 'src/d3d/native_material.inc', root / 'src/d3d/hle.cpp',
           root / 'src/d3d/gpu/threaded.cpp', root / 'src/d3d/gpu/readback.h', root / 'src/d3d/vk/backend.cpp']
-inputs += [root / 'src/d3d' / n for n in ('native_diag.h','native_diag.inc','native_pacing.h')]
-inputs += [root / 'src/d3d' / n for n in ('native_mesh.inc','native_simple.inc','gpu/prepared.h','gpu/backend.h')]
-inputs += [root / 'packaging/switch/runtime/direct' / n for n in ('native_mesh.inc','native_model.inc','display.h','display_device.h','presenter.inc','platform.cpp')]
-inputs += [root / 'packaging/switch/runtime' / n for n in ('runtime.c','runtime.h','identity.c','services.h','direct/hooks.c','direct/output.h','scene/bridge.c')]
+inputs += [root / 'src/d3d' / n for n in ('native_diag.h','native_diag.inc','native_pacing.h','native_cpu_phases.h')]
+inputs += [root / 'src/d3d' / n for n in ('native_mesh.inc','native_simple.inc','compat/kernel/kernel.h','gpu/prepared.h','gpu/backend.h')]
+inputs += [root / 'packaging/switch/runtime/direct' / n for n in ('native_mesh.inc','native_model.inc','native_render_list.inc','native_model_lights.inc','display.h','display_device.h','presenter.inc','platform.cpp')]
+inputs += [root / 'packaging/switch/runtime' / n for n in ('runtime.c','runtime.h','nv2a_boot.c','identity.c','services.h','direct/hooks.c','direct/output.h','scene/bridge.c')]
 inputs += [root / 'packaging/switch/runtime' / n for n in ('main.c','settings_panel.inc','settings_catalog.h','recomp_settings.h','scanout.c','scanout.h','combat_perf.h','combat_perf.inc','workers.inc')]
 inputs += [root / 'packaging/switch/runtime' / n for n in ('menu_gpu.c','pgraph_boot.c','player_diagnostics.h','diagnostics_flag.h','mission_perf.h','mission_perf.inc')]
 inputs += [experiment / n for n in ('build.py','package.py','material_cache.py','material_guest.py','story_gpu.py','disc_archives.py')]
+inputs += [experiment / 'particle_guest.py', root / 'packaging/switch/runtime/particle_prepare.h',
+           root / 'packaging/switch/runtime/direct/particle_profile.S', root / 'packaging/switch/runtime/matrix.h']
 inputs += [root / 'packaging/switch/runtime/button_prompts.c', root / 'packaging/switch/runtime/direct/button_prompts.S']
 inputs += [root / 'src/costume_menu.c', root / 'packaging/switch/runtime/costume_pictures.h', root / 'packaging/switch/settings/link.py']
 inputs += [experiment / 'menu_profile.py', root / 'packaging/switch/runtime/menu_profile.inc',
@@ -108,6 +114,11 @@ manifest['native_material'] = json.loads(material_guest.read_text())
 assert manifest['native_material']['all_other_assembly_unchanged']
 assert manifest['native_material']['candidate_sha256'] == hashlib.sha256(
     (material_guest.parent / 'recomp_0028.c.o').read_bytes()).hexdigest()
+particle_object = material_guest.parent / 'recomp_0009.c.o'
+manifest['particle_guest'] = json.loads((particle_object.parent / 'particle-guest.json').read_text())
+assert manifest['particle_guest']['candidate_sha256'] == hashlib.sha256(particle_object.read_bytes()).hexdigest()
+assert b'particle_update_cpu_us,particle_prepare_cpu_us' in binary
+assert b'ordered_list_cpu_us,effect_model_prepare_cpu_us,draw_task_other_cpu_us' in binary
 assert f'#SESSION,{version},'.encode() in binary
 assert b'startup-home.log' not in binary
 assert b'shader cache: could not commit buffered entries' in binary, 'rebuild direct/nvk.o with the updated nxvk'
@@ -120,6 +131,7 @@ assert b'#O,time_us,min_images,max_images,requested_images,actual_images,command
 assert b'#I,issue_us,read_start_us,read_end_us,' in binary
 assert b'#W,submit_frame,strip_draws,' in binary
 assert b'#A,submit_frame,material_detail,' in binary
+assert b'#E,submit_frame,material_detail,spans,omitted_calls,valid,unused_texture_bindings,alpha_cull_draws,' in binary
 assert b'#L,submit_frame,phase,texture_sig,' in binary
 assert b'#Y,begin_us,generation_after_acquire,' in binary
 assert b'source_frame,image_index,scene_submit_us,window_submit_us,' in binary

@@ -23,6 +23,6 @@ def transform(t):
     once('        b->cmds.clear();','        b->surfaces.clear();\n        b->cmds.clear();')
     for arg,shader in [('a','vs'),('b','ps')]:
         once(f'c.{shader} = int32_t(cur_->{shader}.size());',f'c.{arg} = uint32_t(cur_->{shader}.size())+1;')
-        once(f'if (c.{shader} >= 0) state_.{shader} = b.{shader}[size_t(c.{shader})];', f'if(c.{arg}) state_.{shader} = b.{shader}[c.{arg}-1];')
+        once(f'if (c.{shader} >= 0) state.{shader} = b.{shader}[size_t(c.{shader})];', f'if(c.{arg}) state.{shader} = b.{shader}[c.{arg}-1];')
     once('c.vs < 0 && c.ps < 0','!c.a && !c.b')
     return t

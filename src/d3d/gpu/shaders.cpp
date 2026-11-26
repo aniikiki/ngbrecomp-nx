@@ -791,6 +791,8 @@ std::string FixedVertexHlsl(uint16_t regs, bool pretransformed, uint64_t decode,
     bool clip_effect = !pretransformed && (f.light & kCombatClipPlanes);
     if (clip_effect) s.insert(s.find("    float4 pos : SV_Position;"),
                               "    float4 clipLo : SV_ClipDistance0;\n    float4 clipHi : SV_ClipDistance1;\n");
+    if (f.light & kCullZeroAlpha)
+        s.insert(s.find("    float4 pos : SV_Position;"), "    float alphaCull : SV_CullDistance0;\n");
     bool lit = !pretransformed && (f.light & 1);
     if (pretransformed) {
         s += "    float4 rhw = " + v(0, "float4(0,0,0,1)") + ";\n";
@@ -908,6 +910,8 @@ std::string FixedVertexHlsl(uint16_t regs, bool pretransformed, uint64_t decode,
         s += "    float4 axes = float4(oT0.xy, oT0.x + oT0.y, oT0.x - oT0.y);\n"
              "    o.clipLo = axes - uvc[0];\n    o.clipHi = uvc[1] - axes;\n";
     if (billboards) s += "    o.billboardFactor = c[base+4];\n";
+    if (f.light & kCullZeroAlpha)
+        s += "    o.alphaCull = o.d0.a == 0 ? -1.0 : 1.0;\n";
     return s + "    return o;\n}\n";
 }
 
@@ -919,6 +923,48 @@ bool IdView() { return IdViewMode() > 0; }
 
 std::string PixelHlsl(const PixelKey& k) {
     std::string s = Common(k.instance_factor != 0);
+    if (k.combat == CombatPixel::VertexColour) {
+        s += "float4 main(VOut i) : SV_Target {\n    float4 layer = saturate(i.d0);\n";
+        if (k.shared_inputs & kBlackFog)
+            s += "    layer.rgb *= saturate(i.fogamt);\n";
+        else s += "    layer.rgb = saturate(lerp(fogcolor.rgb, layer.rgb, saturate(i.fogamt)));\n";
+        return s + "    return layer;\n}\n";
+    }
+    const bool sparse = k.combat == CombatPixel::SparseAdditive || k.combat == CombatPixel::SparseFadedAdditive;
+    const bool greater = k.combat == CombatPixel::UnlitGreater || k.combat == CombatPixel::FadedGreater;
+    const bool fade_alpha = k.combat == CombatPixel::FadedAdditive || k.combat == CombatPixel::SparseFadedAdditive ||
+                            k.combat == CombatPixel::FadedGreater;
+    if (sparse || greater || fade_alpha || k.combat == CombatPixel::UnlitAdditive) {
+        s += "Texture2D tex0 : register(t0);\nSamplerState smp0 : register(s0);\n";
+        // Discard only controls blending. Read-only depth/stencil can reject occluded
+        // fragments before the tile lookup; game visibility queries use the original shader.
+        if (sparse || greater || k.shared_inputs) s += "[earlydepthstencil]\n";
+        s += "float4 main(VOut i) : SV_Target {\n";
+        if (sparse) {
+            // The mask includes the full bilinear footprint across both repeat seams.
+            // This path has a single image level and identical min/mag filters.
+            s += "    uint2 tile = min((uint2)(frac(i.tc0.xy) * 16), 15u);\n"
+                 "    uint word = asuint(uvc[2 + (tile.y >> 3)])[((tile.y >> 1) & 3u)];\n"
+                 "    if (i.d0.a == 0 || (word & (1u << (tile.x + 16u * (tile.y & 1u)))) == 0u) discard;\n"
+                 "    float4 tap = tex0.SampleLevel(smp0, i.tc0.xy, 0);\n";
+        } else s += "    float4 tap = tex0.Sample(smp0, i.tc0.xy);\n";
+        const char* diffuse = (k.shared_inputs & kEqualVertexRGBA) ? "i.d0.aaaa" :
+                              (k.shared_inputs & kEqualVertexRGB) ? "i.d0.rrra" : "i.d0";
+        if (k.shared_inputs & kBlackVertexRGB)
+            s += "    float4 layer = float4(0, 0, 0, saturate(tap.a * i.d0.a));\n";
+        else s += F("    float4 layer = saturate(tap * %s);\n", diffuse);
+        if (fade_alpha) s += k.instance_factor ? "    layer.a *= i.billboardFactor.a;\n" : "    layer.a *= tfactor.a;\n";
+        if (sparse || (k.shared_inputs & kRejectZeroAlpha)) s += "    if (layer.a == 0) discard;\n";
+        if (greater) s += "    if ((int)round(layer.a * 255) <= (int)misc.x) discard;\n";
+        if (k.shared_inputs & kBeforeLinearFog) return s + "    return layer;\n}\n";
+        // Keep the original interpolated fog factor even for a constant-one
+        // vertex output. Perspective interpolation can round it below one.
+        const char* fog = (k.shared_inputs & kFogFromVertexAlpha) ? "i.d0.a" : "i.fogamt";
+        if (k.shared_inputs & kBlackFog)
+            return s + F("    layer.rgb *= saturate(%s);\n    return layer;\n}\n", fog);
+        return s + F("    layer.rgb = saturate(lerp(fogcolor.rgb, layer.rgb, saturate(%s)));\n", fog) +
+                   "    return layer;\n}\n";
+    }
     if (k.alphakill & kHazeTargetExtent) DeclareRasterExtent(s);
     s += PsHelpers();
     for (int i = 0; i < 4; i++) {

@@ -13,6 +13,7 @@ extern "C" void ngb_switch_frame(void);
 #include "native_diag.h"
 #include "native_pacing.h"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -29,10 +30,12 @@ extern "C" void ngb_switch_frame(void);
 #include "gpu/texture.h"
 #ifdef NGB_NATIVE_CONTRACT_TEST
 #include "gpu/readback.h"
-#include "gpu/shaders.h"
 #include <condition_variable>
 #include <thread>
 #include <chrono>
+#endif
+#if defined(NGB_DIRECT3D) || defined(NGB_NATIVE_CONTRACT_TEST)
+#include "gpu/shaders.h"
 #endif
 #include "gpu/vertex.h"
 #include "kernel/kernel.h"
@@ -55,6 +58,9 @@ extern "C" int ngb_d3d_native_enabled(void) {
 #endif
 using kernel::HostPtr;
 using kernel::R32;
+#ifdef NGB_DIRECT3D
+using kernel::ReadPtr;
+#endif
 using kernel::W32;
 
 namespace {
@@ -89,6 +95,31 @@ uint64_t native_mesh_attempts, native_mesh_batches, native_mesh_draws, native_me
 extern uint32_t native_draws;
 #include "native_simple.inc"
 #endif
+using Groups = gpu::PreparedState;
+inline void MarkDrawState([[maybe_unused]] uint32_t groups) {
+#ifdef NGB_DIRECT3D
+    native_mesh_changed |= groups;
+#endif
+}
+inline void SetDrawWord(uint32_t& slot, uint32_t value, [[maybe_unused]] uint32_t groups) {
+#ifdef NGB_DIRECT3D
+    if (slot == value) return;
+    MarkDrawState(groups);
+#endif
+    slot = value;
+}
+void SetTextureStageWord(unsigned stage, unsigned state, uint32_t value) {
+    SetDrawWord(g_state.tss[stage][state], value, Groups::TextureStage(stage));
+}
+void SetDrawStream(unsigned stream, uint32_t buffer, uint32_t stride) {
+    auto& slot = g_state.streams[stream];
+#ifdef NGB_DIRECT3D
+    if (slot.vb == buffer && slot.stride == stride) return;
+    MarkDrawState(Groups::Streams);
+    if (slot.vb != buffer) MarkDrawState(Groups::HeaderBindings | Groups::HeaderWrite(buffer));
+#endif
+    slot = {buffer, stride};
+}
 // The Switch adapter runs every guest worker as a fiber on one host thread.
 #ifndef NGB_DIRECT3D
 std::recursive_mutex g_lock;
@@ -108,6 +139,54 @@ uint32_t g_new_decl, g_new_func, g_new_out;
 uint32_t g_program[136][4];
 std::shared_ptr<gpu::VertexShader> g_selected;   // SelectVertexShader's program and declaration
 
+struct ProgramSelection {
+    std::shared_ptr<gpu::VertexShader> declaration, shader;
+};
+// One entry per possible start, plus the empty program selected outside the bank.
+std::array<ProgramSelection, std::size(g_program) + 1> g_program_selections{};
+
+void LoadVertexProgram(uint32_t start, const gpu::VertexShader& source) {
+    if (start >= std::size(g_program)) return;
+    const size_t count = std::min(source.program.size() / 4, std::size(g_program) - start);
+    const size_t bytes = count * sizeof(g_program[0]);
+    if (!count || !std::memcmp(g_program[start], source.program.data(), bytes)) return;
+    std::memcpy(g_program[start], source.program.data(), bytes);
+    // An entry can start before this load and end inside it. Queued batches
+    // still own the old shader, even when the replacement moves its end marker.
+    for (size_t i = 0; i < start + count; ++i) {
+        auto& entry = g_program_selections[i];
+        if (entry.shader && i + entry.shader->program.size() / 4 > start) entry = {};
+    }
+}
+
+const std::shared_ptr<gpu::VertexShader>& SelectVertexProgram(uint32_t handle, uint32_t address) {
+    const size_t start = std::min<size_t>(address, std::size(g_program));
+    auto& entry = g_program_selections[start];
+    auto it = g_vs.find(handle);
+    auto* declaration = it == g_vs.end() ? nullptr : it->second.get();
+    if (entry.shader && entry.shader->handle == handle && entry.declaration.get() == declaration)
+        return entry.shader;
+
+    auto shader = std::make_shared<gpu::VertexShader>();
+    shader->handle = handle;
+    shader->program_type = 0x2078;
+    if (declaration) {
+        shader->decl = declaration->decl;
+        shader->inputs = declaration->inputs;
+        shader->stream_stride = declaration->stream_stride;
+    }
+    size_t end = start;
+    while (end < std::size(g_program)) {
+        if (g_program[end++][3] & 1) break;
+    }
+    if (end > start) {
+        shader->program.resize((end - start) * 4);
+        std::memcpy(shader->program.data(), g_program[start], (end - start) * sizeof(g_program[0]));
+    }
+    entry = {it == g_vs.end() ? nullptr : it->second, std::move(shader)};
+    return entry.shader;
+}
+
 void ViewportConstants(std::array<float, 4>& scale, std::array<float, 4>& offset) {
     auto& v = g_state.viewport;
     float hw = v.w * 0.5f, hh = v.h * 0.5f;
@@ -116,38 +195,80 @@ void ViewportConstants(std::array<float, 4>& scale, std::array<float, 4>& offset
 }
 
 #ifdef NGB_DIRECT3D
-// The title can write constants inline. Compare the live register file once
-// and carry the changed blocks through to the recorder. Registers 58 and 59
-// are produced by the viewport, even if guest memory contains other values.
+// Fixed-function vertices use the transform and lighting state. Points and
+// instanced quads supply their own constants in the Vulkan backend. Keep the
+// effective viewport registers for diagnostics, then read the live guest bank
+// when a programmable draw (or a shader extension) can actually consume it.
 void SyncDrawConstants() {
+    const bool full = (g_state.vs_handle & 1) || gpu::g_shader_hooks || !ngb_d3d_native_enabled();
+    constexpr uint32_t viewport_inputs = Groups::PixelConstantsAndTargets | Groups::LightsAndOffset | Groups::DepthScale;
+    if (!full && g_state.constants_revision && !(native_mesh_changed & viewport_inputs)) return;
+    NativeDiagScope diag(ND_DEFERRED);
     constexpr unsigned block = gpu::State::constant_block_bytes;
-    constexpr unsigned n = sizeof(g_state.vsc) / block;
-    static_assert(block == 8 * sizeof(g_state.vsc[0]) && n < 32 && sizeof(g_state.vsc) % block == 0);
+    static_assert(block == 8 * sizeof(g_state.vsc[0]) && sizeof(g_state.vsc) == 24 * block);
+    std::array<std::array<float, 4>, 2> viewport;
+    ViewportConstants(viewport[0], viewport[1]);
     auto* dst = reinterpret_cast<uint8_t*>(g_state.vsc.data());
-    const auto* src = static_cast<const uint8_t*>(HostPtr(kVsConstants));
-    static_assert(n == 24);
-    // The viewport occupies two registers in block 7. Compare its effective
-    // values even when the underlying guest register bank has not changed.
-    std::array<std::array<float, 4>, 8> patched;
-    std::memcpy(patched.data(), src + 7 * block, block);
-    ViewportConstants(patched[58 % 8], patched[59 % 8]);
-    uint32_t changes = gpu::SyncConstantRange<0, 7, block>(dst, src);
-    if (std::memcmp(dst + 7 * block, patched.data(), block)) {
-        std::memcpy(dst + 7 * block, patched.data(), block);
-        changes |= 1u << 7;
+    uint32_t changes = 0;
+    if (full) {
+        const auto* src = static_cast<const uint8_t*>(HostPtr(kVsConstants, sizeof(g_state.vsc)));
+        changes = gpu::SyncConstantRange<0, 7, block>(dst, src);
+        std::array<std::array<float, 4>, 8> patched;
+        std::memcpy(patched.data(), src + 7 * block, block);
+        patched[2] = viewport[0];
+        patched[3] = viewport[1];
+        if (std::memcmp(dst + 7 * block, patched.data(), block)) {
+            std::memcpy(dst + 7 * block, patched.data(), block);
+            changes |= 1u << 7;
+        }
+        changes |= gpu::SyncConstantRange<8, 8, block>(dst, src);
+        changes |= gpu::SyncConstantRange<16, 8, block>(dst, src);
+    } else if (std::memcmp(&g_state.vsc[58], viewport.data(), sizeof(viewport))) {
+        std::memcpy(&g_state.vsc[58], viewport.data(), sizeof(viewport));
+        changes = 1u << 7;
     }
-    changes |= gpu::SyncConstantRange<8, 8, block>(dst, src);
-    changes |= gpu::SyncConstantRange<16, 8, block>(dst, src);
-    g_state.changed_constant_blocks = changes;
-    ++g_state.constants_revision;
+    if (changes || !g_state.constants_revision) {
+        g_state.changed_constant_blocks = changes;
+        ++g_state.constants_revision;
+    }
+}
+
+// Inlined guest stores bypass the API. Compare the authoritative bank in
+// contiguous groups, and only write the mirror and publish a delta on change.
+static bool SyncBank(void* mirror, const void* guest, size_t bytes) {
+    if (!std::memcmp(mirror, guest, bytes)) return false;
+    std::memcpy(mirror, guest, bytes);
+    return true;
 }
 #endif
 
 void SyncDeferred() {
     NativeDiagScope diag(ND_DEFERRED);
 #ifdef NGB_DIRECT3D
-    native_mesh_changed = ~0u;
-#endif
+    // Bindings can stay the same while guest code edits a resource header.
+    // Re-read the live headers at each boundary with untracked guest code.
+    native_mesh_changed |= Groups::ResourceHeaders;
+    const auto* rs = static_cast<const uint32_t*>(HostPtr(kRenderState, gpu::kRsMax * 4));
+    if (SyncBank(g_state.rs.data() + gpu::kRsDeferredFirst, rs + gpu::kRsDeferredFirst,
+                 (gpu::kRsMax - gpu::kRsDeferredFirst) * 4)) native_mesh_changed |= Groups::RenderStates;
+    NativeSyncSimple();
+    const auto* ts = static_cast<const uint32_t*>(HostPtr(kTextureState, 4 * 32 * 4));
+    for (unsigned stage = 0; stage < 4; ++stage) {
+        if (SyncBank(g_state.tss[stage].data(), ts + stage * 32, gpu::kTssBumpEnvMat00 * 4))
+            native_mesh_changed |= Groups::TextureStage(stage);
+    }
+    uint32_t dev = R32(kDevicePtr);
+    if (!dev) return;
+    const auto* bank = static_cast<const uint8_t*>(HostPtr(dev + 0xc60, 0xfa8 - 0xc60));
+    if (ngb_d3d_native_enabled()) {
+        if (SyncBank(g_state.textures.data(), bank + (0xf88 - 0xc60), 16)) native_mesh_changed |= Groups::TexturesAndPalettes;
+        if (SyncBank(g_state.palettes.data(), bank + (0xf98 - 0xc60), 16)) native_mesh_changed |= Groups::TexturesAndPalettes;
+    }
+    if (SyncBank(g_state.transforms.data() + 2, bank, 2 * 64)) native_mesh_changed |= Groups::ViewMatrices;
+    if (SyncBank(g_state.transforms.data() + 16, bank + 2 * 64, 4 * 64)) native_mesh_changed |= Groups::TextureMatrices;
+    if (SyncBank(g_state.transforms.data() + 256, bank + 6 * 64, 4 * 64)) native_mesh_changed |= Groups::WorldMatrices;
+    if (SyncBank(g_state.material.data(), bank + (0xf00 - 0xc60), 17 * 4)) native_mesh_changed |= Groups::Material;
+#else
     // deferred states live in the title's memory, which the inline SetRenderState and
     // SetTextureStageState write; so do the vertex shader constants
     // deferred and complex alike: the XDK keeps every one in D3D__RenderState, and inlined code
@@ -157,9 +278,6 @@ void SyncDeferred() {
                 (gpu::kRsMax - gpu::kRsDeferredFirst) * 4);
     // the simple states too, as SetRenderState keeps them (the device's defaults were set before
     // the hooks saw anything); not the pixel shader's, which SetPixelShader loads from its definition
-#ifdef NGB_DIRECT3D
-    NativeSyncSimple();
-#else
     const auto* methods = static_cast<const uint32_t*>(HostPtr(kSimpleEncode));
     const auto* states = static_cast<const uint32_t*>(HostPtr(kRenderState));
     for (uint32_t i = 0; i < gpu::kRsDeferredFirst; i++) {
@@ -167,33 +285,47 @@ void SyncDeferred() {
         if ((method >= 0x300 && method < 0x400) || method == 0x1D78)
             g_state.simple[method >> 2] = states[i];
     }
-#endif
     for (int s = 0; s < 4; s++)
         std::memcpy(g_state.tss[s].data(), HostPtr(kTextureState + s * 32 * 4), gpu::kTssBumpEnvMat00 * 4);
-#ifdef NGB_DIRECT3D
-    SyncDrawConstants();
-#else
     std::memcpy(g_state.vsc.data(), HostPtr(kVsConstants), sizeof(g_state.vsc));
-#endif
     // fixed function: the transforms (view, projection, texture 0-3, world 0-3 at +0xC60) and the
     // material (+0xF00) are written into the device by inlined code
     uint32_t dev = R32(kDevicePtr);
     if (dev) {
-#ifdef NGB_DIRECT3D
-        if (ngb_d3d_native_enabled()) {
-            // NGB inlines palette unbinding in its own code. The device fields
-            // and Common reference bits are authoritative on both sides.
-            std::memcpy(g_state.textures.data(), HostPtr(dev + 0xf88), 16);
-            std::memcpy(g_state.palettes.data(), HostPtr(dev + 0xf98), 16);
-        }
-#endif
         for (uint32_t t = 0; t < 10; t++) {
             uint32_t pc = t < 2 ? t + 2 : t < 6 ? t + 14 : t + 250;
             std::memcpy(g_state.transforms[pc].data(), HostPtr(dev + 0xC60 + t * 64), 64);
         }
         std::memcpy(g_state.material.data(), HostPtr(dev + 0xF00), 17 * 4);
     }
+#endif
 }
+
+#ifdef NGB_DIRECT3D
+// Only native producers that account for every intervening guest write may
+// reuse this state. Guest calls, scheduler hand-offs and inline FIFO writes
+// invalidate it before the next draw.
+void SyncOwnedState(uint32_t address) {
+    if (!native_mesh_coherent) {
+        SyncDeferred();
+        native_mesh_coherent = true;
+    }
+    static const bool verify = std::getenv("NGB_NATIVE_MESH_VERIFY") != nullptr;
+    if (verify) {
+        gpu::State saved = g_state;
+        uint32_t changes = native_mesh_changed;
+        SyncDeferred();
+        if (saved.simple != g_state.simple || saved.rs != g_state.rs || saved.tss != g_state.tss ||
+            saved.textures != g_state.textures || saved.palettes != g_state.palettes ||
+            std::memcmp(saved.transforms.data(), g_state.transforms.data(), sizeof(saved.transforms)) ||
+            std::memcmp(saved.vsc.data(), g_state.vsc.data(), sizeof(saved.vsc)) ||
+            std::memcmp(saved.material.data(), g_state.material.data(), sizeof(saved.material)))
+            ngb_stop("native draw state differs from guest state", address);
+        g_state = std::move(saved);
+        native_mesh_changed = changes;
+    }
+}
+#endif
 
 gpu::Surface SurfaceOf(uint32_t header) {
     gpu::Surface s;
@@ -260,17 +392,20 @@ static gpu::CombatEffect CombatEffectUP(Call c) {
 #endif
 
 void Draw(uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices, bool prepared = false,
-          gpu::CombatEffect effect = gpu::CombatEffect::None) {
+          gpu::CombatEffect effect = gpu::CombatEffect::None, const std::shared_ptr<const gpu::IndexSnapshot>& snapshot = {}) {
 #ifdef NGB_DIRECT3D
     if (!g_backend) return;
     bool measure = ngb_direct_detail_frame != 0;
     uint64_t start_ns = measure ? ngb_elapsed_ns() : 0;
 #endif
     if (!prepared) SyncDeferred();
+#ifdef NGB_DIRECT3D
+    SyncDrawConstants();
+#endif
     static bool nolight = std::getenv("NGB_D3D_NOLIGHT") != nullptr;   // debugging
-    if (nolight) g_state.rs[gpu::kRsLighting] = 0;
+    if (nolight) SetDrawWord(g_state.rs[gpu::kRsLighting], 0, Groups::RenderStates);
     static bool nofog = std::getenv("NGB_D3D_NOFOG") != nullptr;       // debugging
-    if (nofog) g_state.rs[gpu::kRsFogEnable] = 0;
+    if (nofog) SetDrawWord(g_state.rs[gpu::kRsFogEnable], 0, Groups::RenderStates);
     static int fogn = std::getenv("NGB_D3D_FOGLOG") ? 1 : 0;
     static uint32_t fog_last[5];
     uint32_t fog_now[5] = { g_state.rs[gpu::kRsFogEnable], g_state.rs[gpu::kRsFogStart], g_state.rs[gpu::kRsFogEnd],
@@ -293,9 +428,10 @@ void Draw(uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices,
     if (g_backend) {
         NativeDiagScope diag(ND_RECORD);
 #ifdef NGB_DIRECT3D
-        if (prepared) {
-            g_backend->DrawPrepared(g_state, prim, start, count, indices,
-                                    {++native_mesh_revision, native_mesh_changed}, effect);
+        if (prepared || ngb_d3d_native_enabled()) {
+            gpu::PreparedState changes{++native_mesh_revision, native_mesh_changed};
+            if (snapshot) g_backend->DrawSnapshot(g_state, prim, start, snapshot, changes, effect);
+            else g_backend->DrawPrepared(g_state, prim, start, count, indices, changes, effect);
             native_mesh_changed = 0;
         } else
 #endif
@@ -309,16 +445,8 @@ void Draw(uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices,
 
 // A pushed index list (RunPushBuffer): BEGIN (0x17FC) with the primitive, then 16-bit index
 // pairs (0x1800) or 32-bit indices (0x1808), END (BEGIN 0). Anything else is reported once.
-void RunPushBuffer(uint32_t pb, bool prepared = false, gpu::CombatEffect effect = gpu::CombatEffect::None) {
-    uint32_t data = R32(pb + 4) | 0x80000000u, size = R32(pb + 0xC);
-#ifdef NGB_DIRECT3D
-    if (ngb_d3d_native_enabled()) {
-        // XDK RunPushBuffer reserves the last word for its return jump. The
-        // unpatched value in that slot is not part of the recorded commands.
-        if (size < 4 || (size & 3)) ngb_stop("invalid native push buffer size", pb);
-        size -= 4;
-    }
-#endif
+template<class Emit>
+void DecodePushBuffer(uint32_t pb, uint32_t data, uint32_t size, Emit emit) {
     std::vector<uint16_t> idx;
     uint32_t prim = 0;
     for (uint32_t o = 0; o + 4 <= size;) {
@@ -348,7 +476,7 @@ void RunPushBuffer(uint32_t pb, bool prepared = false, gpu::CombatEffect effect 
                 prim = v[0];
                 idx.clear();
             } else if (prim) {
-                Draw(prim, 0, uint32_t(idx.size()), reinterpret_cast<const uint8_t*>(idx.data()), prepared, effect);
+                emit(prim, idx);
                 prim = 0;
             }
         } else if (method == 0x1800) {
@@ -374,7 +502,69 @@ void RunPushBuffer(uint32_t pb, bool prepared = false, gpu::CombatEffect effect 
         o += 4 + 4 * count;
     }
     // a buffer that ends without END still draws what it began
-    if (prim && !idx.empty()) Draw(prim, 0, uint32_t(idx.size()), reinterpret_cast<const uint8_t*>(idx.data()), prepared, effect);
+    if (prim && !idx.empty()) emit(prim, idx);
+}
+
+#ifdef NGB_DIRECT3D
+struct DecodedPush {
+    struct Part { uint32_t prim; std::shared_ptr<const gpu::IndexSnapshot> indices; };
+    std::vector<uint8_t> commands;
+    std::vector<Part> parts;
+};
+
+// The title alternates between many live meshes. Keep several addresses per
+// bucket so drawing one mesh does not evict another on every frame.
+static std::shared_ptr<const DecodedPush>& PushCacheSlot(uint32_t address) {
+    struct Slot { uint32_t address{}; uint64_t use{}; std::shared_ptr<const DecodedPush> mesh; };
+    static std::array<std::array<Slot, 4>, 32> cache;
+    static uint64_t sequence;
+    auto& bucket = cache[(address * 0x9e3779b1u) >> 27];
+    auto* slot = &bucket.front();
+    for (auto& entry : bucket) {
+        if (entry.address == address) { slot = &entry; break; }
+        if (entry.use < slot->use) slot = &entry;
+    }
+    if (slot->address != address) {
+        slot->mesh.reset();
+        slot->address = address;
+    }
+    slot->use = ++sequence;
+    return slot->mesh;
+}
+#endif
+
+void RunPushBuffer(uint32_t pb, bool prepared = false, gpu::CombatEffect effect = gpu::CombatEffect::None) {
+    uint32_t data = R32(pb + 4) | 0x80000000u, size = R32(pb + 0xC);
+#ifdef NGB_DIRECT3D
+    if (ngb_d3d_native_enabled()) {
+        // The last word is the XDK's return jump, not part of the mesh.
+        if (size < 4 || (size & 3)) ngb_stop("invalid native push buffer size", pb);
+        size -= 4;
+        if (!size) return;
+        // Bound retained memory. Larger or highly fragmented buffers still use
+        // the same decoder. Guest code can edit a packet without calling Lock.
+        if (size <= 64 * 1024) {
+            auto& entry = PushCacheSlot(data);
+            const auto* words = static_cast<const uint8_t*>(HostPtr(data, size));
+            auto mesh = entry;
+            if (!mesh || mesh->commands.size() != size || std::memcmp(mesh->commands.data(), words, size)) {
+                auto result = std::make_shared<DecodedPush>();
+                result->commands.assign(words, words + size);
+                DecodePushBuffer(pb, data, size, [&](uint32_t prim, std::vector<uint16_t>& idx) {
+                    result->parts.push_back({prim, std::make_shared<gpu::IndexSnapshot>(std::move(idx))});
+                });
+                mesh = result;
+                if (result->parts.size() <= 64) entry = mesh;
+            }
+            for (const auto& part : mesh->parts)
+                Draw(part.prim, 0, part.indices->count(), part.indices->data(), prepared, effect, part.indices);
+            return;
+        }
+    }
+#endif
+    DecodePushBuffer(pb, data, size, [&](uint32_t prim, const std::vector<uint16_t>& idx) {
+        Draw(prim, 0, uint32_t(idx.size()), reinterpret_cast<const uint8_t*>(idx.data()), prepared, effect);
+    });
 }
 
 // The hooked functions Before does nothing for, found at their first call: those skip g_lock. Taken and
@@ -382,7 +572,7 @@ void RunPushBuffer(uint32_t pb, bool prepared = false, gpu::CombatEffect effect 
 std::atomic<bool> g_before_idle[D3DF_COUNT];
 
 // before the call: false to let the recompiled body run (always, mirroring)
-bool Before(int fn, Call c) {
+bool Before(int fn, Call c, bool prepared_line = false) {
     if (unsigned(fn) < D3DF_COUNT && g_before_idle[fn].load(std::memory_order_relaxed)) return false;
 #ifndef NGB_DIRECT3D
     std::lock_guard<std::recursive_mutex> lock(g_lock);
@@ -423,9 +613,10 @@ bool Before(int fn, Call c) {
     switch (fn) {
     // render states
     case D3DF_D3DDevice_SetRenderState_Simple:
+        MarkDrawState(Groups::SimpleMethod(c.r[ECX]));
         g_state.simple[(c.r[ECX] & 0x1FFC) >> 2] = c.r[EDX];
         break;
-#define COMPLEX(name, index) case D3DF_D3DDevice_SetRenderState_##name: g_state.rs[index] = c.a(0); break;
+#define COMPLEX(name, index) case D3DF_D3DDevice_SetRenderState_##name: SetDrawWord(g_state.rs[index], c.a(0), Groups::RenderStates); break;
     COMPLEX(PSTextureModes, gpu::kRsPsTextureModes)
     COMPLEX(VertexBlend, gpu::kRsVertexBlend)
     COMPLEX(FogColor, gpu::kRsFogColor)
@@ -460,20 +651,20 @@ bool Before(int fn, Call c) {
     // texture stage states: (stage eax, type edx, value ecx), BumpEnv (stage eax; type, value),
     // TexCoordIndex (stage esi; value), BorderColor and ColorKeyColor (stage eax, value ebx)
     case D3DF_D3DDevice_SetTextureStageStateNotInline:
-        if (c.r[EDX] < gpu::kTssCount) g_state.tss[c.r[EAX] & 3][c.r[EDX]] = c.r[ECX];
+        if (c.r[EDX] < gpu::kTssCount) SetTextureStageWord(c.r[EAX] & 3, c.r[EDX], c.r[ECX]);
         break;
     case D3DF_D3DDevice_SetTextureState_BumpEnv:
         if (c.a(0) >= gpu::kTssBumpEnvMat00 && c.a(0) <= gpu::kTssBumpEnvLOffset)
-            g_state.tss[c.r[EAX] & 3][c.a(0)] = c.a(1);
+            SetTextureStageWord(c.r[EAX] & 3, c.a(0), c.a(1));
         break;
     case D3DF_D3DDevice_SetTextureState_TexCoordIndex:
-        g_state.tss[c.r[ESI] & 3][gpu::kTssTexCoordIndex] = c.a(0);
+        SetTextureStageWord(c.r[ESI] & 3, gpu::kTssTexCoordIndex, c.a(0));
         break;
     case D3DF_D3DDevice_SetTextureState_BorderColor:
-        g_state.tss[c.r[EAX] & 3][gpu::kTssBorderColor] = c.r[EBX];
+        SetTextureStageWord(c.r[EAX] & 3, gpu::kTssBorderColor, c.r[EBX]);
         break;
     case D3DF_D3DDevice_SetTextureState_ColorKeyColor:
-        g_state.tss[c.r[EAX] & 3][gpu::kTssColorKeyColor] = c.r[EBX];
+        SetTextureStageWord(c.r[EAX] & 3, gpu::kTssColorKeyColor, c.r[EBX]);
         break;
 
     // fixed function: SetTransform (type eax, matrix edx), SetLight (index, light), LightEnable
@@ -483,6 +674,10 @@ bool Before(int fn, Call c) {
         if (t < 10) {
             uint32_t pc = t < 2 ? t + 2 : t < 6 ? t + 14 : t + 250;
             std::memcpy(g_state.transforms[pc].data(), HostPtr(c.r[EDX]), 64);
+#ifdef NGB_DIRECT3D
+            native_mesh_changed |= t < 2 ? gpu::PreparedState::ViewMatrices : t < 6 ? gpu::PreparedState::TextureMatrices
+                                                                                   : gpu::PreparedState::WorldMatrices;
+#endif
         }
         break;
     }
@@ -498,6 +693,7 @@ bool Before(int fn, Call c) {
         }
         break;
     case D3DF_D3DDevice_LightEnable:
+        MarkDrawState(Groups::LightsAndOffset);
         if (c.r[EAX] < 8)
             g_state.light_enable = c.a(0) ? g_state.light_enable | 1u << c.r[EAX] : g_state.light_enable & ~(1u << c.r[EAX]);
         break;
@@ -505,13 +701,13 @@ bool Before(int fn, Call c) {
     // resources: SetTexture (stage eax; texture), SetPalette (stage eax; palette), SetStreamSource
     // (stream eax, buffer ebx; stride)
     case D3DF_D3DDevice_SetTexture:
-        g_state.textures[c.r[EAX] & 3] = c.a(0);
+        SetDrawWord(g_state.textures[c.r[EAX] & 3], c.a(0), Groups::TexturesAndPalettes | Groups::HeaderBindings | Groups::HeaderWrite(c.a(0)));
         break;
     case D3DF_D3DDevice_SetPalette:
-        g_state.palettes[c.r[EAX] & 3] = c.a(0);
+        SetDrawWord(g_state.palettes[c.r[EAX] & 3], c.a(0), Groups::TexturesAndPalettes | Groups::HeaderBindings | Groups::HeaderWrite(c.a(0)));
         break;
     case D3DF_D3DDevice_SetStreamSource:
-        g_state.streams[c.r[EAX] & 15] = {c.r[EBX], c.a(0)};
+        SetDrawStream(c.r[EAX] & 15, c.r[EBX], c.a(0));
         break;
 
     // shaders
@@ -526,6 +722,7 @@ bool Before(int fn, Call c) {
         break;
     case D3DF_D3DDevice_SetVertexShader: {
         uint32_t h = c.a(0);
+        MarkDrawState(Groups::Vertex);
         g_state.vs_handle = h;
         g_state.vs = nullptr;
         if (h & 1) {
@@ -536,30 +733,15 @@ bool Before(int fn, Call c) {
     }
     case D3DF_D3DDevice_LoadVertexShader: {          // (handle eax; address): its program into memory
         auto it = g_vs.find(c.r[EAX]);
-        uint32_t at = c.a(0);
-        if (it != g_vs.end())
-            for (size_t i = 0; i < it->second->program.size() / 4 && at + i < 136; i++)
-                std::memcpy(g_program[at + i], &it->second->program[i * 4], 16);
+        if (it != g_vs.end()) LoadVertexProgram(c.a(0), *it->second);
         break;
     }
     case D3DF_D3DDevice_SelectVertexShader: {        // (handle eax, address ebx): run from there
-        uint32_t h = c.r[EAX], at = c.r[EBX];
-        auto vs = std::make_shared<gpu::VertexShader>();
-        auto it = g_vs.find(h);
-        if (it != g_vs.end()) {
-            vs->decl = it->second->decl;
-            vs->inputs = it->second->inputs;
-            vs->stream_stride = it->second->stream_stride;
-        }
-        vs->program_type = 0x2078;
-        for (uint32_t i = at; i < 136; i++) {
-            vs->program.insert(vs->program.end(), g_program[i], g_program[i] + 4);
-            if (g_program[i][3] & 1) break;          // the final instruction
-        }
-        vs->handle = h;
-        g_selected = vs;
+        uint32_t h = c.r[EAX];
+        g_selected = SelectVertexProgram(h, c.r[EBX]);
+        MarkDrawState(Groups::Vertex);
         g_state.vs_handle = h | 1;
-        g_state.vs = vs;
+        g_state.vs = g_selected;
         break;
     }
     case D3DF_D3DDevice_SetPixelShader: {
@@ -576,6 +758,7 @@ bool Before(int fn, Call c) {
             std::memcpy(ps->def, def, sizeof(ps->def));
             ps->handle = h;
         }
+        MarkDrawState(Groups::PixelCombiners | Groups::RenderStates);
         g_state.ps = ps;
         const uint32_t* d = ps->def;
         auto put = [&](uint32_t method, uint32_t v) { g_state.simple[method >> 2] = v; };
@@ -601,12 +784,14 @@ bool Before(int fn, Call c) {
     case D3DF_D3DDevice_SetPixelShaderConstant: {    // (register ecx; source; count eax)
         uint32_t reg = c.r[ECX], src = c.a(0), n = c.r[EAX];
         for (uint32_t i = 0; i < n && reg + i < 16; i++) std::memcpy(g_state.psc[reg + i].data(), HostPtr(src + i * 16), 16);
+        MarkDrawState(Groups::PixelConstantsAndTargets | Groups::PixelCombiners);
         gpu::ApplyPixelConstants(g_state, reg, n);
         break;
     }
 
     // targets and the viewport
     case D3DF_D3DDevice_SetRenderTarget: {
+        MarkDrawState(Groups::PixelConstantsAndTargets | Groups::DepthScale | Groups::ResourceHeaders);
         if (c.a(0)) g_state.rt = SurfaceOf(c.a(0));
         g_state.zs = SurfaceOf(c.a(1));
         uint32_t w, h;
@@ -627,6 +812,7 @@ bool Before(int fn, Call c) {
         break;
     }
     case D3DF_D3DDevice_SetViewport: {
+        MarkDrawState(Groups::PixelConstantsAndTargets);
         uint32_t v = c.a(0);
         float mn, mx;
         std::memcpy(&mn, HostPtr(v + 16), 4);
@@ -651,10 +837,12 @@ bool Before(int fn, Call c) {
         break;
     }
     case D3DF_D3DDevice_SetScissors:
+        MarkDrawState(Groups::PixelConstantsAndTargets);
         g_state.scissor_count = std::min<uint32_t>(c.a(0), 8);
         for (uint32_t i = 0; i < g_state.scissor_count * 4; i++) g_state.scissors[i] = R32(c.a(2) + i * 4);
         break;
     case D3DF_D3DDevice_SetScreenSpaceOffset:
+        MarkDrawState(Groups::LightsAndOffset);
         g_state.ss_offset_x = c.af(0);
         g_state.ss_offset_y = c.af(1);
         static const bool sslog = std::getenv("NGB_D3D_SSLOG") != nullptr;
@@ -678,13 +866,18 @@ bool Before(int fn, Call c) {
         if (!guest_header) guest_header = xbox_HeapAlloc(20, 16);
         W32(guest_header, 0x80000001u);
         W32(guest_header + 4, data);
-        g_state.streams[0] = {guest_header, stride};
+        SetDrawStream(0, guest_header, stride);
         gpu::CombatEffect effect = gpu::CombatEffect::None;
 #ifdef NGB_DIRECT3D
         effect = CombatEffectUP(c);
+        if (prepared_line) {
+            SyncOwnedState(data);
+            // The temporary header keeps its address when the vertex data changes.
+            MarkDrawState(Groups::HeaderWrite(guest_header));
+        }
 #endif
-        Draw(prim, 0, count, nullptr, false, effect);
-        g_state.streams[0] = saved;
+        Draw(prim, 0, count, nullptr, prepared_line, effect);
+        SetDrawStream(0, saved.vb, saved.stride);
         break;
     }
     case D3DF_D3DDevice_DrawIndexedVertices: {
@@ -789,6 +982,7 @@ void After(int fn, Call c) {
         // the swap turns the back buffer's surface to the other buffer's memory: the frame's first
         // clear (made before any SetRenderTarget) goes there, not into the picture just shown -- the
         // picture a cut's cross-fade copies at the next frame
+        MarkDrawState(Groups::PixelConstantsAndTargets | Groups::ResourceHeaders);
         if (g_state.rt.header) g_state.rt = SurfaceOf(g_state.rt.header);
         break;
     default:
@@ -1039,8 +1233,48 @@ extern "C" void d3d_hle_after(int fn, const uint32_t regs[8]) {
 }
 
 #ifdef NGB_DIRECT3D
+// With no pending inline commands and an existing slot this XDK call only
+// touches ordinary device memory. It cannot call back into the guest.
+static bool NativeLightTableReady() {
+    return native_push && !native_flushing && R32(kNativeDevice) == native_read;
+}
+
+extern "C" int ngb_d3d_set_light_ready(uint32_t stack) {
+    if (!NativeLightTableReady()) return 0;
+    uint32_t index = R32(stack + 4);
+    if (index >= R32(kNativeDevice + 0x7a8)) return 0;
+    NativeDiagScope diag(ND_STATE);
+    ++native_calls[D3DF_D3DDevice_SetLight];
+    NativeSetLightAt(native_lights + index * 0x90, R32(stack + 8));
+    return 1;
+}
+
+extern "C" int ngb_d3d_light_enable_ready(uint32_t index, uint32_t stack) {
+    if (!NativeLightTableReady() || index >= R32(kNativeDevice + 0x7a8)) return 0;
+    NativeDiagScope diag(ND_OTHER);
+    ++native_calls[D3DF_D3DDevice_LightEnable];
+    NativeLightEnableAt(index, native_lights + index * 0x90, R32(stack + 4) != 0);
+    return 1;
+}
+
+// LightEnable(false) initializes a missing light, sets a guest-visible dirty
+// bit and releases an assigned hardware slot. Test all three before eliding it.
+extern "C" int ngb_d3d_lights_already_disabled(unsigned first) {
+    if (first >= 8 || !NativeLightTableReady() || R32(kNativeDevice + 0x7a8) < 8) return 0;
+    unsigned count = 8 - first;
+    const auto* words = static_cast<const uint32_t*>(ReadPtr(native_lights + first * 0x90, count * 0x90));
+    for (unsigned i = 0; i < count; ++i, words += 0x90 / 4) {
+        if (!words[0] || !(words[0x68 / 4] & 4) || words[0x8c / 4] < 8) return 0;
+    }
+    native_calls[D3DF_D3DDevice_LightEnable] += count;
+    return 1;
+}
+
 extern "C" void ngb_d3d_native_poll(void) {
     if (ngb_d3d_native_enabled()) NativePoll();
+}
+extern "C" void ngb_d3d_prepared_line(uint32_t regs[8]) {
+    NativeCall(D3DF_D3DDevice_DrawVerticesUP, Call{regs}, true);
 }
 extern "C" int d3d_hle_native_address(uint32_t address, uint32_t regs[8]) {
     if (!ngb_d3d_native_enabled()) return 0;
@@ -1092,6 +1326,7 @@ extern "C" void ngb_direct_close(void)
     g_vs.clear();
     g_ps.clear();
     g_selected.reset();
+    g_program_selections.fill({});
     std::memset(g_program, 0, sizeof(g_program));
     guest_header = 0;
     g_started = false;

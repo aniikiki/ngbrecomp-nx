@@ -25,6 +25,11 @@ def compatibility():
     header = 'src/d3d/gpu/shaders.h'
     bounds = 'src/d3d/vk/combat_effects.h'
     compatible = {
+        # 0.57.72 adds distinct pixel keys for vertex-colour lines, black fog and zero-alpha rejection.
+        ('eaf73c90743fe2bacd2945c5cd6ed50a188e78a24a5fa350e98aed30a10ec3e1',
+         'a304703cbf66f9ef9d132d1d0112c65d2e50b572f740dec9958e22ac8eb58528',
+         'aa7b9481b365b1ce1bf3ecf4b38daa288a8c6e715e5c387e313173c55fa08281',
+         '3289cfe9301e18bcb90f06a8bbd90919ee7ef18c0a4836bbf8346b48d02d14cc'),
         ('8ddaebf3c992a429038d4db4db9a58c3328f289f69eb97ea42a45303231617b2',
          '3c2739f5642414f6816e064ff2316ca2f65d04c4c0fcff93357ddf1ef489b2bd',
          'cc59d339e1768bdfdbdf38531f369775089a8f07368e7161c2d29758ad8acea9',
@@ -83,6 +88,31 @@ def compatibility():
          '49e9804d6b13fe67dd11f861317cd1ac5988f6a8970390438fd0093583bb757f'),
         # 0.57.60 selects existing coordinate keys for unread billboard stages.
         ('b844505d4dfba7402440ab2bf559aebff25d90efadf149066d2cabb7de740b44',
+         '69ca18a986ed8d8a622787928941daea8cb2a8c0691b3f2dcc05a5570b1269ec',
+         'dd025add898ec7e28c0ec844cd9ac672dce0849d1d2d2922a0beeb168d2300bb',
+         '49e9804d6b13fe67dd11f861317cd1ac5988f6a8970390438fd0093583bb757f'),
+        # 0.57.67 reuses the same shaders for ordered particle strips and omits unread constants.
+        ('1eaa89e2459dca353ff10497302f70e89988832469f8076f34605e7e73c2db04',
+         '1a6b9b0e985ab076d66d90a98da278834310d9d5aa09a7c6e360d0b605b286fb',
+         'b572384868b12a61d6984eec51f348d946c2496b947024fc1cdd015eea8e8c90',
+         'c9793cec316e6f5eeefbfa4c36289be03a9b21fba30ab953af572c5634d785d9'),
+        # 0.57.65 selects keyed particle inputs and folds full-weight crossfades.
+        ('4f9cc0d143ffd40fcfa6bb726cd0c52fefb344aff657e8a7473be22804d85927',
+         '1a6b9b0e985ab076d66d90a98da278834310d9d5aa09a7c6e360d0b605b286fb',
+         'b572384868b12a61d6984eec51f348d946c2496b947024fc1cdd015eea8e8c90',
+         'c9793cec316e6f5eeefbfa4c36289be03a9b21fba30ab953af572c5634d785d9'),
+        # 0.57.64 adds keyed vertex culling and two alpha-threshold pixel shaders.
+        ('7ce7bcee2cf9fa2e753018f7ebc271111dcaf8cfb3ad02fc04168b1b2d38e075',
+         '36703fcf3413a3682634a4030d5ef950d53290b61c23cf1f45eb81ada1bfc973',
+         'ea664e85b7bd414867b1f22297adb0c35439883119a13278fd5fcb97e9624396',
+         'afc17518c17c0c12ee0bf94c24ebf1c2a5561c2ceb28cf02372831d8b35834b4'),
+        # 0.57.63 adds separate keys for unlit additive materials and their coverage variants.
+        ('0b510d92a82a6ce9c048204f8dbea48969c33746c9c303b175792745aca8778d',
+         '421a6188dbcaa982fab2760ce6775fca1eea0a2a527969d11aecf372aef93fcd',
+         '31cae2d378cd92f3335b5853f38762e7923a07b1667d46b3c730e1820ff31093',
+         'afc17518c17c0c12ee0bf94c24ebf1c2a5561c2ceb28cf02372831d8b35834b4'),
+        # 0.57.61 changes geometry residency and reuses the existing line-list pipeline key.
+        ('bafb14f1512a9e5a255456c1af3557f592939dd916a8f9cd69bcb4a7b044da1c',
          '69ca18a986ed8d8a622787928941daea8cb2a8c0691b3f2dcc05a5570b1269ec',
          'dd025add898ec7e28c0ec844cd9ac672dce0849d1d2d2922a0beeb168d2300bb',
          '49e9804d6b13fe67dd11f861317cd1ac5988f6a8970390438fd0093583bb757f'),

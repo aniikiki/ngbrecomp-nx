@@ -58,6 +58,7 @@ uint32_t NativeHeader(uint32_t bytes) {
     uint32_t args[] = {0x40, bytes};
     uint32_t p = ngb_graphics_guest_call(0x0032cffd, args, 2);
     if (!p) ngb_stop("native graphics header allocation failed", bytes);
+    MarkDrawState(Groups::HeaderWrite(p));
     std::memset(HostPtr(p, bytes), 0, bytes); return p;
 }
 
@@ -114,6 +115,7 @@ void NativeSurfaceDesc(uint32_t header, uint32_t level, uint32_t out) {
 void NativeDestroy(uint32_t resource);
 uint32_t NativeAddRef(uint32_t resource) {
     if (!resource) return 0;
+    MarkDrawState(Groups::HeaderWrite(resource));
     uint32_t common = R32(resource);
     if (!(common & 0xffff) && (common & 0x70000) == 0x50000 && R32(resource + 20))
         NativeAddRef(R32(resource + 20));
@@ -121,6 +123,7 @@ uint32_t NativeAddRef(uint32_t resource) {
 }
 uint32_t NativeRelease(uint32_t resource) {
     if (!resource) return 0;
+    MarkDrawState(Groups::HeaderWrite(resource));
     NativeResourceTrace(resource, 3);
     uint32_t common = R32(resource), refs = common & 0xffff;
     if (!refs) return 0;
@@ -166,6 +169,7 @@ void NativeDestroy(uint32_t resource) {
 
 void NativeBind(uint32_t old_resource, uint32_t resource) {
     if (resource == old_resource) return;
+    MarkDrawState(Groups::HeaderWrite(old_resource) | Groups::HeaderWrite(resource));
     if (resource) {
         NativeResourceTrace(resource, 1);
         uint32_t common = R32(resource);
@@ -232,6 +236,7 @@ void NativeDefaults() {
 
 void NativeCreate(uint32_t params, uint32_t out) {
     native_simple_ready = false;
+    native_mesh_changed = ~0u;
     if (native_push) ngb_stop("duplicate native device creation", params);
     uint32_t width = R32(params), height = R32(params + 4);
     if (!width) width = 640;
@@ -303,42 +308,60 @@ uint32_t NativeLight(uint32_t index) {
     return native_lights + index * 0x90;
 }
 
-void NativeSetLight(uint32_t index, uint32_t source) {
-    uint32_t light = NativeLight(index);
-    std::memcpy(HostPtr(light, 104), HostPtr(source, 104), 104);
-    W32(light + 0x68, R32(light + 0x68) | 3);
+void NativeSetLightAt(uint32_t light, uint32_t source) {
+    auto* words = static_cast<uint32_t*>(HostPtr(light, 0x90));
+    const auto* input = static_cast<const uint8_t*>(HostPtr(source, 104));
+    std::memmove(words, input, 104);
+    words[0x68 / 4] |= 3;
     for (unsigned i = 0; i < 3; ++i) {
-        float value; std::memcpy(&value, HostPtr(source + 64 + i * 4, 4), 4); value = -value;
-        std::memcpy(HostPtr(light + 0x6c + i * 4, 4), &value, 4);
+        uint32_t direction;
+        std::memcpy(&direction, input + 64 + i * 4, sizeof direction);
+        words[0x6c / 4 + i] = direction ^ 0x80000000u;
     }
-    uint32_t slot = R32(light + 0x8c);
-    if (slot < 8) {
-        std::memcpy(g_state.lights[slot].data(), HostPtr(light, 104), 104);
+    uint32_t slot = words[0x8c / 4];
+    if (slot < 8 && std::memcmp(g_state.lights[slot].data(), words, 104)) {
+        std::memcpy(g_state.lights[slot].data(), words, 104);
         ++g_state.lights_revision;
     }
 }
 
-void NativeLightEnable(uint32_t index, bool enabled) {
-    uint32_t light = NativeLight(index), slot = R32(light + 0x8c);
-    if (!R32(light)) {
-        W32(light, 3); for (unsigned i = 1; i <= 3; ++i) W32(light + i * 4, 0x3f800000);
-        W32(light + 72, 0x3f800000); W32(light + 0x6c + 8, 0xbf800000);
+void NativeSetLight(uint32_t index, uint32_t source) {
+    NativeSetLightAt(NativeLight(index), source);
+}
+
+void NativeLightEnableAt(uint32_t index, uint32_t light, bool enabled) {
+    auto* words = static_cast<uint32_t*>(HostPtr(light, 0x90));
+    if (!words[0]) {
+        words[0] = 3;
+        for (unsigned i = 1; i <= 3; ++i) words[i] = 0x3f800000;
+        words[72 / 4] = 0x3f800000;
+        words[(0x6c + 8) / 4] = 0xbf800000;
     }
+    // The title can inspect or clear this dirty bit between two identical calls.
+    words[0x68 / 4] |= 4;
+    uint32_t slot = words[0x8c / 4];
+    if (enabled ? slot != ~0u : slot >= 8) return;
     uint32_t control = R32(kNativeDevice + 0x7cc);
-    if (enabled && slot == ~0u) {
+    if (enabled) {
         for (slot = 0; slot < 8 && ((control >> (slot * 2)) & 3); ++slot) {}
         if (slot == 8) ngb_stop("native light slots exhausted", index);
-        uint32_t type = R32(light);
+        uint32_t type = words[0];
         control |= (type == 3 ? 1 : type + 1) << (slot * 2);
-        W32(light + 0x8c, slot); W32(kNativeDevice + 0x7ac + slot * 4, light);
+        words[0x8c / 4] = slot; W32(kNativeDevice + 0x7ac + slot * 4, light);
+        MarkDrawState(Groups::LightsAndOffset);
         g_state.light_enable |= 1u << slot;
-        std::memcpy(g_state.lights[slot].data(), HostPtr(light, 104), 104);
-    } else if (!enabled && slot < 8) {
+        std::memcpy(g_state.lights[slot].data(), words, 104);
+        ++g_state.lights_revision;
+    } else {
         control &= ~(3u << (slot * 2)); W32(kNativeDevice + 0x7ac + slot * 4, 0);
-        W32(light + 0x8c, ~0u); g_state.light_enable &= ~(1u << slot);
+        MarkDrawState(Groups::LightsAndOffset);
+        words[0x8c / 4] = ~0u; g_state.light_enable &= ~(1u << slot);
     }
-    W32(light + 0x68, R32(light + 0x68) | 4);
-    W32(kNativeDevice + 0x7cc, control); ++g_state.lights_revision;
+    W32(kNativeDevice + 0x7cc, control);
+}
+
+void NativeLightEnable(uint32_t index, bool enabled) {
+    NativeLightEnableAt(index, NativeLight(index), enabled);
 }
 
 void NativeReset(uint32_t params) {
@@ -350,10 +373,12 @@ void NativeReset(uint32_t params) {
     native_front = NativeSurface(width, height, gpu::LinearColorFormat(R32(params + 8)));
     native_depth = R32(params + 32) ? NativeSurface(width, height, gpu::LinearDepthFormat(R32(params + 36))) : 0;
     NativeBind(g_state.rt.header, native_back); NativeBind(g_state.zs.header, native_depth);
+    MarkDrawState(Groups::PixelConstantsAndTargets | Groups::ResourceHeaders);
     g_state.rt = SurfaceOf(native_back); g_state.zs = SurfaceOf(native_depth);
     W32(kNativeDevice + 0x1a04, native_back); W32(kNativeDevice + 0x1a08, native_depth);
     W32(kNativeDevice + 0x1a14, native_back); W32(kNativeDevice + 0x1a18, native_front);
     NativeRelease(old_back); NativeRelease(old_front); NativeRelease(old_depth);
+    MarkDrawState(Groups::PixelConstantsAndTargets);
     g_state.viewport = {0, 0, width, height, 0, 1}; g_state.scissor_count = 0;
     NativeViewport();
 }
@@ -381,6 +406,7 @@ void NativeDestroyDevice() {
     native_pacer = {};
     g_backend.reset(); g_started = false; g_state = gpu::State{};
     g_vs.clear(); g_ps.clear(); g_selected.reset();
+    g_program_selections.fill({});
     W32(kDevicePtr, 0);
 }
 void NativeImmediateEnd() {
@@ -395,10 +421,10 @@ void NativeImmediateEnd() {
         auto saved = g_state.streams[0];
         if (!guest_header) guest_header = NativePool(20);
         W32(guest_header, 0x80000001); W32(guest_header + 4, native_scratch);
-        g_state.streams[0] = {guest_header, stride};
+        SetDrawStream(0, guest_header, stride);
         // Recorded::Draw copies UP vertices before returning; scratch can be reused.
         Draw(native_prim, 0, count, nullptr);
-        g_state.streams[0] = saved;
+        SetDrawStream(0, saved.vb, saved.stride);
     };
     if (!native_inline.empty()) {
         gpu::VertexShader fvf;
@@ -543,7 +569,7 @@ void NativePoll() {
     native_polling = false;
 }
 
-bool NativeCall(int fn, Call c) {
+bool NativeCall(int fn, Call c, bool prepared_line = false) {
 #ifdef NGB_NATIVE_DIAG
     unsigned diag_kind = ND_OTHER;
     if (ngb_native_diag_on) {
@@ -755,6 +781,7 @@ bool NativeCall(int fn, Call c) {
         swap_diag.PresentEnd();
         uint32_t back = R32(native_back + 4), front = R32(native_front + 4);
         W32(native_front + 4, back); W32(native_back + 4, front);
+        MarkDrawState(Groups::PixelConstantsAndTargets | Groups::ResourceHeaders);
         if (g_state.rt.header == native_back) g_state.rt = SurfaceOf(native_back);
         W32(kNativeDevice + 0x2478, ++native_frames);
         W32(kNativeDevice + 0x1dbc + 4, 1);
@@ -780,7 +807,7 @@ bool NativeCall(int fn, Call c) {
     case D3DF_D3DDevice_PersistDisplay: break;
     default: ngb_stop("unimplemented native D3D API", d3d_funcs[fn].va);
     }
-    if (translate) Before(fn, c);
+    if (translate) Before(fn, c, prepared_line);
     if (fn == D3DF_D3DDevice_SetRenderTarget) g_state.scissor_count = 0;
     if (fn == D3DF_D3DDevice_SetViewport || fn == D3DF_D3DDevice_SetRenderTarget || fn == D3DF_D3DDevice_SetScreenSpaceOffset)
         NativeViewport();
@@ -796,6 +823,7 @@ bool NativeHelper(uint32_t address, Call c) {
     uint32_t ret = 0;
     switch (address) {
     case 0x3c6100: // The title also writes these two fields inline.
+        MarkDrawState(Groups::LightsAndOffset);
         std::memcpy(&g_state.ss_offset_x, HostPtr(kNativeDevice + 0xef8, 4), 4);
         std::memcpy(&g_state.ss_offset_y, HostPtr(kNativeDevice + 0xefc, 4), 4);
         g_state.ss_offset_x -= .53125f; g_state.ss_offset_y -= .53125f;

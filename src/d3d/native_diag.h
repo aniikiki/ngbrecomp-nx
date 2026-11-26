@@ -11,7 +11,8 @@ enum NativeDiagKind {
 };
 
 #ifdef NGB_NATIVE_DIAG
-extern bool ngb_native_diag_on, ngb_native_diag_sample;
+extern "C" bool ngb_native_diag_on;
+extern bool ngb_native_diag_sample;
 struct NativeDiagScope {
     NativeDiagScope* previous;
     unsigned kind, worker;

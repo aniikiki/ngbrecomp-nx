@@ -3,10 +3,12 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <utility>
 #include <vector>
 
 #include "gpu/state.h"
 #include "gpu/prepared.h"
+#include "gpu/vertex.h"
 
 namespace gpu {
 
@@ -38,7 +40,19 @@ struct QuickPeek {
     bool fps_lettered = false;     // that picture has the text (not yet: the font not loaded)
 };
 
-struct IndexBounds;
+// Shared by the game thread and queued draws. A new version gets a new ID even
+// when the allocator recycles the same host address.
+struct IndexSnapshot {
+    explicit IndexSnapshot(std::vector<uint16_t> values)
+        : indices(std::move(values)), bounds(IndexRange(data(), count())), id(next_id.fetch_add(1, std::memory_order_relaxed)) {}
+    const uint8_t* data() const { return reinterpret_cast<const uint8_t*>(indices.data()); }
+    uint32_t count() const { return uint32_t(indices.size()); }
+    const std::vector<uint16_t> indices;
+    const IndexBounds bounds;
+    const uint64_t id;
+private:
+    inline static std::atomic<uint64_t> next_id{1};
+};
 
 struct BillboardInstance {
     std::array<float, 16> world;
@@ -112,15 +126,22 @@ public:
         if (consumed) consumed(context);
     }
 
-    // Replay the same ordered four-index strip for each instance. The
+    // Replay the same ordered triangle strip for each instance. The
     // recorder's next state delta is relative to the last instance.
-    virtual void DrawBillboards(State& s, const uint8_t* indices, std::span<const BillboardInstance> instances) {
+    virtual void DrawBillboards(State& s, std::span<const uint8_t> indices, const IndexBounds& bounds,
+                                std::span<const BillboardInstance> instances) {
         for (const auto& instance : instances) {
             instance.Apply(s);
-            Draw(s, 6, 0, 4, indices);
+            Draw(s, 6, 0, uint32_t(indices.size() / sizeof(uint16_t)), indices.data(), &bounds);
         }
     }
 
+#ifdef NGB_DIRECT3D
+    virtual void DrawSnapshot(const State& s, uint32_t prim, uint32_t start,
+                              const std::shared_ptr<const IndexSnapshot>& indices, PreparedState, CombatEffect effect) {
+        Draw(s, prim, start, indices->count(), indices->data(), &indices->bounds, effect);
+    }
+#endif
 private:
     uint32_t fence_ = 0;
 };

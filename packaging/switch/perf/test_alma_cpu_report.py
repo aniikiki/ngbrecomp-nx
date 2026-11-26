@@ -59,6 +59,16 @@ class AttributionTests(unittest.TestCase):
         self.assertEqual(self.symbols.lookup(0x308)[0], "following")
         self.assertEqual(self.symbols.lookup(0x450)[0], "unresolved")
 
+    def test_saved_call_sites_respect_depth_and_symbol_boundaries(self):
+        saved = report["saved_callers"]
+        sample = {"depth": 2, "caller0": 0x308, "caller1": 0x110, "caller2": 0x218}
+        self.assertEqual(saved(sample, self.symbols, 0x500), ("following", "parent"))
+        self.assertEqual(saved({"pc_offset": 0x200, "lr_offset": 0x114}, self.symbols, 0x500), ())
+        self.assertEqual(saved(dict(sample, depth=0), self.symbols, 0x500), ())
+        self.assertEqual(saved(dict(sample, caller0=0x240), self.symbols, 0x500), ("0x240", "parent"))
+        for invalid in (0x111, 0x500, 0xffffffff):
+            self.assertEqual(saved(dict(sample, caller1=invalid), self.symbols, 0x500), ("following",))
+
     def test_host_support_is_not_charged_to_unproven_graphics_parent(self):
         group, _ = report["classify"]("ngb_guest_pointer", "_ZN12_GLOBAL__N_1L6BeforeEi", "LR alone does not establish parent")
         self.assertEqual(group, "runtime, scheduling and host support")

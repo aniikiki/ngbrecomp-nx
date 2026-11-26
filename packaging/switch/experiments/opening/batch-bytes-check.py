@@ -14,7 +14,7 @@ code='#include <vector>\n#include <cstring>\n#include <cstdint>\n#include <cstdl
 int main(){A a; B b;unsigned rng=7267;uint8_t data[512];for(unsigned n=0;n<50000;n++){rng=rng*1664525+1013904223;
 memset(data,rng>>24,sizeof data);size_t sz=(rng>>10)%400+1;
 switch(rng%7){case 0:a.buf.bytes.clear();b.buf.bytes.clear();break;
-case 1:case 2:a.WriteDelta(4,data,sz);b.WriteDelta(4,data,sz);break;
+case 1:case 2:a.WriteDelta(a.sent_,4,data,sz);b.WriteDelta(b.sent_,4,data,sz);break;
 case 3:if(a.buf.bytes.size()>=2){a.strip(18,rng&1,data);b.strip(18,rng&1,data);}break;
 default:if(a.Put(data,sz)!=b.Put(data,sz))abort();}
 auto &x=a.buf.bytes;auto &y=b.buf.bytes;if(x.size()!=y.size()||(x.size()&&memcmp(x.data(),y.data(),x.size()))||memcmp(a.sent_,b.sent_,512))abort();}}

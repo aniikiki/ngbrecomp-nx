@@ -1,4 +1,4 @@
-"""Attribute archived Alma PC/LR snapshots, without inventing missing stack frames.
+"""Attribute archived guest PC samples and the frame records captured with them.
 
 Run with the symbols and NRO archived alongside the recorded build. Optional
 --objdump disassembles the NRO bytes, not a newly linked or host executable.
@@ -103,6 +103,19 @@ class Symbols:
 def guest_address(name):
     match = re.fullmatch(r"(?:ngb_reg_)?(?:sub_|d3d_orig_)([0-9A-F]{8})(?:\.localalias)?", name)
     return match[1] if match else None
+
+
+def saved_callers(sample, symbols, text_size):
+    # The recorder already converted each saved return address to its call site.
+    # PC and live LR are separately sampled registers, not saved frames.
+    chain = []
+    for i in range(min(sample.get("depth", 0), 12)):
+        site = sample.get(f"caller{i}")
+        if site is None or site >= text_size or site % 4:
+            break
+        name = symbols.lookup(site)[0]
+        chain.append(hex(site) if name == "unresolved" else name)
+    return tuple(chain)
 
 
 def short_name(name):
@@ -234,11 +247,15 @@ def report(args):
                                 (*range(r["pc_offset"], r["pc_offset"] + 20, 4),
                                  *range(r["lr_offset"] - 20, r["lr_offset"], 4))]) if args.objdump else {}
     details, groups, paths, evidence_counts = [], Counter(), Counter(), Counter()
+    chains = Counter()
     instruction_overlay = Counter()
     blocks = defaultdict(Counter)
     for sample in accepted:
         pc, lr = sample["pc_offset"], sample["lr_offset"]
         leaf, _, _, extent = symbols.lookup(pc)
+        parents = saved_callers(sample, symbols, text_size)
+        if parents:
+            chains[(leaf, *parents)] += 1
         evidence, caller, target, op = call_evidence(nro, symbols, pc, lr)
         group, path = classify(leaf, caller, evidence)
         instruction = instructions.get(pc, "")
@@ -258,6 +275,7 @@ def report(args):
         groups[group] += 1; paths[group, path] += 1; evidence_counts[evidence] += 1
         blocks[int((seconds(sample) - args.start) // 5)][group] += 1
         details.append({"seconds": seconds(sample), "pc": hex(pc), "lr": hex(lr),
+                        "saved_callers_nearest_first": " | ".join(parents),
                         "pc_symbol": leaf, "symbol_extent": extent, "lr_site_symbol": caller,
                         "lr_site_op": op, "lr_target": hex(target) if target is not None else "",
                         "lr_target_symbol": symbols.lookup(target)[0] if target is not None else "",
@@ -290,6 +308,9 @@ def report(args):
         "samples": len(accepted), "rejected_samples": len(samples) - len(accepted),
         "sample_pause_us": sum(r["pause_cost_us"] for r in accepted),
         "lost": lost, "partial_records": partial, "call_evidence": dict(evidence_counts),
+        "samples_with_saved_callers": sum(chains.values()),
+        "recorded_chains": [{"leaf_and_saved_callers": chain, "samples": n}
+                            for chain, n in chains.most_common()],
         "instruction_overlay_NOT_additive": dict(instruction_overlay),
         "groups": group_rows, "five_second_sample_totals": [sum(blocks[i].values()) for i in range(len(blocks))],
         "clocks": [dict(zip(("cpu_hz", "gpu_hz", "emc_hz", "cpu_rc", "gpu_rc", "emc_rc"), k), count=n)
@@ -299,7 +320,8 @@ def report(args):
         "inputs": {key: {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
                    for key, path in (("log", args.log), ("symbols", args.symbols), ("nro", args.nro))},
         "limitations": [
-            "P rows contain PC/LR, no saved stack. A matching direct call recovers one edge, not a full stack.",
+            "Each chain contains the sampled PC and available frame records, nearest first. "
+            "Older logs have only PC/LR. Tail calls and functions without frame records can be absent.",
             "Internal LR is not evidence of recursion or of the sampled function's caller.",
             "PC snapshots sample elapsed time, including possible off-CPU time; CPU equivalents assume representative sampling.",
             "Five-second counts expose variability; 82 samples do not establish precise per-function milliseconds.",

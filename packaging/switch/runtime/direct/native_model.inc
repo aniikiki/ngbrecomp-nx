@@ -3,10 +3,10 @@
 void ngb_d3d_model_scope(int enter);
 void ngb_d3d_model_world(uint32_t matrix);
 
-static int model_body(int filtered)
+static int model_body(int filtered, int list_owns_state)
 {
     if (g_df) return 0;
-    ngb_d3d_model_scope(1);
+    if (!list_owns_state) ngb_d3d_model_scope(1);
     RECOMP_ENTRY(filtered ? 0x00307A10u : 0x003078B0u);
     uint32_t bp = g_seh_ebp;
     edx = MEM32(esp + 8); esp -= 16;
@@ -44,8 +44,17 @@ static int model_body(int filtered)
         edi = model + 0x94; esi = 0;
         unsigned count = MEM32(model + 8);
         while (esi < count) {
-            if (filtered || esi) mesh_poll();
-            if (!filtered) mesh_poll();
+            // A mesh without override commands has three consecutive polls
+            // (four after the first mesh) around clearing its command slots.
+            // Combine tickets only if none can run guest code.
+            unsigned tickets = esi ? 4u : 3u;
+            int empty_commands = !filtered && !bp && !ebx && !ngb_pending_dpcs &&
+                ngb_poll_mask - (ngb_guest_polls & ngb_poll_mask) >= tickets;
+            if (empty_commands) ngb_guest_polls += tickets;
+            else {
+                if (filtered || esi) mesh_poll();
+                if (!filtered) mesh_poll();
+            }
             MEM32(esp + 0x14) = MEM32(esp + 0x18) = MEM32(esp + 0x1c) = 0;
             if (filtered && MEM8(edi - 3) != MEM8(esp + 0x2c)) {
                 if (bp && MEM32(bp) == esi) bp = MEM32(bp + 16);
@@ -60,11 +69,11 @@ static int model_body(int filtered)
                         MEM32(esp + 0x18) = MEM32(bp + 8);
                     }
                     MEM32(esp + 0x1c) = MEM32(bp + 12); bp = MEM32(bp + 16);
-                } else {
+                } else if (!empty_commands) {
                     if (!filtered) mesh_poll();
                     if (ebx) MEM32(esp + 0x18) = MEM32(edx + 8);
                 }
-                if (!filtered) mesh_poll();
+                if (!filtered && !empty_commands) mesh_poll();
                 uint32_t opacity = MEM32(esp + (filtered ? 0x30 : 0x2c));
                 uint32_t commands = esp + 0x14, material = MEM32(edi);
                 PUSH32(esp, opacity); PUSH32(esp, commands); PUSH32(esp, material);
@@ -89,9 +98,9 @@ static int model_body(int filtered)
     }
     if (!filtered) mesh_poll();
     POP32(esp, esi); POP32(esp, bp); POP32(esp, ebx); esp += 20;
-    ngb_d3d_model_scope(0);
+    if (!list_owns_state) ngb_d3d_model_scope(0);
     return 1;
 }
 
-int ngb_direct_model(void) { return model_body(0); }
-int ngb_direct_model_filtered(void) { return model_body(1); }
+int ngb_direct_model(void) { return model_body(0, 0); }
+int ngb_direct_model_filtered(void) { return model_body(1, 0); }

@@ -39,6 +39,10 @@ if sys.argv[1] == 'guest':
         (out / name).write_text('extern int ngb_d3d_native_entry(unsigned);\n' + src)
     assert len(counts) == 226 and all(n == 1 for n in counts.values()), counts
     (out / 'intercepted.json').write_text(json.dumps(sorted(counts), indent=2) + '\n')
+    from particle_guest import transform as prepare_particles
+    assert 'recomp_func_t recomp_lookup_manual(uint32_t va) { (void)va; return NULL; }' in (runtime / 'runtime.c').read_text()
+    particle_unit = 'recomp_0009.c'
+    (out / particle_unit).write_text(prepare_particles((base / 'gen' / particle_unit).read_text()))
     script = (root / 'packaging/switch/arm-registers/compile.py').read_text().split("f=o/'entry.S'")[0]
     script = script.replace("o=Path(os.environ.get('NGB_REG_OUT',w.parent/'native-regs'))", f'o=Path({str(out)!r})')
     script, n = re.subn(r'^ns=\[[\d,]+\]$', 'ns=list(range(47))', script, flags=re.M)
@@ -48,9 +52,19 @@ if sys.argv[1] == 'guest':
     script = script.replace('register uint16_t *reg_pages asm("x27");', 'register uint32_t *reg_ends asm("x27");')
     script = script.replace('#define ngb_fast_page_bytes reg_pages', '')
     script = script.replace(' sp.run(c,cwd=w,check=True)', " c[-1]=str(o/n);c[1:1]=['-I'+str(w.parent/'gen')]\n sp.run(c,cwd=w,check=True)")
-    script = script.replace('ex.map(build,units)', "ex.map(build,['recomp_0044.c','recomp_0045.c'])")
+    script = script.replace('ex.map(build,units)', "ex.map(build,['recomp_0009.c','recomp_0044.c','recomp_0045.c'])")
     exec(compile(script, 'native-xdk-guest', 'exec'), {})
+    # Use the same shared exit gates as the retained particle object. The two
+    # XDK units below already contain explicit register synchronisation.
+    gate_script = (root / 'packaging/switch/arm-registers/gates.py').read_text()
+    gate_script = gate_script[:gate_script.index('with cf.ThreadPoolExecutor')]
+    gate_script += "\nbuild(Path(" + repr(str(out / (particle_unit + '.s'))) + "))\n"
+    gate_script = gate_script.replace('out=old', 'out=Path(' + repr(str(out)) + ')')
+    exec(compile(gate_script, 'native-particle-gates', 'exec'), {})
+    from particle_guest import audit
+    particle_obj = particle_unit + '.o'
     cc = '/opt/devkitpro/devkitA64/bin/aarch64-none-elf-gcc'
+    audit(full / particle_obj, out / particle_obj, cc.replace('gcc', 'objdump'))
     # The register synchronisation is already in the assembly emitted above.
     # Keeping it explicit needs no changes to the shared exit-gate table.
     for unit in (44, 45):
@@ -87,7 +101,7 @@ elif sys.argv[1] == 'host':
     for i, value in enumerate(link):
         if 'ngb_boot_code.dir/' in value and re.search(r'recomp_\d{4}\.o$', value):
             name = Path(value).stem + '.c.o'
-            link[i] = str(out / name if not control and name in ('recomp_0028.c.o','recomp_0044.c.o','recomp_0045.c.o') else manifest[name])
+            link[i] = str(out / name if not control and name in ('recomp_0009.c.o','recomp_0028.c.o','recomp_0044.c.o','recomp_0045.c.o') else manifest[name])
     link[1:1] = [str(full / 'entry.o'), str(full / 'gates.o'), str(base / 'native-regs/checkpoint.o')]
     prologue_flags = []
     if not control:
@@ -100,6 +114,9 @@ elif sys.argv[1] == 'host':
         from menu_profile import link_button_prompts, link_menu_profile
         link_menu_profile(root, out, link, next(c for c in commands if c[-1].endswith('/runtime_test.c')), host, 'objcopy')
         link_button_prompts(root, out, link, 'objcopy')
+        if diagnostics:
+            from particle_guest import link_profile
+            link_profile(root, out, link, 'cc')
     def compile_source(name, source=None, flags=()):
         if name == 'ohci_boot.c':
             # Some recorded scripts supply Xbox buttons directly.
@@ -142,7 +159,7 @@ elif sys.argv[1] == 'host':
         return str(obj)
     driver = (experiment / 'replay.c').read_text()
     if diagnostics:
-        (sources / 'native_combat_perf.inc').write_text((runtime / 'combat_perf.inc').read_text().replace('#SESSION,0.56.25,','#SESSION,0.57.37,'))
+        (sources / 'native_combat_perf.inc').write_text((runtime / 'combat_perf.inc').read_text().replace('#SESSION,0.56.25,','#SESSION,0.57.75,'))
     runtime_source = (runtime / 'runtime.c').read_text().replace('RECOMP_TLS RecompRegs g_regs;', 'RecompRegs g_regs;')
     runtime_source = runtime_source.replace('        ngb_menu_draw(cursor);', '        extern void replay_unlock(uint32_t); replay_unlock(g_ebx);\n        ngb_menu_draw(cursor);')
     (sources / 'native-runtime.inc').write_text(runtime_source)
@@ -193,11 +210,12 @@ elif sys.argv[1] == 'host':
               'src/d3d/gpu/readback.h','src/d3d/vk/backend.cpp','packaging/switch/runtime/runtime.c',
               'packaging/switch/runtime/direct/hooks.c','packaging/switch/runtime/direct/output.h',
               'packaging/switch/runtime/scene/bridge.c')]
-    inputs += [root / 'src/d3d' / n for n in ('native_diag.h','native_diag.inc','native_pacing.h')]
+    inputs += [root / 'src/d3d' / n for n in ('native_diag.h','native_diag.inc','native_pacing.h','native_cpu_phases.h')]
     inputs += [root / 'src/d3d/vk/cache_writer.h']
-    inputs += [root / 'src/d3d' / n for n in ('native_mesh.inc','native_simple.inc','gpu/prepared.h','gpu/backend.h')]
-    inputs += [runtime / 'direct' / n for n in ('native_mesh.inc','native_model.inc','disc_archives.S','menu_profile.S','button_prompts.S')]
+    inputs += [root / 'src/d3d' / n for n in ('native_mesh.inc','native_simple.inc','compat/kernel/kernel.h','gpu/prepared.h','gpu/backend.h')]
+    inputs += [runtime / 'direct' / n for n in ('native_mesh.inc','native_model.inc','native_render_list.inc','disc_archives.S','menu_profile.S','button_prompts.S')]
     inputs += [runtime / 'button_prompts.c']
+    inputs += [runtime / 'particle_prepare.h', runtime / 'matrix.h', runtime / 'direct/particle_profile.S', experiment / 'particle_guest.py']
     inputs += [runtime / n for n in ('workers.inc','diagnostics_flag.h','combat_perf.h','combat_perf.inc','files.c','files.h','files_bridge.c','files_bridge.h','disc_reads.inc','disc_names.inc','ohci_boot.c','ohci_boot.h','opening_movie.c','prologue_stream.inc','menu_profile.inc')]
     inputs += [runtime / n for n in ('movie_audio.inc','audio_output.h','audio_output.inc')]
     if diagnostics:

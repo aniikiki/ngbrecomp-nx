@@ -218,7 +218,6 @@ static void track_draw_call(int fn, int entering)
 
 int d3d_hook(int fn)
 {
-    uint32_t regs[] = {eax, ecx, edx, ebx, esp, g_ebp, esi, edi};
     if (fn == D3DF_Direct3D_CreateDevice) {
         const char *mode = getenv("NGB_D3D_THREAD");
         if (!mode || strcmp(mode, "0")) {
@@ -228,6 +227,14 @@ int d3d_hook(int fn)
         }
     }
     track_draw_call(fn, 1);
+    if ((fn == D3DF_D3DDevice_LightEnable && ngb_d3d_light_enable_ready(eax, esp)) ||
+        (fn == D3DF_D3DDevice_SetLight && ngb_d3d_set_light_ready(esp))) {
+        track_draw_call(fn, 0);
+        eax = 0;
+        esp += fn == D3DF_D3DDevice_LightEnable ? 8 : 12;
+        return 1;
+    }
+    uint32_t regs[] = {eax, ecx, edx, ebx, esp, g_ebp, esi, edi};
     int took = d3d_hle_call(fn, regs);
     if (took) track_draw_call(fn, 0);
     if (fn == D3DF_D3DDevice_Swap) d3d_hle_frame_wait();
@@ -264,6 +271,8 @@ int ngb_direct_material_texture(void)
 
 #include "native_mesh.inc"
 #include "native_model.inc"
+#include "native_render_list.inc"
+#include "native_model_lights.inc"
 
 void d3d_after(int fn)
 {

@@ -8,6 +8,7 @@
 namespace {
 std::atomic<uint64_t> calls[4]{};
 std::atomic<uint64_t> instanced[2]{};
+std::atomic<uint64_t> unindexed_draws{};
 PFN_vkCmdDraw cmd_draw;
 PFN_vkCmdDrawIndexed cmd_draw_indexed;
 PFN_vkQueueSubmit queue_submit;
@@ -32,6 +33,7 @@ VkResult VKAPI_PTR ResetSets(VkDevice device, VkDescriptorPool pool, VkDescripto
     return reset_sets(device, pool, flags);
 }
 void VKAPI_PTR Draw(VkCommandBuffer cmd, uint32_t vertices, uint32_t instances, uint32_t first, uint32_t base) {
+    ++unindexed_draws;
     if (instances > 1) ++instanced[0];
     cmd_draw(cmd, vertices, instances, first, base);
 }
@@ -55,3 +57,4 @@ extern "C" void ngb_test_submission_counts(uint64_t* output) {
     for (unsigned i = 0; i < 4; ++i) output[i] = calls[i].load();
 }
 extern "C" uint64_t ngb_test_instanced_draws(bool indexed) { return instanced[indexed].load(); }
+extern "C" uint64_t ngb_test_unindexed_draws() { return unindexed_draws.load(); }

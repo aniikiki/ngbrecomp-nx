@@ -1,5 +1,8 @@
 """Append changed header records directly to their owning batch."""
 def transform(t):
+    # Current recorders already retain headers in ordered groups in each batch.
+    if 'std::vector<HeaderGroup> header_groups;' in t:
+        return t
     def rep(old,new,n=1):
         nonlocal t
         assert t.count(old)==n,old

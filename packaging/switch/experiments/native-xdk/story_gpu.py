@@ -82,7 +82,15 @@ def instrument(source, *, wave=True):
                 pass = RingWithTarget;
             }
         }
-        PhaseDraw(kind, k, s, views, from_target, pass);
+        BlendMethod method = OtherBlend;
+        if (unlit != CombatPixel::None) {
+            method = sparse_alpha ? NativeMask :
+                     alpha_compare == VK_COMPARE_OP_GREATER ? NativeGreater : k.dst == 1 ? NativeAdd : NativeAlpha;
+            if (fk.light & kCullZeroAlpha) ++phase_[slot_].cull_draws;
+        }
+        for (unsigned i = 0; i < 4; ++i)
+            if (s.textures[i] && !(sample_mask & (1u << i))) ++phase_[slot_].unused_bindings;
+        PhaseDraw(kind, k, s, views, from_target, pass, method);
     }
     uint32_t wave_query = ~0u;
     if (cp_on && rt && rt->gw >= 640 && prim == 6 && (count == 4 || count == 14) &&

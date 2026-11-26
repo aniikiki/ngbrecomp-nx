@@ -31,8 +31,14 @@ enum : uint8_t {
     kTexQuadGrayAlpha = kTexQuadColorAlpha | kTexQuadAlpha, // equal R, G and B, arbitrary alpha
 };
 
-enum class CombatPixel : uint8_t { None, Additive, History, ModulatedParticle, ModulatedParticleGreater };
+enum class CombatPixel : uint8_t {
+    None, Additive, History, ModulatedParticle, ModulatedParticleGreater,
+    UnlitAdditive, FadedAdditive, SparseAdditive, SparseFadedAdditive,
+    UnlitGreater, FadedGreater, VertexColour
+};
 enum class BumpLod : uint8_t { Zero, MostDetailed, FromDerivatives };
+constexpr uint8_t kEqualVertexRGB = 1, kEqualVertexRGBA = 2, kFogFromVertexAlpha = 4, kBlackVertexRGB = 8;
+constexpr uint8_t kBeforeLinearFog = 16, kBlackFog = 32, kRejectZeroAlpha = 64;
 constexpr uint32_t kHazeTargetExtent = 1u << 8;  // PixelKey::alphakill, for screen reads with unequal X/Y scale
 constexpr uint64_t kRectangularPointKey = 0x72656374506f696eull; // point shaders on such targets
 
@@ -48,7 +54,8 @@ struct PixelKey {
     uint32_t flat = 0, two_sided = 0;
     uint8_t proj = 0;        // fixed function: bit per stage sampled at coordinates divided by w
     BumpLod bump_lod = BumpLod::Zero;
-    uint16_t instance_factor = 0;  // zero in existing recipes; read the billboard's flat colour when set
+    uint8_t instance_factor = 0;  // read the billboard's flat colour when set
+    uint8_t shared_inputs = 0;    // high byte of the old 0/1 instance field, zero in existing recipes
     // a screen quad (QuadHlsl); a point sprite, stage 3 at the point's own coordinates after the stages before it
     // (#51). Halves of what was one uint32_t quad: the key's size and bytes as the shader cache has them.
     uint8_t quad = 0;
@@ -70,6 +77,7 @@ std::string VertexProgramHlsl(const std::vector<uint32_t>& program, uint16_t reg
 // fixed function vertex state a shader is built for
 constexpr uint32_t kCombatClipPlanes = 1u << 31;  // FixedKey::light, native UT geometry
 constexpr uint32_t kBillboardInstances = 1u << 30; // FixedKey::light, clip matrix and colour per instance
+constexpr uint32_t kCullZeroAlpha = 1u << 29; // fixed-function triangles whose source alpha contains vertex alpha
 struct FixedKey {
     uint32_t light = 0;    // bit 0 lighting, 1 specular, 2 local viewer, 3 normalize, then D3DMCS 2 bits each from bit 8:
                            // diffuse, specular, ambient, emissive (material when the vertex lacks that colour)

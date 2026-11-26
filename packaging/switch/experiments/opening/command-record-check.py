@@ -11,20 +11,20 @@ def harness(s,new):
  cmd=cut(s,'enum class Op','// a header copy')
  copy=cut(s,'        Cmd c{Op::Copy};','        if (!thread_) Submit();')
  pres=cut(s,'            Cmd c{Op::Present};','            id = Submit();').replace('inner_->CaptureQuick(cur_->quick.back());','cur_->quick.back()=seed;')
- state=cut(s,'        if (s.vs.get() != sent_.vs.get())','    // the batch handed over')
+ state=cut(s,'        if (s.vs.get() != record.value.vs.get())','    // the batch handed over')
  play=cut(s,'            case Op::Copy:', '            case Op::Flush:').replace('inner_->','sink.')
- shaders=cut(s,'                if '+('(' if new else '(c.vs >= 0)'), '                break;') if not new else cut(s,'                if(c.a) state_.vs','                break;')
+ shaders=cut(s,'                if(c.a) state.vs' if new else '                if (c.vs >= 0)', '                break;')
  return cmd+'''
  struct B{uint64_t id=1;std::vector<Cmd>cmds;std::vector<Surface>surfaces;std::vector<int>quick;
  std::vector<uint8_t>bytes;std::vector<std::shared_ptr<int>>vs,ps;};
- struct Test{B b; B*cur_=&b; State sent_,state_;Sink sink;std::vector<Surface> input;
+ struct Test{B b; B*cur_=&b; struct { State value; } record; State state;Sink sink;std::vector<Surface> input;
  using Recorded=Test;std::mutex m_;std::condition_variable done_cv_;std::atomic<uint64_t> present_consumed_{0};
  unsigned Put(const uint8_t*p,size_t n){unsigned off=b.bytes.size();b.bytes.insert(b.bytes.end(),p,p+n);return off;}
- void record(State s,size_t first){Cmd c{Op::State};
+ void bind(State s,size_t first){Cmd c{Op::State};
 '''+state+'''void copy(Surface src,Surface dst,uint32_t count,const uint8_t*src_rects,const uint8_t*dst_points){
 '''+copy+'''}void present(Surface front,int seed){
 '''+pres+'''}void run(){for(auto c:b.cmds)switch(c.op){case Op::State:
-'''+shaders+'''sink.shader(state_);break;
+'''+shaders+'''sink.shader(state);break;
 '''+play+'''default:abort();}b=B{};} };'''
 src='''
 #include <vector>
@@ -51,7 +51,7 @@ int main(){ref::Test a;alt::Test b;std::shared_ptr<int> sp[7]={};for(int i=1;i<7
 for(unsigned round=0;round<5;round++){overlap=round%2;for(unsigned i=0;i<400;i++){Surface x{i,12,i*3,round},y{5,i,3,i+round};
 unsigned char data[48];for(unsigned j=0;j<48;j++)data[j]=j+i;
 for(auto test:[&]{return std::vector<int>{0,1};}()){
-#define RECORD(t) t.copy(x,y,i%4,i%2?data:nullptr,i%3?data:nullptr);t.present(x,i);t.record({sp[i%7],sp[(i/5)%7]},t.b.bytes.size());
+#define RECORD(t) t.copy(x,y,i%4,i%2?data:nullptr,i%3?data:nullptr);t.present(x,i);t.bind({sp[i%7],sp[(i/5)%7]},t.b.bytes.size());
 if(test){RECORD(b)}else{RECORD(a)}
 }}
 a.run();b.run();assert(a.sink.v==b.sink.v);assert(a.present_consumed_==b.present_consumed_);if(overlap)assert(a.present_consumed_==1);}}

@@ -1,5 +1,8 @@
 #pragma once
 #include <stdint.h>
+#ifdef NGB_NATIVE_DIAG
+#include "../../../src/d3d/native_cpu_phases.h"
+#endif
 #ifdef __cplusplus
 extern "C" {
 #endif

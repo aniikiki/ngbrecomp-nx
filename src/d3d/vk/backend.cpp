@@ -26,7 +26,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <functional>
 #include <sstream>
 #include <iomanip>
 #include <memory>
@@ -319,6 +318,7 @@ struct Tex {
     Image img;
     CombatHull combat_hull;
 #ifdef NGB_DIRECT3D
+    AlphaTiles alpha_tiles;
     uint8_t quad_filter_flags = kTexLinear;
     bool transparent_mission_border = false;
 #endif
@@ -334,6 +334,11 @@ struct Tex {
 constexpr uint32_t kDsDynamicBias = 2;
 constexpr uint32_t kRtParticleWindows = 2;  // has_rt, an inclusive discard-rectangle pipeline
 constexpr uint32_t kRtMissionBorder = 4;    // one exclusive rectangle inside the mission border
+struct PassClear {
+    uint32_t flags{};
+    VkClearColorValue color{};
+    VkClearDepthStencilValue depth_stencil{};
+};
 struct PipeKey {
     uint64_t vs, ps;
     uint32_t regs, elements[16], strides[16];
@@ -465,7 +470,14 @@ public:
     void Clear(const State& s, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z,
                uint32_t stencil) override;
     void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices, const IndexBounds* bounds, CombatEffect effect) override;
-    void DrawBillboards(State& s, const uint8_t* indices, std::span<const BillboardInstance> instances) override;
+#ifdef NGB_DIRECT3D
+    void DrawSnapshot(const State& s, uint32_t prim, uint32_t start, const std::shared_ptr<const IndexSnapshot>& indices,
+                      PreparedState, CombatEffect effect) override {
+        DrawGeometry(s, prim, start, indices->count(), indices->data(), &indices->bounds, effect, {}, indices->id);
+    }
+#endif
+    void DrawBillboards(State& s, std::span<const uint8_t> indices, const IndexBounds& bounds,
+                        std::span<const BillboardInstance> instances) override;
     void Copy(const Surface& src, const Surface& dst, uint32_t count, const uint8_t* src_rects,
               const uint8_t* dst_points) override;
     void Present(const Surface& front) override { Present(front, nullptr, nullptr); }
@@ -483,7 +495,8 @@ public:
 
 private:
     void DrawGeometry(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices,
-                      const IndexBounds* bounds, CombatEffect effect, std::span<const BillboardInstance> instances);
+                      const IndexBounds* bounds, CombatEffect effect, std::span<const BillboardInstance> instances,
+                      uint64_t index_version = 0);
     VkDeviceSize UploadBillboards(const State& s, uint32_t width, uint32_t height,
                                  std::span<const BillboardInstance> instances);
     // the game's side of the call being drawn (gpu::Peek) and of the frame (QuickPeek): taken here at the call, or
@@ -556,6 +569,7 @@ private:
     bool anisotropy_ = false;
     bool bc_ = true;   // the GPU reads DXT (textureCompressionBC); without it (Mali, Adreno) DXT is decoded to BGRA
     bool combat_clip_ = false;
+    bool alpha_cull_ = false;
     bool particle_windows_ = false;
     bool wide_lines_ = false;   // lines wider than a pixel (the sparks of a hit are 2.7 to 3, #51)
     bool standard_sample_locations_ = false;
@@ -718,13 +732,13 @@ private:
     std::optional<std::array<float, 4>> blend_;
     std::optional<uint32_t> stencil_;
     // Each fenced command slot keeps its own immutable copies for draws in flight.
-    static constexpr size_t kGeometryCapacity = 4u << 20;
+    static constexpr size_t kGeometryCapacity = 8u << 20;
     struct GeometrySlot {
         struct Entry {
-            const void* source{};
+            uint64_t version{};
             uint32_t offset{}, bytes{}, last_frame{};
         };
-        std::array<Entry, 2048> entries{};
+        std::array<std::array<Entry, 4>, 1024> entries{};
         // Only CPU-written cached pages need a flush before this slot is submitted.
         uint64_t dirty_pages[kGeometryCapacity / 4096 / 64]{};
         uint32_t used{};
@@ -736,7 +750,7 @@ private:
     VkDeviceSize geometry_atom_ = 4096;
     void FlushGeometry();
     uint64_t geometry_requested_{}, geometry_reused_{};
-    VkDeviceSize UploadGeometry(const void* data, uint32_t bytes, uint32_t align, VkBuffer& buffer);
+    VkDeviceSize UploadGeometry(const void* data, uint32_t bytes, uint32_t align, VkBuffer& buffer, uint64_t version = 0);
     VkDescriptorBufferInfo bound_buffers_[2]{};
     VkDescriptorImageInfo bound_images_[4]{};
     VkSampler bound_samplers_[4]{};
@@ -815,7 +829,7 @@ private:
     bool draw_feedback_ready_ = false; // all stages of one draw read the same pre-draw picture
     Target* bound_ds_ = nullptr;
     bool rendering_ = false;
-    void BeginRendering(Target* rt, Target* ds);
+    void BeginRendering(Target* rt, Target* ds, bool overwrite_color = false, const PassClear* clear = nullptr);
     bool TargetStamp(const Target& t, uint64_t& stamp);
     void StampTarget(Target& t) { t.stamped = TargetStamp(t, t.stamp); }
     void EndRendering();
@@ -837,7 +851,7 @@ private:
 
 #endif
     std::unordered_map<uint64_t, Tex> textures_;
-    VkImageView BindTexture(const State& s, int stage, TexInfo& info, bool& from_target);
+    VkImageView BindTexture(const State& s, int stage, TexInfo& info, bool& from_target, const Tex** bound_static);
     Image null2d_, nullcube_, null3d_;
     std::unordered_map<uint64_t, VkSampler> samplers_;
     VkSampler Sampler(const State& s, int stage, const TexInfo& info);
@@ -847,7 +861,8 @@ private:
     VkPipelineLayout pipe_layout_ = VK_NULL_HANDLE;
     std::unordered_map<uint64_t, VkShaderModule> modules_;
     std::unordered_map<PipeKey, VkPipeline, PipeHash> pipelines_;
-    VkShaderModule Module(uint64_t key, const std::function<std::string()>& src, bool vertex);
+    template<class Source> VkShaderModule Module(uint64_t key, const Source& src, bool vertex);
+    VkShaderModule QueueOrCompileModule(uint64_t key, std::string hlsl, bool vertex);
     VkPipeline Pipeline(const PipeKey& k);
 
     Assembled asm_;
@@ -1097,6 +1112,8 @@ bool VulkanBackend::CreateDevice() {
         // A Vulkan implementation with shaderClipDistance supports at least 8 planes.
         combat_clip_ = have.shaderClipDistance;
         f2.features.shaderClipDistance = have.shaderClipDistance;
+        alpha_cull_ = have.shaderCullDistance;
+        f2.features.shaderCullDistance = have.shaderCullDistance;
 #endif
         f2.features.wideLines = have.wideLines;
         f2.features.largePoints = have.largePoints;
@@ -2069,23 +2086,43 @@ void VulkanBackend::FlushGeometry() {
     }
 }
 
-VkDeviceSize VulkanBackend::UploadGeometry(const void* data, uint32_t bytes, uint32_t align, VkBuffer& buffer) {
+VkDeviceSize VulkanBackend::UploadGeometry(const void* data, uint32_t bytes, uint32_t align, VkBuffer& buffer, uint64_t version) {
     if (FrameCountersEnabled()) geometry_requested_ += bytes;
     auto& g = geometry_[slot_];
     buffer = ring_;
     if (bytes < 256 || bytes > kGeometryCapacity || !geometry_cpu_) return Upload(data, bytes, align);
 
-    uintptr_t key = reinterpret_cast<uintptr_t>(data);
-    auto& e = g.entries[((key >> 4) ^ (key >> 15) ^ (key >> 26)) & (g.entries.size() - 1)];
-    VkDeviceSize base = slot_ * kGeometryCapacity;
-    if (e.source == data && e.bytes == bytes && !std::memcmp(geometry_cpu_ + base + e.offset, data, bytes)) {
-        e.last_frame = frame_;
-        if (FrameCountersEnabled()) geometry_reused_ += bytes;
-        buffer = geometry_buffer_;
-        return base + e.offset;
+    // Mutable guest RAM can be rewritten without an XDK lock. Sample it for
+    // lookup only, then compare every byte of a candidate. Published index
+    // snapshots have a unique immutable version and need no memory scan.
+    uint64_t key = version;
+    if (!version) {
+        const auto* src = static_cast<const uint8_t*>(data);
+        auto word = [&](uint32_t offset) {
+            uint64_t value;
+            std::memcpy(&value, src + offset, sizeof(value));
+            return value;
+        };
+        key = word(0) ^ std::rotl(word(bytes / 2), 19) ^ std::rotl(word(bytes - 8), 41) ^ (uint64_t(bytes) << 23);
     }
+    key ^= key >> 33;
+    key *= UINT64_C(0xff51afd7ed558ccd);
+    auto& bucket = g.entries[key >> (64 - 10)];
+    VkDeviceSize base = slot_ * kGeometryCapacity;
+    auto* replace = &bucket.front();
+    for (auto& candidate : bucket) {
+        if (candidate.bytes == bytes && candidate.version == version &&
+            (version || !std::memcmp(geometry_cpu_ + base + candidate.offset, data, bytes))) {
+            candidate.last_frame = frame_;
+            if (FrameCountersEnabled()) geometry_reused_ += bytes;
+            buffer = geometry_buffer_;
+            return base + candidate.offset;
+        }
+        if (!candidate.bytes || (replace->bytes && candidate.last_frame < replace->last_frame)) replace = &candidate;
+    }
+    auto& e = *replace;
     // A changed range can reuse its space only if no draw in this recording references it.
-    if (!e.bytes || bytes != e.bytes || e.last_frame == frame_ || chunk_) {
+    if (bytes > e.bytes || e.last_frame == frame_ || chunk_) {
         size_t offset = (g.used + 15u) & ~15u;
         if (offset + bytes > kGeometryCapacity) {
             g.full = true;
@@ -2094,7 +2131,7 @@ VkDeviceSize VulkanBackend::UploadGeometry(const void* data, uint32_t bytes, uin
         e.offset = uint32_t(offset);
         g.used = uint32_t(offset + bytes);
     }
-    e.source = data;
+    e.version = version;
     e.bytes = bytes;
     e.last_frame = frame_;
     std::memcpy(geometry_cpu_ + base + e.offset, data, bytes);
@@ -2167,31 +2204,61 @@ void VulkanBackend::DestroyImage(Image& img) {
     img = Image{};
 }
 
-void VulkanBackend::Barrier(Image& img, VkImageLayout to) {
-    if (img.layout == to) return;
-    // A layout change is not allowed inside a rendering pass (dynamic rendering without local read):
-    // the pass ends first, the next draw begins it again. A draw sampling a render target other than
-    // the one bound (the water's screen copy, the haze's) changed its layout inside the pass still
-    // open from the draw before (the validation layer's VUID 09553); RADV let it through, what
-    // another driver makes of it is not defined (#16).
-    if (rendering_) EndRendering();
+struct ImageScope {
+    VkPipelineStageFlags2 stages;
+    VkAccessFlags2 access;
+};
+
+static ImageScope ImageLayoutScope(VkImageLayout layout) {
+    switch (layout) {
+    case VK_IMAGE_LAYOUT_UNDEFINED: return {VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE};
+    case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL: return {VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT};
+    case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL: return {VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT};
+    case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:
+        // Both are sampled exclusively in fragment shaders in this renderer.
+        return {VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT};
+    case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
+        return {VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT};
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+        // Fixed-function depth resolves also access the images at COLOR_ATTACHMENT_OUTPUT.
+        return {VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT};
+    default: return {VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
+    }
+}
+
+static VkImageMemoryBarrier2 ImageTransition(Image& img, VkImageLayout to) {
+    const ImageScope src = ImageLayoutScope(img.layout), dst = ImageLayoutScope(to);
     VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-    b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-    b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
-    b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-    b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    b.srcStageMask = src.stages;
+    b.srcAccessMask = src.access;
+    b.dstStageMask = dst.stages;
+    b.dstAccessMask = dst.access;
     b.oldLayout = img.layout;
     b.newLayout = to;
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.image = img.image;
-    VkImageAspectFlags aspect = img.depth ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT
-                                          : VK_IMAGE_ASPECT_COLOR_BIT;
+    VkImageAspectFlags aspect = img.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+    if (img.format == VK_FORMAT_D24_UNORM_S8_UINT || img.format == VK_FORMAT_D32_SFLOAT_S8_UINT)
+        aspect |= VK_IMAGE_ASPECT_STENCIL_BIT;
     b.subresourceRange = {aspect, 0, img.levels, 0, img.layers};
+    img.layout = to;
+    return b;
+}
+
+void VulkanBackend::Barrier(Image& img, VkImageLayout to) {
+    if (img.layout == to) return;
+    // Dynamic rendering does not allow an image layout change inside the pass.
+    if (rendering_) EndRendering();
+    const auto b = ImageTransition(img, to);
     VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     di.imageMemoryBarrierCount = 1;
     di.pImageMemoryBarriers = &b;
     d_.vkCmdPipelineBarrier2(cmd_, &di);
-    img.layout = to;
 }
 
 // targets, by guest memory and kind
@@ -2280,8 +2347,11 @@ Target* VulkanBackend::MakeTarget(const Surface& s, bool depth, uint64_t key, ui
     t.samples = samples;
     t.addr = uint32_t(key >> 1);
     DescribeSurface(s, t.guest);
-    VkImageUsageFlags u = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                          (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    // Depth is cleared and resolved as an attachment. A transfer destination
+    // would prevent NVK from preserving Maxwell's ZCULL data across passes.
+    VkImageUsageFlags u = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                          (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT :
+                                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
     if (!CreateImage(t.img, depth ? ds_format_ : kColorFormat, iw, ih, 1, 1, depth, false, u)) return nullptr;
     if (samples > 1 &&
         !CreateImage(t.ms, depth ? ds_format_ : kColorFormat, iw, ih, 1, 1, depth, false,
@@ -2655,27 +2725,30 @@ bool VulkanBackend::TargetStamp(const Target& t, uint64_t& stamp) {
     return len && nv2a_dirty_stamp(HostPtr(t.addr | 0x80000000u), len, &stamp) != 0;
 }
 
-void VulkanBackend::BeginRendering(Target* rt, Target* ds) {
+void VulkanBackend::BeginRendering(Target* rt, Target* ds, bool overwrite_color, const PassClear* clear) {
     // a colour and a depth target of different sizes cannot share a pass (one scaled, one not):
     // the depth goes without, as the title's picture is in the colour
     if (rt && ds && (rt->img.w != ds->img.w || rt->img.h != ds->img.h || rt->samples != ds->samples)) ds = nullptr;
     if (rendering_ && rt == bound_rt_ && ds == bound_ds_) return;
     EndRendering();
+    const uint32_t clear_flags = clear ? clear->flags : 0;
     if (rt && rt->ms_stale) {
-        if (rt->drawn) FillMs(*rt);
+        if (rt->drawn && !overwrite_color && !(clear_flags & kClearTarget)) FillMs(*rt);
         rt->ms_stale = false;
     }
     bound_rt_ = rt;
     bound_ds_ = ds;
-    if (rt) Barrier(rt->img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-    if (ds) Barrier(ds->img, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-    if (rt && rt->samples > 1) Barrier(rt->ms, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-    if (ds && ds->samples > 1) Barrier(ds->ms, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-    {   // The pass before, on the same targets in the same layout, got no barrier above (Barrier skips an
-        // unchanged layout), and Vulkan orders attachment writes only within a pass: its depth and colour
-        // writes against this pass's tests and blending need one. RADV keeps passes in order regardless;
-        // AMD's Windows driver does not have to -- Ryu's shadow, drawn in a pass after another on its shadow
-        // map, went missing for a few frames at a time there (#50).
+    {   // Start all attachments together. The memory dependency also orders depth
+        // tests and blending on targets that keep their layout between passes (#50).
+        std::array<VkImageMemoryBarrier2, 4> images;
+        unsigned count = 0;
+        auto transition = [&](Image& image, VkImageLayout layout) {
+            if (image.layout != layout) images[count++] = ImageTransition(image, layout);
+        };
+        if (rt) transition(rt->img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        if (ds) transition(ds->img, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        if (rt && rt->samples > 1) transition(rt->ms, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        if (ds && ds->samples > 1) transition(ds->ms, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
         VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
         mb.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
                           VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
@@ -2685,17 +2758,25 @@ void VulkanBackend::BeginRendering(Target* rt, Target* ds) {
                            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
                            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
         VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-        di.memoryBarrierCount = 1;
+        static const bool off = std::getenv("NGB_D3D_NO_PASS_BARRIER") != nullptr;
+        di.imageMemoryBarrierCount = count;
+        di.pImageMemoryBarriers = images.data();
+        di.memoryBarrierCount = off ? 0 : 1;
         di.pMemoryBarriers = &mb;
-        static const bool off = std::getenv("NGB_D3D_NO_PASS_BARRIER") != nullptr;   // to compare
-        if (!off) d_.vkCmdPipelineBarrier2(cmd_, &di);
+        if (count || !off) d_.vkCmdPipelineBarrier2(cmd_, &di);
     }
     VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     VkRenderingAttachmentInfo da{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    VkRenderingAttachmentInfo sa{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     if (rt) {
         ca.imageView = rt->img.view;
         ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        ca.loadOp = rt->drawn ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
+        ca.loadOp = overwrite_color ? VK_ATTACHMENT_LOAD_OP_DONT_CARE :
+                    rt->drawn ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
+        if (clear_flags & kClearTarget) {
+            ca.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            ca.clearValue.color = clear->color;
+        }
         ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         if (rt->samples > 1) {                       // drawn multisampled, resolved as the pass ends
             ca.imageView = rt->ms.view;
@@ -2718,6 +2799,15 @@ void VulkanBackend::BeginRendering(Target* rt, Target* ds) {
             da.resolveImageView = ds->img.attachment ? ds->img.attachment : ds->img.view;
             da.resolveImageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         }
+        sa = da;
+        if (clear_flags & kClearZ) {
+            da.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            da.clearValue.depthStencil.depth = clear->depth_stencil.depth;
+        }
+        if (clear_flags & kClearStencil) {
+            sa.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            sa.clearValue.depthStencil.stencil = clear->depth_stencil.stencil;
+        }
         ds->drawn = true;
         StampTarget(*ds);
     }
@@ -2728,7 +2818,7 @@ void VulkanBackend::BeginRendering(Target* rt, Target* ds) {
     ri.colorAttachmentCount = rt ? 1 : 0;
     ri.pColorAttachments = rt ? &ca : nullptr;
     ri.pDepthAttachment = ds ? &da : nullptr;
-    ri.pStencilAttachment = ds ? &da : nullptr;
+    ri.pStencilAttachment = ds ? &sa : nullptr;
     d_.vkCmdBeginRendering(cmd_, &ri);
     st_.passes++;
     rendering_ = true;
@@ -2746,7 +2836,8 @@ void VulkanBackend::Clear(const State& s, uint32_t count, const uint8_t* rects, 
     Target* brt = EnsureTarget(s.rt, false);
     Target* bds = s.zs.header ? EnsureTarget(s.zs, true) : nullptr;
     if (!brt && !bds) return;
-    BeginRendering(brt, bds);
+    if (brt && bds && (brt->img.w != bds->img.w || brt->img.h != bds->img.h || brt->samples != bds->samples))
+        bds = nullptr;
     const Image& any = brt ? brt->img : bds->img;
     uint32_t gw = brt ? brt->gw : bds->gw, gh = brt ? brt->gh : bds->gh;
     float sx = float(any.w) / gw, sy = float(any.h) / gh;
@@ -2768,7 +2859,6 @@ void VulkanBackend::Clear(const State& s, uint32_t count, const uint8_t* rects, 
         const auto& v = s.viewport;
         add(int(v.x), int(v.y), int(v.x + v.w), int(v.y + v.h));
     }
-    if (rs.empty()) return;
     VkClearAttachment at[2];
     uint32_t n = 0;
     if (rt && rt == brt) {
@@ -2785,7 +2875,22 @@ void VulkanBackend::Clear(const State& s, uint32_t count, const uint8_t* rects, 
     }
     if (trace_)
         std::fprintf(trace_, "%u clear rt %08X flags %X color %08X rects %u n %u\n", presents_, s.rt.data, flags, color, count, n);
-    if (n) d_.vkCmdClearAttachments(cmd_, n, at, uint32_t(rs.size()), rs.data());
+    const bool full = rs.size() == 1 && !rs[0].rect.offset.x && !rs[0].rect.offset.y &&
+                      rs[0].rect.extent.width == any.w && rs[0].rect.extent.height == any.h;
+    if (n && full && !(rendering_ && brt == bound_rt_ && bds == bound_ds_)) {
+        // Supply the game's clear at pass begin. NVK can initialize ZCULL
+        // directly instead of reloading the previous pass's depth bounds.
+        PassClear clear{};
+        if (rt) { clear.flags |= kClearTarget; clear.color = at[0].clearValue.color; }
+        if (ds && ds == bds) {
+            clear.flags |= flags & (kClearZ | kClearStencil);
+            clear.depth_stencil = at[n - 1].clearValue.depthStencil;
+        }
+        BeginRendering(brt, bds, false, &clear);
+    } else {
+        BeginRendering(brt, bds);
+        if (n && !rs.empty()) d_.vkCmdClearAttachments(cmd_, n, at, uint32_t(rs.size()), rs.data());
+    }
 }
 
 // a texture stage: a target the title draws into and reads back, or a texture from guest memory
@@ -2799,7 +2904,7 @@ static uint64_t TextureSignature(const uint8_t* data, size_t bytes, uint64_t for
 #endif
 }
 
-VkImageView VulkanBackend::BindTexture(const State& s, int stage, TexInfo& info, bool& from_target) {
+VkImageView VulkanBackend::BindTexture(const State& s, int stage, TexInfo& info, bool& from_target, const Tex** bound_static) {
     info = TexInfo{};
     from_target = false;
     uint32_t hdr = s.textures[size_t(stage)];
@@ -2940,6 +3045,7 @@ VkImageView VulkanBackend::BindTexture(const State& s, int stage, TexInfo& info,
     }
     uint64_t key = uint64_t(d.data) << 8 | d.format;
     Tex& tx = textures_[key];
+    if (bound_static) *bound_static = &tx;
     // A bump map supplies signed offsets to a BUMPENVMAP texture stage.
     bool bump_src = s.ps && stage < 3 && (d.format == 0x28 || d.format == 0x17) && [&] {
         uint32_t m = (s.rs[kRsPsTextureModes] >> ((stage + 1) * 5)) & 0x1F;
@@ -3007,6 +3113,8 @@ VkImageView VulkanBackend::MakeStatic(Tex& tx,const TextureDesc& d,const uint8_t
     if (tx.img.image) Retire(tx.img);   // made again: the old one goes when no frame in flight uses it
     tx.combat_hull = {};
 #ifdef NGB_DIRECT3D
+    tx.alpha_tiles = fi.host == Host::BC3 && !d.cube && d.depth == 1 && d.levels == 1
+        ? FilteredAlphaTiles(guest,d.width,d.height) : AlphaTiles{};
     tx.transparent_mission_border = false;
     tx.quad_filter_flags = d.format == 0x19 ? kTexLinear | kTexQuadAlpha : kTexLinear;
     if (fi.host == Host::BC3 && !d.cube && d.depth == 1 &&
@@ -3340,13 +3448,17 @@ VkSampler VulkanBackend::Sampler(const State& s, int stage, const TexInfo& info)
     return smp;
 }
 
-VkShaderModule VulkanBackend::Module(uint64_t key, const std::function<std::string()>& src, bool vertex) {
+template<class Source>
+VkShaderModule VulkanBackend::Module(uint64_t key, const Source& src, bool vertex) {
     {
         std::lock_guard<std::recursive_mutex> g(cache_mu_);
         auto it = modules_.find(key);
         if (it != modules_.end()) return it->second;
     }
-    std::string hlsl = src();
+    return QueueOrCompileModule(key, src(), vertex);
+}
+
+VkShaderModule VulkanBackend::QueueOrCompileModule(uint64_t key, std::string hlsl, bool vertex) {
     // Left to the compiler thread only when it is new: a module whose SPIR-V an earlier session kept is
     // made at once (no glslang, just vkCreateShaderModule). Deferred, the draw was left out until the
     // prewarm thread got to it -- walls and effects flickering for a while after every launch (#21).
@@ -3721,19 +3833,21 @@ VkDeviceSize VulkanBackend::UploadBillboards(const State& s, uint32_t width, uin
     return UploadReused(vc_reuse_, constants, sizeof(Constants) * instances.size(), ringAlign_);
 }
 
-void VulkanBackend::DrawBillboards(State& s, const uint8_t* indices, std::span<const BillboardInstance> instances) {
+void VulkanBackend::DrawBillboards(State& s, std::span<const uint8_t> indices, const IndexBounds& bounds,
+                                   std::span<const BillboardInstance> instances) {
     static const bool debug_pixels = std::getenv("NGB_D3D_PSDEBUG") != nullptr;
     if (instances.size() < 2 || instances.size() > kBillboardsPerDraw ||
         vis_on_ || trace_ || IdView() || debug_pixels || g_shader_hooks) {
-        Backend::DrawBillboards(s, indices, instances);
+        Backend::DrawBillboards(s, indices, bounds, instances);
         return;
     }
     instances.back().Apply(s);
-    DrawGeometry(s, 6, 0, 4, indices, nullptr, CombatEffect::None, instances);
+    DrawGeometry(s, 6, 0, uint32_t(indices.size() / sizeof(uint16_t)), indices.data(), &bounds, CombatEffect::None, instances);
 }
 
 void VulkanBackend::DrawGeometry(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices,
-                                 const IndexBounds* bounds, CombatEffect effect, std::span<const BillboardInstance> instances) {
+                                 const IndexBounds* bounds, CombatEffect effect, std::span<const BillboardInstance> instances,
+                                 uint64_t index_version) {
 #ifdef NGB_COMBAT_PERF
     // Rotate selection over frames; CPU clock excludes time blocked in the driver.
     struct Sample {uint64_t &wall,&cpu,t,c;~Sample(){if(t){wall+=(ngb_elapsed_ns()-t)/1000;
@@ -3819,12 +3933,32 @@ void VulkanBackend::DrawGeometry(const State& s, uint32_t prim, uint32_t start, 
     }
 #endif
 
-    TexInfo info[4];
-    VkImageView views[4];
-    bool from_target[4];
+    const Tex* first_static = nullptr;
+    TexInfo info[4]{};
+    VkImageView views[4]{};
+    bool from_target[4]{};
+    unsigned sample_mask = 15;
+    static const char* psdbg = std::getenv("NGB_D3D_PSDEBUG");
+#ifdef NGB_DIRECT3D
+    // Binding an unused target can end a render pass and copy its contents. The
+    // combiner may still use this stage's constants, so retain its arithmetic.
+    if (!s.ps && !(s.vs_handle & 1u) && !a.pretransformed &&
+        (a.topology == Topology::Triangles || a.topology == Topology::Lines) &&
+        SimpleState(s,kMBlendEnable) && !vis_on_ && !trace_ && !psdbg && !g_shader_hooks && !IdView()) {
+        sample_mask = FixedTextureSampleMask(s);
+        // The heat-haze shader also tests projected, clamped target coordinates.
+        // That test consumes the bound target even for a constant-only combiner.
+        for (unsigned i = 0; i < 4 && s.tss[i][kTssColorOp] > 1; ++i) {
+            const auto& t = s.tss[i];
+            if ((t[kTssTextureTransformFlags] & 256) && t[kTssAddressU] == 3 && t[kTssAddressV] == 3)
+                sample_mask |= 1u << i;
+        }
+    }
+#endif
     draw_rt_ = rt;
     draw_feedback_ready_ = false;
     for (int i = 0; i < 4; i++) {
+        if (!(sample_mask & (1u << i))) continue;
         int shared = -1;
         for (int j = 0; j < i; j++)
             if (from_target[j] && s.textures[i] == s.textures[j]) { shared = j; break; }
@@ -3832,7 +3966,7 @@ void VulkanBackend::DrawGeometry(const State& s, uint32_t prim, uint32_t start, 
             // Target interpretation is independent of the texture stage. Blur
             // taps share the image lookup/copy, but keep their own sampler and UV.
             views[i] = views[shared]; info[i] = info[shared]; from_target[i] = true;
-        } else views[i] = BindTexture(s, i, info[i], from_target[i]);
+        } else views[i] = BindTexture(s, i, info[i], from_target[i], i == 0 ? &first_static : nullptr);
     }
     draw_rt_ = nullptr;
     auto read_only_depth_stencil = [&] {
@@ -3841,16 +3975,19 @@ void VulkanBackend::DrawGeometry(const State& s, uint32_t prim, uint32_t start, 
              (StencilOp(s.rs[kRsStencilFail]) == VK_STENCIL_OP_KEEP && StencilOp(SimpleState(s,kMStencilZFail)) == VK_STENCIL_OP_KEEP &&
               StencilOp(SimpleState(s,kMStencilPass)) == VK_STENCIL_OP_KEEP)));
     };
-    const bool additive = effect == CombatEffect::Transparent && rt && !vis_on_ && !IdView() && !s.ps &&
-        SimpleState(s,kMBlendEnable) && SimpleState(s,kMSrcBlend) == 0x302 && SimpleState(s,kMDestBlend) == 1 &&
-        SimpleState(s,kMBlendOp) == 0x8006 &&
-        (!SimpleState(s,kMAlphaTestEnable) || Cmp(SimpleState(s,kMAlphaFunc)) == VK_COMPARE_OP_ALWAYS) &&
-        read_only_depth_stencil();
+    const auto dest_blend = SimpleState(s,kMDestBlend);
+    const auto alpha_compare = SimpleState(s,kMAlphaTestEnable) ? Cmp(SimpleState(s,kMAlphaFunc)) : VK_COMPARE_OP_ALWAYS;
+    const bool source_alpha_blend = rt && !vis_on_ && !IdView() && !s.ps && SimpleState(s,kMBlendEnable) &&
+        SimpleState(s,kMSrcBlend) == 0x302 && (dest_blend == 1 || dest_blend == 0x303) &&
+        SimpleState(s,kMBlendOp) == 0x8006 && read_only_depth_stencil();
+    const bool additive = effect == CombatEffect::Transparent && source_alpha_blend &&
+                          dest_blend == 1 && alpha_compare == VK_COMPARE_OP_ALWAYS;
     const auto& t0 = s.tss[0];
     const auto& t1 = s.tss[1];
     const CombatHull* hull = nullptr;
+    const AlphaTiles* sparse_alpha = nullptr;
+    CombatPixel unlit = CombatPixel::None;
     std::array<float,4> tile{};
-    static const char* psdbg = std::getenv("NGB_D3D_PSDEBUG");
     CombatPixel particle = CombatPixel::None;
     bool clip_particle = false;
 #ifdef NGB_DIRECT3D
@@ -3894,6 +4031,39 @@ void VulkanBackend::DrawGeometry(const State& s, uint32_t prim, uint32_t start, 
         }
     }
 
+#ifdef NGB_DIRECT3D
+    // A normalized image modulates an unlit vertex colour. The optional second
+    // stage only scales alpha. Fixed-function fog still uses its interpolated factor.
+    const bool fade = t1[kTssColorOp] == 3 && t1[kTssColorArg2] == 1 &&
+        t1[kTssAlphaOp] == 4 && t1[kTssAlphaArg1] == 3 && t1[kTssAlphaArg2] == 1 &&
+        t1[kTssResultArg] != 5 && s.tss[2][kTssColorOp] <= 1;
+    if (!s.ps && !(s.vs_handle & 1u) && !a.pretransformed && a.topology == Topology::Triangles &&
+        s.rs[kRsZEnable] && !s.rs[kRsLighting] &&
+        (!s.rs[kRsSpecularEnable] || !(a.regs & (1u << 4))) && !trace_ && !psdbg && !g_shader_hooks &&
+        views[0] && !from_target[0] && info[0].kind == kTex2D && !info[0].rect && !info[0].shadow && !info[0].flags &&
+        !(t0[kTssTextureTransformFlags] & 256) && ModulatesCurrent(t0, 2) && t0[kTssAlphaKill] != 4 &&
+        (t1[kTssColorOp] <= 1 || (fade && t1[kTssAlphaKill] != 4 && !from_target[1])) &&
+        source_alpha_blend && (alpha_compare == VK_COMPARE_OP_ALWAYS || alpha_compare == VK_COMPARE_OP_GREATER)) {
+        const unsigned opacity = s.rs[kRsTextureFactor] >> 24;
+        if (fade && instances.empty() && !opacity) return;
+        const bool faded = fade && (!instances.empty() || opacity != 255);
+        unlit = faded ? CombatPixel::FadedAdditive : CombatPixel::UnlitAdditive;
+        if (alpha_compare == VK_COMPARE_OP_GREATER)
+            unlit = faded ? CombatPixel::FadedGreater : CombatPixel::UnlitGreater;
+        else if (dest_blend == 1 && first_static && first_static->img.view == views[0] && first_static->alpha_tiles.sparse &&
+            first_static->img.levels == 1 && !aniso_level_ && t0[kTssMinFilter] == t0[kTssMagFilter] &&
+            (t0[kTssMinFilter] == 1 || t0[kTssMinFilter] == 2) &&
+            t0[kTssAddressU] == 1 && t0[kTssAddressV] == 1) {
+            sparse_alpha = &first_static->alpha_tiles;
+            if (sparse_alpha->empty) return;
+            unlit = faded ? CombatPixel::SparseFadedAdditive : CombatPixel::SparseAdditive;
+        }
+        // Keep the existing per-pixel zero-alpha rejection for dense native
+        // additive layers. Sparse layers can reject empty tiles before sampling.
+        if (additive && !sparse_alpha) unlit = CombatPixel::None;
+    }
+#endif
+
     // vertex shader: the title's program, or fixed function for its declaration
     bool prog = (s.vs_handle & 1) && s.vs && !s.vs->program.empty();
     bool quad = count <= kQuadVertices && !s.rs[kRsZEnable];
@@ -3909,6 +4079,12 @@ void VulkanBackend::DrawGeometry(const State& s, uint32_t prim, uint32_t start, 
             if (!(billboard_samples & (1u << i))) fk.tex[i] = (2u << 12) | i;
     }
     if (hull && additive) fk.light |= kCombatClipPlanes;
+    // Source alpha is texture * vertex (* optional fade). Zero is the blend
+    // identity for RGBA and cannot write depth/stencil for this material.
+    // CullDistance rejects only whole primitives. A partly visible triangle
+    // keeps its original edges, interpolation and derivatives.
+    if (alpha_cull_ && unlit != CombatPixel::None && !(hull && additive) && (a.regs & (1u << 3)))
+        fk.light |= kCullZeroAlpha;
     uint64_t vkey;
     if (prog) {
         if (!s.vs->hash) s.vs->hash = Hash(s.vs->program.data(), s.vs->program.size() * 4) | 1;
@@ -3946,27 +4122,23 @@ void VulkanBackend::DrawGeometry(const State& s, uint32_t prim, uint32_t start, 
                          Bits(s.rs[kRsPointSizeMax]));
         }
     }
-    bool vnew;
-    {
-        std::lock_guard<std::recursive_mutex> g(cache_mu_);
-        vnew = !modules_.count(vkey);
-    }
-    if (vnew && !points && !spark_quad) {   // how it is made, for the cache (ShaderCache)
-        std::vector<uint8_t> r;
-        if (prog) {
-            CurrentVertexProgramRecipe(s.vs->program, a.regs, a.decode, quad, r);
-            CacheRecord('V', vkey, r.data(), r.size());
-        } else {
-            uint8_t b[2 + 1 + 8 + sizeof(FixedKey)];
-            std::memcpy(b, &a.regs, 2);
-            b[2] = uint8_t(a.pretransformed);
-            std::memcpy(b + 3, &a.decode, 8);
-            std::memcpy(b + 11, &fk, sizeof(fk));
-            CacheRecord('F', vkey, b, sizeof(b));
-        }
-    }
     async_now_ = async_;
     VkShaderModule vmod = Module(vkey, [&] {
+        // Record the recipe on the same cache miss that needs its source.
+        if (!points && !spark_quad) {
+            if (prog) {
+                std::vector<uint8_t> r;
+                CurrentVertexProgramRecipe(s.vs->program, a.regs, a.decode, quad, r);
+                CacheRecord('V', vkey, r.data(), r.size());
+            } else {
+                uint8_t b[2 + 1 + 8 + sizeof(FixedKey)];
+                std::memcpy(b, &a.regs, 2);
+                b[2] = uint8_t(a.pretransformed);
+                std::memcpy(b + 3, &a.decode, 8);
+                std::memcpy(b + 11, &fk, sizeof(fk));
+                CacheRecord('F', vkey, b, sizeof(b));
+            }
+        }
         std::string src = prog ? VertexProgramHlsl(s.vs->program, a.regs, a.decode)
                                : FixedVertexHlsl(a.regs, a.pretransformed, a.decode, fk);
         if (spark_quad) src = SparkStrokeHlsl(std::move(src));
@@ -4070,6 +4242,55 @@ void VulkanBackend::DrawGeometry(const State& s, uint32_t prim, uint32_t start, 
     pk.skip_alpha_test = (SimpleState(s, kMBlendEnable) || refractive_water) &&
         (!SimpleState(s, kMAlphaTestEnable) || Cmp(SimpleState(s, kMAlphaFunc)) == VK_COMPARE_OP_ALWAYS);
 #endif
+    if (unlit != CombatPixel::None) {
+        // Only the fade factor can come from the instance. Unused Xbox stage
+        // arguments and bound images should share the same native pipeline.
+        pk = {};
+        pk.combat = unlit;
+        pk.tex[0].kind = kTex2D;
+        if (a.vertex_count == 4 || sparse_alpha)
+            pk.shared_inputs = SharedUnlitInputs(a, !s.rs[kRsFogEnable]);
+#ifdef NGB_RIGID_CLIP
+        if (a.vertex_count == 4 && instances.empty() && !fk.blend && s.rs[kRsFogEnable] && s.rs[kRsFogTableMode] == 3) {
+            if (!checked_rigid) {
+                float viewport[16];
+                RigidViewport(s, target.gw, target.gh, viewport);
+                RigidMatrices(s, s.transforms[256].data(), viewport, rigid_wv, rigid_clip);
+                checked_rigid = true;
+            }
+            if (BeforeLinearFog(a, rigid_clip, Bits(s.rs[kRsFogStart]), Bits(s.rs[kRsFogEnd])))
+                pk.shared_inputs |= kBeforeLinearFog;
+        }
+#endif
+        // A black fog colour reduces the same interpolation to a multiply.
+        // Keep the interpolated factor, including its raster precision.
+        if (!(pk.shared_inputs & kBeforeLinearFog) && !(s.rs[kRsFogColor] & 0x00ffffff))
+            pk.shared_inputs |= kBlackFog;
+        // The sampler has already applied the requested filter. Zero alpha
+        // leaves every destination channel untouched under this blend state.
+        if (!sparse_alpha && alpha_compare == VK_COMPARE_OP_ALWAYS && first_static &&
+            first_static->img.view == views[0] && first_static->alpha_tiles.transparent_regions)
+            pk.shared_inputs |= kRejectZeroAlpha;
+        pk.skip_alpha_test = alpha_compare == VK_COMPARE_OP_ALWAYS;
+        pk.instance_factor = !instances.empty() &&
+            (unlit == CombatPixel::FadedAdditive || unlit == CombatPixel::SparseFadedAdditive ||
+             unlit == CombatPixel::FadedGreater);
+    }
+#ifdef NGB_DIRECT3D
+    // Untextured fixed-function lines select the interpolated diffuse colour.
+    // The host blend unit still applies the original blend to all four channels.
+    if (a.topology == Topology::Lines && !prog && !a.pretransformed && source_alpha_blend &&
+        (!s.rs[kRsSpecularEnable] || (!s.rs[kRsLighting] && !(a.regs & (1u << 4)))) &&
+        !sample_mask && !pk.two_sided && !pk.alphakill &&
+        pk.skip_alpha_test && !g_shader_hooks && !psdbg && !trace_ &&
+        t0[kTssColorOp] == 2 && t0[kTssColorArg1] == 0 &&
+        t0[kTssAlphaOp] == 2 && t0[kTssAlphaArg1] == 0 && t0[kTssResultArg] != 5 && t1[kTssColorOp] <= 1) {
+        pk = {};
+        pk.combat = CombatPixel::VertexColour;
+        pk.skip_alpha_test = 1;
+        if (!(s.rs[kRsFogColor] & 0x00ffffff)) pk.shared_inputs = kBlackFog;
+    }
+#endif
     // The heat haze over lava -- fixed-function sprites blended by their alpha, reading a 512x256 copy of the
     // screen on stage 0 at projected coordinates, clamped -- reads a little past the copy's right edge; clamped there,
     // the last column ran down the right of the screen as a streaky band, the console's too (#55). Near the copy's
@@ -4103,15 +4324,8 @@ void VulkanBackend::DrawGeometry(const State& s, uint32_t prim, uint32_t start, 
     // debugging: NGB_D3D_PSDEBUG=flat (solid red) | tex (stage 0's texture) | uv | diffuse
     static int flat = psdbg && !std::strcmp(psdbg, "flat");
     if (psdbg) pkey = Hash(psdbg, std::strlen(psdbg), pkey);
-    if (!psdbg && !sprite && !rectangular_point) {
-        bool pnew;
-        {
-            std::lock_guard<std::recursive_mutex> g(cache_mu_);
-            pnew = !modules_.count(pkey);
-        }
-        if (pnew) CacheRecord('P', pkey, &pk, sizeof(pk));
-    }
     VkShaderModule pmod = Module(pkey, [&] {
+        if (!psdbg && !sprite && !rectangular_point) CacheRecord('P', pkey, &pk, sizeof(pk));
         std::string src = PixelHlsl(pk);
         if (sprite || rectangular_point) src = PointPixelHlsl(std::move(src), sprite, rectangular_point ? point_samples : 0);
         // NGB_D3D_PSDEBUG=bump | duv | copy: the water's draws only (a bump map in stage 0 displacing stage
@@ -4323,6 +4537,16 @@ void VulkanBackend::DrawGeometry(const State& s, uint32_t prim, uint32_t start, 
         t0[kTssAlphaOp] == 4 && t0[kTssAlphaArg1] == 2 && t0[kTssAlphaArg2] == 0 && t0[kTssResultArg] != 5 &&
         !k.zen && !k.sten && k.blend && k.src == 0x302 && k.dst == 0x303 && k.op == 0x8006)
         k.has_rt |= kRtMissionBorder;
+    // A constant-alpha crossfade at either endpoint can write the source
+    // directly. Keep the guest factors for texture-coordinate handling below.
+    const bool constant_crossfade = k.blend && k.op == 0x8006 &&
+        ((k.src == 0x8003 && k.dst == 0x8004) || (k.src == 0x8004 && k.dst == 0x8003));
+    const bool replace_blend = constant_crossfade &&
+        (SimpleState(s, kMBlendColor) >> 24) == (k.src == 0x8003 ? 255u : 0u);
+    if (replace_blend) {
+        k.blend = 0;
+        k.src = k.dst = k.op = 0;
+    }
 #endif
     VkPipeline pipe = vmod && pmod ? Pipeline(k) : VK_NULL_HANDLE;
     if (!pipe && vmod && pmod && (k.has_rt & (kRtParticleWindows | kRtMissionBorder))) {
@@ -4683,6 +4907,10 @@ void VulkanBackend::DrawGeometry(const State& s, uint32_t prim, uint32_t start, 
             std::fflush(vf);
         }
     }
+    // This fixed vertex format supplies position, diffuse colour and UV. Its
+    // ordinary triangle shader never reads the programmable vertex registers.
+    const bool unlit_mesh = s.vs_handle == 0x142 && !s.ps && !g_shader_hooks &&
+        !a.pretransformed && !s.rs[kRsLighting] && !fk.blend && a.topology == Topology::Triangles && !spark_quad;
     if (!prog && !a.pretransformed) {
         float wv[16],vpm[16];
         RigidViewport(s,gw,gh,vpm);
@@ -4693,10 +4921,17 @@ void VulkanBackend::DrawGeometry(const State& s, uint32_t prim, uint32_t start, 
         } else
 #endif
         RigidMatrices(s,s.transforms[256].data(),vpm,wv,c.wvp);
-        Transpose(wv, c.wv);
-        float n[16] = {};
-        InverseTranspose3x3(wv, n);
-        Transpose(n, c.wvn);
+        // Generated UVs can still use the view-space position or normal on
+        // an unlit mesh. Count and generation have the same encoding as FixedVertexHlsl.
+        const bool plain_uv = unlit_mesh && std::none_of(std::begin(fk.tex), std::end(fk.tex),
+            [](uint32_t tex) { return tex & 0x770; });
+        if (!plain_uv) {
+            Transpose(wv, c.wv);
+            float n[16] = {};
+            InverseTranspose3x3(wv, n);
+            Transpose(n, c.wvn);
+            for (int t = 0; t < 4; t++) Transpose(s.transforms[16 + size_t(t)].data(), c.tm[t]);
+        }
         if (fk.blend) {
             for (int m = 0; m < 4; m++) {
                 float wvm[16], nm[16] = {};
@@ -4709,13 +4944,13 @@ void VulkanBackend::DrawGeometry(const State& s, uint32_t prim, uint32_t start, 
             MatMul(s.transforms[3].data(), vpm, pvm);
             Transpose(pvm, c.pv);
         }
-        for (int t = 0; t < 4; t++) Transpose(s.transforms[16 + size_t(t)].data(), c.tm[t]);
-        // lights in view space, the material and the ambient colour
-        std::memcpy(c.mat, s.material.data(), sizeof(float) * 16);
-        c.mat[4][0] = s.material[16];
-        Color(s.rs[kRsAmbient], c.amb);
-        for (int i = 0; i < 8; i++)
-            if ((fk.types >> (i * 2)) & 3) LightToView(s.lights[size_t(i)], s.transforms[2].data(), c.lt[i]);
+        if (!unlit_mesh) {
+            std::memcpy(c.mat, s.material.data(), sizeof(float) * 16);
+            c.mat[4][0] = s.material[16];
+            Color(s.rs[kRsAmbient], c.amb);
+            for (int i = 0; i < 8; i++)
+                if ((fk.types >> (i * 2)) & 3) LightToView(s.lights[size_t(i)], s.transforms[2].data(), c.lt[i]);
+        }
     }
 #ifdef NGB_DIRECT3D
     // The mission grid fades its pictures and borders through vertex alpha.
@@ -4732,7 +4967,8 @@ void VulkanBackend::DrawGeometry(const State& s, uint32_t prim, uint32_t start, 
         if (Describe(s.textures[0], tex) && tex.format == 0x0b) return;
     }
 #endif
-    VkDeviceSize vc;
+    const bool uses_vc = !unlit_mesh || !instances.empty();
+    VkDeviceSize vc = 0;
     if (!instances.empty()) vc = UploadBillboards(s, gw, gh, instances);
     else if (points && !prog) {   // the point sizes for PointHlsl, in registers fixed function leaves unused
         auto v = s.vsc;
@@ -4743,7 +4979,7 @@ void VulkanBackend::DrawGeometry(const State& s, uint32_t prim, uint32_t start, 
                   s.rs[kRsPointScaleEnable] ? 1.0f : 0.0f};
         v[191] = {Bits(s.rs[kRsPointScaleA]), Bits(s.rs[kRsPointScaleB]), Bits(s.rs[kRsPointScaleC]), vh};
         vc = UploadReused(vc_reuse_, v.data(), sizeof(v), ringAlign_);
-    } else {
+    } else if (uses_vc) {
         vc = UploadReused(vc_reuse_, s.vsc.data(), sizeof(s.vsc), ringAlign_);
     }
     QuadSnap(s, a, count, quad, rt ? rt->samples : ds ? ds->samples : 1, c);
@@ -4753,11 +4989,11 @@ void VulkanBackend::DrawGeometry(const State& s, uint32_t prim, uint32_t start, 
     // Sample them through the guest sampler, as the D3D9 ports do. Keep the
     // quad's pixel-centre correction and alpha-weighted filtering of UI art.
     if (c.qsnap[1] && rt && !prog && !pk.programmable && from_target[0] && !info[0].shadow &&
-        !k.sten && k.blend && k.op == 0x8006 && s.tss[1][kTssColorOp] == 1) {
+        !k.sten && (replace_blend || (k.blend && k.op == 0x8006)) && s.tss[1][kTssColorOp] == 1) {
         const bool composite = rt->gw >= 640 && rt->gh >= 448 && c.texsize[0][0] == 512 && c.texsize[0][1] == 512 &&
                                k.src == 0x302 && k.dst == 0x303;
         const bool capture = rt->gw == 512 && rt->gh == 512 && c.texsize[0][0] >= 640 && c.texsize[0][1] >= 448 &&
-                             k.src == 0x8003 && k.dst == 0x8004;
+                             SimpleState(s, kMSrcBlend) == 0x8003 && dest_blend == 0x8004;
         if (capture || composite) c.qsnap[1] = 0.0f;
     }
 #endif
@@ -4767,6 +5003,7 @@ void VulkanBackend::DrawGeometry(const State& s, uint32_t prim, uint32_t start, 
             c.uvc[1][j] = tile[j] + hull->hi[j];
         }
     }
+    if (sparse_alpha) std::memcpy(&c.uvc[2], sparse_alpha->words.data(), sizeof(sparse_alpha->words));
     bool id_opaque = !a.pretransformed && k.zen && k.zwrite && !k.blend && a.topology == Topology::Triangles &&
                      rt && rt->gw >= 640;
     bool id_dumping = !dump_dir_.empty() && presents_ + 1 >= dump_from_ && presents_ + 1 < dump_from_ + dump_count_;
@@ -4826,23 +5063,39 @@ void VulkanBackend::DrawGeometry(const State& s, uint32_t prim, uint32_t start, 
     uint32_t ibytes = a.index_count * (a.index16 ? 2 : 4);
 #ifdef NGB_DIRECT3D
     for (uint32_t b = 0; b < a.buffer_count; b++) voff[b] = UploadGeometry(a.buffers[b].src, a.buffers[b].bytes, 16, bufs[b]);
-    if (a.index_count) ioff = UploadGeometry(a.index_src, ibytes, 4, index_buf);
+    if (a.index_count) ioff = UploadGeometry(a.index_src, ibytes, 4, index_buf,
+                                            a.index16 && a.index_src == indices ? index_version : 0);
 #else
     for (uint32_t b = 0; b < a.buffer_count; b++) voff[b] = Upload(a.buffers[b].src, a.buffers[b].bytes, 16);
     if (a.index_count) ioff = Upload(a.index_src, ibytes, 4);
 #endif
     // an upload since the constants (theirs included) started the ring over: what they lie in is written over,
     // so again (the two from copies: UploadReused keeps its own)
-    if (vc_reuse_.epoch != ring_epoch_ || dc_reuse_.epoch != ring_epoch_) {
+    if (uses_vc && vc_reuse_.epoch != ring_epoch_) {
         std::vector<uint8_t> vbytes = vc_reuse_.bytes;
         vc = UploadReused(vc_reuse_, vbytes.data(), vbytes.size(), ringAlign_);
-        dc = UploadReused(dc_reuse_, &c, sizeof(c), ringAlign_);
     }
+    if (dc_reuse_.epoch != ring_epoch_)
+        dc = UploadReused(dc_reuse_, &c, sizeof(c), ringAlign_);
 
     // record: the uploads above may have submitted, so everything is set after them
-    BeginRendering(rt, ds);
+    bool overwrite_color = false;
+#ifdef NGB_DIRECT3D
+    // A full-target replacement with no rejected samples needs neither a
+    // previous attachment load nor a refill from an older MSAA resolve.
+    if (replace_blend && rt && !ds && !k.cull && k.wmask == 15 &&
+        k.fill != 0x1b00 && k.fill != 0x1b01 && k.has_rt == 1 && !prog && !pk.programmable &&
+        (pk.combat == CombatPixel::History || pk.combat == CombatPixel::None) && pk.skip_alpha_test && !pk.alphakill &&
+        !g_shader_hooks && !psdbg && !IdView() && !s.scissor_count && !vis_on_ &&
+        c.surf[2] >= 1.0f / 16777216.0f && c.surf[2] <= 1.0f &&
+        !s.viewport.x && !s.viewport.y && s.viewport.w == rt->gw && s.viewport.h == rt->gh &&
+        !c.ext[0] && !c.ext[2] && hud_clip1 <= 0 && hud_clipy1 <= 0)
+        overwrite_color = CoversColorTarget(a, rt->gw, rt->gh);
+#endif
+    BeginRendering(rt, ds, overwrite_color);
     BindPipeline(pipe);
-    VkDescriptorBufferInfo bvc{ring_, vc, vc_reuse_.bytes.size()}, bdc{ring_, dc, sizeof(c)};
+    // Keep a valid, stable descriptor for the layout even when the shader has no reads from it.
+    VkDescriptorBufferInfo bvc{ring_, vc, uses_vc ? vc_reuse_.bytes.size() : sizeof(s.vsc)}, bdc{ring_, dc, sizeof(c)};
     VkDescriptorImageInfo img[4], smp[4];
     for (int i = 0; i < 4; i++) {
         if (i == 3 && bump_view) {

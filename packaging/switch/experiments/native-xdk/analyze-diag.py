@@ -13,6 +13,10 @@ from statistics import mean, median
 from present_timing import gpu_ns_per_unit
 from perf_capture import game_capture
 
+MAIN_PHASES = ('particle_update_cpu_us', 'particle_prepare_cpu_us', 'ordered_list_cpu_us',
+               'effect_model_prepare_cpu_us', 'draw_task_other_cpu_us', 'player_update_cpu_us',
+               'scene_actor_update_cpu_us', 'interrupt_cpu_us')
+
 
 def load(path):
     sessions = []
@@ -58,6 +62,8 @@ def verify(s):
     for frame, a in n.items():
         b = v[frame]
         assert a['draws'] == b['draws'], (frame, 'draw count')
+        if a['frame_cpu_us']:
+            assert sum(a.get(key, 0) for key in MAIN_PHASES) <= a['frame_cpu_us'], (frame, 'main CPU phases overlap')
         assert b['exit_blank'] >= b['entry_blank']
         assert b['wait_wall_us'] + b['present_wall_us'] <= b['swap_wall_us'] + 2
         if b['retargeted']:
@@ -116,7 +122,7 @@ def verify(s):
         assert edge['vsync_wake_us'] >= edge['wait_start_us']
 
 
-def report(sessions, start=None, end=None):
+def report(sessions, start=None, end=None, ranges=()):
     selected = [i for i, s in enumerate(sessions) if s['rows']['N']]
     if not selected:
         raise ValueError('Capture the session with diagnostics.flag present at startup to record native diagnostics.')
@@ -124,26 +130,31 @@ def report(sessions, start=None, end=None):
     s, r = sessions[index], sessions[index]['rows']
     guests = r['G']
     times = [g['time_us'] for g in guests]
-    alive = []
+    window = []
     for n in r['N']:
+        if (start is not None and n['time_us'] < start*1e6) or (end is not None and n['time_us'] >= end*1e6):
+            continue
+        if ranges:
+            if any(first <= n['native_frame'] <= last for first, last in ranges):
+                window.append(n)
+            continue
         at = bisect_right(times, n['time_us'])-1
         g = guests[at] if at >= 0 else None
         if (n['draws'] >= 250 and g and g['active'] and
-                g['max_hp'] == 2400 and g['hp'] > 0 and n['time_us']-g['time_us'] < 250000 and
-                (start is None or n['time_us'] >= start*1e6) and
-                (end is None or n['time_us'] < end*1e6)):
-            alive.append(n)
-    frames = [n for n in alive if not n['profiled']]
+                g['max_hp'] == 2400 and g['hp'] > 0 and n['time_us']-g['time_us'] < 250000):
+            window.append(n)
+    frames = [n for n in window if not n['profiled']]
     wanted = {n['native_frame'] for n in frames}
     swaps = [v for v in r['V'] if v['native_frame'] in wanted]
     # Detailed samples are reported separately: they are excluded from the FPS
     # estimate so the observer cost can be checked against neighbouring frames.
-    alive_ids = {n['native_frame'] for n in alive}
-    detailed = [t for t in r['T'] if t['native_frame'] in alive_ids]
+    window_ids = {n['native_frame'] for n in window}
+    detailed = [t for t in r['T'] if t['native_frame'] in window_ids]
     result = dict(version=s['version'], session_index=index, trailing_sessions=len(sessions)-index-1,
         records={k: len(v) for k, v in r.items()}, dropped=dict(s['lost']), malformed=s['malformed'],
         window_seconds_since_boot=[start, end],
-        selection='alive Alma, max_hp=2400, draws>=250, detailed samples excluded',
+        selection='explicit frame ranges, detailed samples excluded' if ranges else
+                  'alive Alma, max_hp=2400, draws>=250, detailed samples excluded',
         frames=len(frames), fps=len(frames)*1e6/sum(n['frame_wall_us'] for n in frames) if frames else None)
     result['timing'] = {k: stats(n[k] for n in frames) for k in
         ('frame_wall_us','frame_cpu_us','frame_wait_us','resource_wait_us','fence_wait_us',
@@ -157,6 +168,14 @@ def report(sessions, start=None, end=None):
     byswap = {v['native_frame']: v for v in swaps}
     result['outside_pace_wall'] = stats(n['frame_wall_us']-byswap[n['native_frame']]['wait_wall_us']
         for n in frames if n['native_frame'] in byswap)
+    for key in MAIN_PHASES:
+        if key in s['schemas']['N']:
+            result[key[:-3]] = stats(n[key] for n in frames)
+    if 'ordered_list_cpu_us' in s['schemas']['N']:
+        result['unassigned_cpu'] = stats(n['frame_cpu_us'] - sum(n[k] for k in MAIN_PHASES)
+                                         for n in frames if n['frame_cpu_us'])
+    if ranges:
+        result['native_frame_ranges'] = ranges
     result['calls_per_frame'] = {k: mean(n[k] for n in frames) if frames else None
         for k in s['schemas']['N'] if k.endswith('_calls') or k in ('draws','inline_words')}
     # Native and render presents use the same counter in this package. GPU
@@ -180,8 +199,9 @@ def report(sessions, start=None, end=None):
         texture_upload=stats(a['texture_us'] for a in matched))
     result['sampled_exclusive_wall'] = {k: stats(t[k]/1000 for t in detailed)
         for k in s['schemas']['T'] if k.endswith('_ns')}
-    result['sampled_frame_cpu'] = stats(n['frame_cpu_us'] for n in alive if n['profiled'])
-    result['readback'] = {k: sum(b[k] for b in r['B']) for k in
+    result['sampled_frame_cpu'] = stats(n['frame_cpu_us'] for n in window if n['profiled'])
+    readbacks = [b for b in r['B'] if b['present'] in wanted] if ranges else r['B']
+    result['readback'] = {k: sum(b[k] for b in readbacks) for k in
         ('requests','targets','staging_bytes','wall_us','cpu_us','submit_us')}
     result['latest_clocks'] = r['C'][-1] if r['C'] else None
     result['notes'] = [
@@ -192,6 +212,10 @@ def report(sessions, start=None, end=None):
         'Readback B runs on the render thread. Its time overlaps the guest readback wait; do not add them.',
         'From 0.57.9, asynchronous chunks share a frame ID. Their Q rows count each covered GPU interval once, excluding gaps between submissions.',
     ]
+    if 'ordered_list_cpu_us' in s['schemas']['N']:
+        result['notes'].append('The per-frame CPU phases are exclusive across nested passes, Xbox workers and fibers. '
+                               'Effect/model preparation excludes the two particle passes. Draw-task overhead excludes '
+                               'ordered-list dispatch. Unassigned CPU is the frame CPU time outside those measured phases.')
     return s, result
 
 
@@ -204,12 +228,12 @@ if __name__ == '__main__':
     parser.add_argument('--json', type=Path)
     parser.add_argument('--story', action='store_true', help='compare New Game entries, full charges and Alma sword landing candidates in each boot')
     parser.add_argument('--frames', type=int, nargs=2, action='append', default=[],
-                        metavar=('FIRST','LAST'), help='include this inclusive guest-flip window in --story output')
+                        metavar=('FIRST','LAST'), help='select inclusive native frame IDs, or guest flip IDs with --story')
     parser.add_argument('--start', type=float, help='inclusive seconds since boot (not since first combat row)')
     parser.add_argument('--end', type=float, help='exclusive seconds since boot')
     args = parser.parse_args()
-    if args.frames and (not args.story or any(first<0 or last<first for first,last in args.frames)):
-        parser.error('--frames requires --story and an inclusive range of nonnegative flip numbers')
+    if any(first<0 or last<first for first,last in args.frames):
+        parser.error('--frames requires an inclusive range of nonnegative frame numbers')
     if args.start is not None and args.end is not None and args.end <= args.start:
         parser.error('--end must be later than --start')
     sessions = load(args.capture)
@@ -227,7 +251,7 @@ if __name__ == '__main__':
             args.json.write_text(output+'\n')
         print(output)
         raise SystemExit(0)
-    session, result = report(sessions, args.start, args.end)
+    session, result = report(sessions, args.start, args.end, args.frames)
     if args.verify:
         verify(session)
         result['verified'] = True

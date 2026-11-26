@@ -1,9 +1,6 @@
 /* Included by runtime.c: a single host CPU runs the guest threads in turn.
  * Each suspended call chain has its own host stack and emulated registers. */
 #include "../../../src/host_context.h"
-#ifdef NGB_NATIVE_DIAG
-#include "combat_perf.h"
-#endif
 
 #define WORKER_LIMIT 16
 #define WORKER_HOST_STACK (1024u * 1024u)
@@ -422,6 +419,9 @@ static struct fiber {
     uint32_t record, seh, owner;
     void *stack, *sp;
     RecompRegs regs;
+#ifdef NGB_NATIVE_DIAG
+    unsigned cpu_phase;
+#endif
 } fibers[128];
 
 static void release_owned_fibers(unsigned owner)
@@ -456,9 +456,36 @@ static uint32_t fiber_slot(void)
     return read32(tls + read32(0x45e84c) * 4) + 8;
 }
 
+#ifdef NGB_NATIVE_DIAG
+static unsigned fiber_cpu_phase(uint32_t record)
+{
+    // CreateFiber puts the start routine immediately before the fiber record
+    // and its argument in the first word. Only the title's task trampoline
+    // interprets that argument as a task object with a callback at +12.
+    uint32_t entry[2], callback;
+    const void *header = ngb_ram_span(record - 4, sizeof(entry));
+    if (!header) return NGB_CPU_OTHER;
+    memcpy(entry, header, sizeof(entry));
+    if (entry[0] != 0x0030c8b0u || entry[1] > UINT32_MAX - 12) return NGB_CPU_OTHER;
+    const void *target = ngb_ram_span(entry[1] + 12, sizeof(callback));
+    if (!target) return NGB_CPU_OTHER;
+    memcpy(&callback, target, sizeof(callback));
+    switch (callback) {
+    case 0x001ca790u: return NGB_CPU_DRAW_TASK;
+    case 0x001cb9a0u: return NGB_CPU_EFFECT_PREPARE;
+    case 0x000320e0u: return NGB_CPU_PLAYER_UPDATE;
+    case 0x00151150u: return NGB_CPU_SCENE_ACTORS;
+    default: return NGB_CPU_OTHER;
+    }
+}
+#endif
+
 static void start_fiber(void)
 {
     uint32_t record = read32(fiber_slot());
+#ifdef NGB_NATIVE_DIAG
+    if (ngb_combat_enabled) ngb_native_cpu_resume(fiber_cpu_phase(record));
+#endif
     g_esp = record - 8;
     g_ebx = g_esi = g_edi = g_seh_ebp = 0;
     write32(g_fs_base, UINT32_MAX);
@@ -488,6 +515,9 @@ void ngb_switch_fiber(void)
         write32(g_fs_base, next->seh);
     }
     write32(slot, dest);
+#ifdef NGB_NATIVE_DIAG
+    if (ngb_combat_enabled) old->cpu_phase = ngb_native_cpu_resume(next->cpu_phase);
+#endif
     ngb_ctx_switch(&old->sp, next->sp);
 }
 

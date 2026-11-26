@@ -101,11 +101,23 @@ static uint64_t PaceNowUs() {
         std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
-enum class Op : uint8_t { State, Headers, Peek, Draw, Clear, Copy, Present, Flush, Gamma, VisBegin, VisEnd, Sync, Billboards };
+enum class Op : uint8_t { State, Peek, Draw, Clear, Copy, Present, Flush, Gamma, VisBegin, VisEnd, Sync, Billboards, Lines };
+
+// A draw keeps its position in the command stream. Its state is relative to
+// the last draw of the same kind, even when a different material drew between.
+enum class DrawState : uint8_t {
+    Scene,
+#ifdef NGB_DIRECT3D
+    Lines, Particles,
+#endif
+    Count
+};
+constexpr size_t kDrawStates = size_t(DrawState::Count);
 
 struct Cmd {
     Op op;
     CombatEffect effect = CombatEffect::None;
+    DrawState state = DrawState::Scene;
     uint32_t a = 0, b = 0, c = 0, d = 0;
     float f = 0;
     uint32_t data = 0, size = 0;   // bytes in Batch::bytes
@@ -123,14 +135,24 @@ struct HeaderSend {
 };
 
 #ifdef NGB_DIRECT3D
-struct IndexSnapshot {
-    std::vector<uint8_t> bytes;
+// Per-run resources can change between particles without changing the common
+// render state. Indices and instances are owned by the batch until replay.
+struct ParticleIndices {
+    uint32_t offset = 0, count = 0;
     IndexBounds bounds{};
 };
+struct ParticleStrip {
+    State::Stream stream;
+    uint32_t texture, first, count;
+    ParticleIndices indices;
+};
+
 struct IndexSlot {
     const uint8_t* source = nullptr;
     unsigned count = 0;
     std::shared_ptr<const IndexSnapshot> snapshot;
+    uint64_t owner_batch = 0;
+    uint32_t owner_position = 0;
 };
 #endif
 
@@ -138,11 +160,28 @@ struct Batch {
 #ifdef NGB_DIRECT3D
     std::vector<std::shared_ptr<const IndexSnapshot>> index_snapshots;
     std::vector<BillboardInstance> billboards;
+    std::vector<ParticleStrip> strips;
+    std::array<ParticleIndices, 8> particle_indices{};
 #endif
     uint64_t id = 0;
     uint64_t handed_us = 0;   // (NV2A_PACE_LOG)
     uint32_t put = 0;   // the title's DMA_PUT as it was handed over: the push buffer may be read this far once drawn
+    struct HeaderGroup {
+        uint32_t before_command, header_end;
+    };
+    std::vector<HeaderSend> headers;
+    std::vector<HeaderGroup> header_groups;
     std::vector<Cmd> cmds;
+
+    // Apply new descriptors before the next command. Such a draw cannot join
+    // the preceding one, even if their scalar render state is identical.
+    bool HasHeaderBoundary() const {
+        return !header_groups.empty() && header_groups.back().before_command == cmds.size();
+    }
+    // Header updates count towards the same handoff limit as draw commands.
+    size_t CommandCount() const { return cmds.size() + header_groups.size(); }
+    bool Empty() const { return cmds.empty() && header_groups.empty(); }
+
     std::vector<uint8_t> bytes;
     std::vector<std::shared_ptr<VertexShader>> vs;
     std::vector<std::shared_ptr<PixelShader>> ps;
@@ -164,6 +203,11 @@ constexpr auto StateRanges() {
     auto simple = [](uint32_t first, uint32_t last) {   // methods first to last
         return Range{offsetof(State, simple) + first, size_t(last - first) + 4};
     };
+#ifdef NGB_DIRECT3D
+    auto texture_stage = [](size_t stage) {
+        return Range{offsetof(State, tss) + stage * sizeof(State::tss[0]), sizeof(State::tss[0])};
+    };
+#endif
     return std::array{
         simple(kMPsAlphaInputs, kMPsFinalEfgh),
         simple(kMAlphaTestEnable, kMDepthOffset),
@@ -171,7 +215,11 @@ constexpr auto StateRanges() {
         simple(kMPsCompareMode, kMPsCompareMode),
         simple(kMDepthClipControl, kMDepthClipControl),
         simple(kMPsFinalConstant0, kMPsInputTexture),
+#ifdef NGB_DIRECT3D
+        Range{offsetof(State, rs), sizeof(State::rs)},
+#else
         Range{offsetof(State, rs), offsetof(State, index_buffer) - offsetof(State, rs)},          // render states, textures, the streams
+#endif
         Range{offsetof(State, index_buffer), offsetof(State, vs) - offsetof(State, index_buffer)},
 #ifdef NGB_DIRECT3D
         Range{offsetof(State, psc), offsetof(State, transforms) - offsetof(State, psc)},
@@ -185,6 +233,9 @@ constexpr auto StateRanges() {
         Range{offsetof(State, material), sizeof(State::material)},
         Range{offsetof(State, light_enable), offsetof(State, changed_constant_blocks) - offsetof(State, light_enable)},
         Range{offsetof(State, zscale), sizeof(State::zscale)},
+        texture_stage(0), texture_stage(1), texture_stage(2), texture_stage(3),
+        Range{offsetof(State, textures), offsetof(State, streams) - offsetof(State, textures)},
+        Range{offsetof(State, streams), sizeof(State::streams)},
 #else
         Range{offsetof(State, material), sizeof(State) - offsetof(State, material)},
 #endif
@@ -193,9 +244,22 @@ constexpr auto StateRanges() {
 
 constexpr auto kStateRanges = StateRanges();
 #ifdef NGB_DIRECT3D
-static_assert(kStateRanges.size() == 15 &&
+constexpr Range kInstanceFactor{offsetof(State, rs) + kRsTextureFactor * sizeof(uint32_t), sizeof(uint32_t)};
+constexpr Range kInstanceWorld{offsetof(State, transforms) + 256 * sizeof(State::transforms[0]), sizeof(State::transforms[0])};
+static_assert(kInstanceFactor.off >= kStateRanges[6].off &&
+              kInstanceFactor.off + kInstanceFactor.len <= kStateRanges[6].off + kStateRanges[6].len);
+static_assert(kInstanceWorld.off == kStateRanges[11].off && kInstanceWorld.len <= kStateRanges[11].len);
+static_assert(kStateRanges.size() == 21 &&
               kStateRanges[6].off == offsetof(State, rs) &&
+              kStateRanges[6].off + kStateRanges[6].len == kStateRanges[15].off &&
+              kStateRanges[18].off + kStateRanges[18].len == kStateRanges[19].off &&
+              kStateRanges[19].off + kStateRanges[19].len == kStateRanges[20].off &&
+              kStateRanges[20].off + kStateRanges[20].len == kStateRanges[7].off &&
               kStateRanges[7].off == offsetof(State, index_buffer) &&
+              kStateRanges[8].off == offsetof(State, psc) &&
+              kStateRanges[13].off == offsetof(State, light_enable) &&
+              kStateRanges[14].off == offsetof(State, zscale) &&
+              kStateRanges[9].off == offsetof(State, transforms) + 2 * 64 &&
               kStateRanges[10].off == offsetof(State, transforms) + 16 * 64 &&
               kStateRanges[11].off == offsetof(State, transforms) + 256 * 64 &&
               kStateRanges[12].off == offsetof(State, material));
@@ -314,19 +378,45 @@ public:
                       const uint8_t* indices, PreparedState changes, CombatEffect effect) override {
         RecordDraw(s, prim, start, count, indices, changes, effect);
     }
+#ifdef NGB_DIRECT3D
+    void DrawSnapshot(const State& s, uint32_t prim, uint32_t start, const std::shared_ptr<const IndexSnapshot>& indices,
+                      PreparedState changes, CombatEffect effect) override {
+        RecordDraw(s, prim, start, indices->count(), indices->data(), changes, effect, indices);
+    }
+#endif
     void RecordDraw(const State& s, uint32_t prim, uint32_t start, uint32_t count,
-                    const uint8_t* indices, PreparedState changes, CombatEffect effect) {
+                    const uint8_t* indices, PreparedState changes, CombatEffect effect,
+                    const std::shared_ptr<const IndexSnapshot>& immutable = {}) {
         std::lock_guard lock(cap_);
 #ifdef NGB_DIRECT3D
-        if (thread_ && prim == 6 && !start && count == 4 && indices && effect == CombatEffect::None &&
-            !recording_visibility_ && TryInstanceBillboards(s, indices, changes)) return;
+        const bool segment = (prim == 2 || prim == 4) && count == 2 && !indices;
+        if (thread_ && segment && !start && !recording_visibility_ &&
+            !(s.vs_handle & 1) && s.streams[0].vb && s.streams[0].stride && s.streams[0].stride <= 256 &&
+            kernel::R32(s.streams[0].vb) == 0x80000001u && !SamplesOutput(s)) {
+            RecordLines(s, prim, changes, effect);
+            return;
+        }
+        if (thread_ && prim == 6 && !start && indices && count >= 3 && count <= 32 &&
+            effect == CombatEffect::None && !recording_visibility_ && CanInstanceBillboards(s)) {
+            RecordParticleStrip(s, indices, count, changes);
+            return;
+        }
         const size_t before = cur_->cmds.size();
 #endif
         SendState(s, start + count, changes);
 #ifdef NGB_DIRECT3D
-        if (before == cur_->cmds.size() && before && cur_->cmds.back().op == Op::Draw) {
+        if (before == cur_->cmds.size() && before && cur_->cmds.back().op == Op::Draw && !cur_->HasHeaderBoundary()) {
             ++same_state_pairs_;
             Cmd& prev = cur_->cmds.back();
+            // An ordinary bound vertex buffer also permits joining adjacent
+            // endpoint pairs without taking a new copy of its vertices.
+            if (segment && !recording_visibility_ && !prev.d && prev.effect == effect &&
+                ((prev.a == 2 && !(prev.c & 1)) || (prev.a == 4 && prev.c == 2)) &&
+                prev.c < 1024 && uint64_t(prev.b) + prev.c == start && !SamplesOutput(s)) {
+                prev.a = 2;
+                prev.c += 2;
+                return;
+            }
             if (prev.effect == effect && prim == 6 && prev.a == prim && indices && prev.d == 1 && prev.b == start &&
                 TryJoinStrips(s, prev, indices, count)) {
                 ++merged_strips_;
@@ -345,12 +435,12 @@ public:
         c.c = count;
         if (indices) {
 #ifdef NGB_DIRECT3D
-            auto snapshot = CaptureIndices(indices, count);
-            if (snapshot) {
+            if (immutable) {
                 c.d = 2;
                 c.size = uint32_t(cur_->index_snapshots.size());
-                cur_->index_snapshots.push_back(std::move(snapshot));
-            } else
+                cur_->index_snapshots.push_back(immutable);
+            } else if (CaptureIndices(indices, count, c.size)) c.d = 2;
+            else
 #endif
             {
                 c.d = 1;
@@ -358,7 +448,7 @@ public:
             }
         }
         cur_->cmds.push_back(c);
-        if (!thread_ || cur_->cmds.size() >= kBatchCommands) Submit();
+        if (!thread_ || cur_->CommandCount() >= kBatchCommands) Submit();
     }
 
     void Clear(const State& s, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z,
@@ -406,7 +496,7 @@ public:
 #endif
             SendHeader(front.header);
             FlushHeaders();
-            SendPeek(sent_);
+            SendPeek(recorded_[size_t(last_state_)].value);
             Cmd c{Op::Present};
             c.s1 = front;
             c.quick = int32_t(cur_->quick.size());
@@ -526,7 +616,7 @@ public:
             if (g_pace_on) g_pace.hook_busy++;
             return;
         }
-        if (g_pace_on) (cur_->cmds.empty() ? g_pace.hook_gate : g_pace.hook_submit)++;
+        if (g_pace_on) (cur_->Empty() ? g_pace.hook_gate : g_pace.hook_submit)++;
         Release();
         cap_.unlock();
     }
@@ -556,24 +646,125 @@ private:
 #ifdef NGB_DIRECT3D
     // Promote a recurring source only on its second use. Pending batches own
     // immutable snapshots; a guest overwrite or a cache collision can't change them.
-    std::shared_ptr<const IndexSnapshot> CaptureIndices(const uint8_t* src, unsigned count) {
-        if (count < 64 || count > 4096) return {};
+    bool CaptureIndices(const uint8_t* src, unsigned count, uint32_t& position) {
+        if (count < 64 || count > 4096) return false;
         uintptr_t key = reinterpret_cast<uintptr_t>(src);
-        auto& slot = index_slots_[((key >> 2) ^ (key >> 13) ^ count) & 2047];
-        if (slot.source != src || slot.count != count) {
-            slot = {src, count, {}};
-            return {};
+        size_t set = ((key >> 2) ^ (key >> 13) ^ count) & (std::size(index_slots_) - 1);
+        auto& ways = index_slots_[set];
+        auto matches = [&](unsigned way) { return ways[way].source == src && ways[way].count == count; };
+        unsigned way = 0;
+        if (!matches(0)) {
+            if (matches(1)) way = 1;
+            else {
+                way = index_victim_[set];
+                ways[way] = {src, count, {}};
+                index_victim_[set] = way ^ 1;
+                return false;
+            }
         }
-        size_t bytes = size_t(count)*2;
-        if (slot.snapshot && !std::memcmp(slot.snapshot->bytes.data(), src, bytes)) {
+        index_victim_[set] = way ^ 1;
+        auto& slot = ways[way];
+        const size_t bytes = size_t(count) * 2;
+        if (slot.snapshot && !std::memcmp(slot.snapshot->data(), src, bytes)) {
             ++index_hits_;
-            return slot.snapshot;
+        } else {
+            std::vector<uint16_t> copy(count);
+            std::memcpy(copy.data(), src, bytes);
+            slot.snapshot = std::make_shared<IndexSnapshot>(std::move(copy));
+            slot.owner_batch = 0;
         }
-        auto copy = std::make_shared<IndexSnapshot>();
-        copy->bytes.assign(src, src + bytes);
-        copy->bounds = IndexRange(copy->bytes.data(), count);
-        slot.snapshot = copy;
-        return copy;
+        if (slot.owner_batch != cur_->id) {
+            slot.owner_position = uint32_t(cur_->index_snapshots.size());
+            cur_->index_snapshots.push_back(slot.snapshot);
+            slot.owner_batch = cur_->id;
+        }
+        position = slot.owner_position;
+        return true;
+    }
+
+    // A per-draw resolve can observe the output produced by the preceding draw.
+    static bool SamplesOutput(const State& s) {
+        for (uint32_t texture : s.textures) {
+            if (!texture) continue;
+            uint32_t data = kernel::R32(texture + 4) & 0x7fffffffu;
+            if (data == (s.rt.data & 0x7fffffffu) || data == (s.zs.data & 0x7fffffffu)) return true;
+        }
+        return false;
+    }
+
+    // Append to the open native draw while the producer still owns it. Other
+    // draw kinds must see all intervening changes when they next record state.
+    bool ContinueEffect(const State& s, uint32_t vertices, PreparedState changes, DrawState kind,
+                        bool& captured_inputs) {
+        auto& record = recorded_[size_t(kind)];
+        if (!changes.revision || changes.changed == ~0u || fixed_source_ != &s ||
+            fixed_revision_ + 1 != changes.revision || last_state_ != kind ||
+            header_batch_ != cur_->id || header_has_up_ || cur_->HasHeaderBoundary() ||
+            !s.constants_revision || record.constants_revision != s.constants_revision ||
+            !s.lights_revision || record.value.lights_revision != s.lights_revision ||
+            record.value.vs != s.vs || record.value.ps != s.ps) return false;
+        const auto* sent = reinterpret_cast<const uint8_t*>(&record.value);
+        const auto* now = reinterpret_cast<const uint8_t*>(&s);
+        // The particle command already owns both values for this instance.
+        // Another draw kind can append only if it sees the same two values.
+        if (kind != DrawState::Particles && (changes.changed & PreparedState::InstanceValues) &&
+            (std::memcmp(sent + kInstanceFactor.off, now + kInstanceFactor.off, kInstanceFactor.len) ||
+             std::memcmp(sent + kInstanceWorld.off, now + kInstanceWorld.off, kInstanceWorld.len))) return false;
+        uint32_t ranges = changes.changed & ((1u << kStateRanges.size()) - 1);
+        while (ranges) {
+            const Range r = kStateRanges[__builtin_ctz(ranges)];
+            if (std::memcmp(sent + r.off, now + r.off, r.len)) return false;
+            ranges &= ranges - 1;
+        }
+        static const bool verify = std::getenv("NGB_NATIVE_MESH_VERIFY") != nullptr;
+        if (verify) VerifyFixedRanges(sent, now, changes.changed);
+        const size_t before = cur_->cmds.size();
+        SendDrawHeaders(s, vertices, kind, changes.changed, verify);
+        SendPeek(s);
+        captured_inputs = true;
+        if (header_has_up_ || cur_->HasHeaderBoundary() || before != cur_->cmds.size()) return false;
+        fixed_revision_ = changes.revision;
+        for (size_t i = 0; i < pending_changes_.size(); ++i)
+            if (i != size_t(kind)) pending_changes_[i] |= changes.changed;
+        return true;
+    }
+
+    // Fixed-function UP draws consume only stream zero. Snapshot the two
+    // endpoints now, even if the game changes its scratch buffer on the next call.
+    void RecordLines(const State& s, uint32_t prim, PreparedState changes, CombatEffect effect) {
+        const auto stream = s.streams[0];
+        bool captured_inputs = false;
+        if (!cur_->cmds.empty()) {
+            const auto& last = cur_->cmds.back();
+            if (last.op == Op::Lines && last.effect == effect && last.c < 1024 &&
+                last.data + size_t(last.c) * stream.stride == ((cur_->bytes.size() + 3) & ~size_t(3)) &&
+                ContinueEffect(s, 2, changes, DrawState::Lines, captured_inputs)) {
+                const uint32_t source = kernel::R32(stream.vb + 4);
+                Put(kernel::HostPtr(source, stream.stride * 2), stream.stride * 2);
+                cur_->cmds.back().c += 2;
+                return;
+            }
+        }
+        SendState(s, 2, changes, DrawState::Lines, captured_inputs);
+        uint32_t source = kernel::R32(stream.vb + 4);
+        uint32_t offset = Put(kernel::HostPtr(source, stream.stride * 2), stream.stride * 2);
+        auto& commands = cur_->cmds;
+        if (!commands.empty() && !cur_->HasHeaderBoundary()) {
+            auto& last = commands.back();
+            if (last.op == Op::Lines && last.effect == effect && last.c < 1024 && last.data + last.c * stream.stride == offset) {
+                last.c += 2;
+                return;
+            }
+        }
+        Cmd c{Op::Lines};
+        c.state = DrawState::Lines;
+        c.a = prim;
+        c.effect = effect;
+        c.data = offset;
+        c.b = source;
+        c.c = 2;
+        commands.push_back(c);
+        if (cur_->CommandCount() >= kBatchCommands) Submit();
     }
 
     // A repeated last and first index separate the strips. The second strip
@@ -583,11 +774,7 @@ private:
             !s.rs[kRsZEnable] || (s.vs_handle & 0xf) == 4 ||
             s.rs[kRsFillMode] == 0x1B00 || s.rs[kRsFillMode] == 0x1B01) return false;
         // Some game passes sample a render target. Keep their per-draw resolves.
-        for (uint32_t texture : s.textures) {
-            if (!texture) continue;
-            const uint32_t data = kernel::R32(texture + 4) & 0x7fffffff;
-            if (data == (s.rt.data & 0x7fffffff) || data == (s.zs.data & 0x7fffffff)) return false;
-        }
+        if (SamplesOutput(s)) return false;
         const size_t end = size_t(prev.data) + prev.c * sizeof(uint16_t);
         if (end != cur_->bytes.size()) return false;
         // Keep the same vertex fetch footprint: joining two sparse strips must
@@ -623,6 +810,8 @@ private:
         if (s.vs_handle != 0x142 || s.ps || s.rs[kRsLighting] || s.rs[kRsVertexBlend] ||
             !s.rs[kRsZEnable] || !s.simple[kMBlendEnable / 4] || s.simple[kMSrcBlend / 4] != 0x302 ||
             s.simple[kMDestBlend / 4] != 1 || s.simple[kMBlendOp / 4] != 0x8006) return false;
+        // UP streams take a private vertex copy with every draw.
+        if (!s.streams[0].vb || (kernel::R32(s.streams[0].vb) & 0x80000000u)) return false;
         uint32_t generated = 0;
         for (unsigned i = 0; i < s.textures.size(); ++i) {
             if (!s.textures[i]) continue;
@@ -635,45 +824,57 @@ private:
         return !generated || !(generated & FixedTextureSampleMask(s));
     }
 
-    bool TryInstanceBillboards(const State& s, const uint8_t* indices, PreparedState changes) {
-        auto& commands = cur_->cmds;
-        if (commands.empty()) return false;
-        const auto& last = commands.back();
-        const bool first_pair = last.op == Op::Draw && last.effect == CombatEffect::None &&
-                                last.a == 6 && !last.b && last.c == 4 && last.d == 1;
-        if (!first_pair && (last.op != Op::Billboards || last.c >= kBillboardsPerDraw)) return false;
-        constexpr size_t index_bytes = 4 * sizeof(uint16_t);
-        if (std::memcmp(cur_->bytes.data() + last.data, indices, index_bytes) || !CanInstanceBillboards(s)) return false;
-
-        // Leave the first draw on the ordinary strip-joining path until the same geometry recurs.
-        const size_t before = commands.size();
-        auto& instances = cur_->billboards;
-        const BillboardInstance previous{sent_.transforms[256], sent_.rs[kRsTextureFactor]};
-        const BillboardInstance current{s.transforms[256], s.rs[kRsTextureFactor]};
-        current.Apply(sent_);
-        SendState(s, 4, changes);
-        if (commands.size() == before) {
-            auto& group = commands.back();
-            if (first_pair) {
-                group.op = Op::Billboards;
-                group.a = uint32_t(instances.size());
-                group.c = 1;
-                instances.push_back(previous);
+    void RecordParticleStrip(const State& s, const uint8_t* indices, uint32_t count, PreparedState changes) {
+        // Replay restores these four values for each run/instance. Keeping them
+        // out of state deltas also handles a one-particle run between two lines.
+        const BillboardInstance instance{s.transforms[256], s.rs[kRsTextureFactor]};
+        State& sent = recorded_[size_t(DrawState::Particles)].value;
+        instance.Apply(sent);
+        if (sent.streams[0].vb != s.streams[0].vb)
+            changes.changed |= PreparedState::HeaderBindings | PreparedState::HeaderWrite(s.streams[0].vb);
+        if (sent.textures[0] != s.textures[0])
+            changes.changed |= PreparedState::HeaderBindings | PreparedState::HeaderWrite(s.textures[0]);
+        sent.streams[0] = s.streams[0];
+        sent.textures[0] = s.textures[0];
+        bool captured_inputs = false;
+        if (!cur_->cmds.empty() && cur_->cmds.back().op == Op::Billboards) {
+            auto& run = cur_->strips.back();
+            if (run.count < kBillboardsPerDraw && run.texture == s.textures[0] && run.stream.vb == s.streams[0].vb &&
+                run.stream.stride == s.streams[0].stride && count == run.indices.count &&
+                !std::memcmp(cur_->bytes.data() + run.indices.offset, indices, size_t(count) * 2) &&
+                ContinueEffect(s, count, changes, DrawState::Particles, captured_inputs)) {
+                cur_->billboards.push_back(instance);
+                ++run.count;
+                if (cur_->billboards.size() >= kBatchCommands) Submit();
+                return;
             }
-            instances.push_back(current);
-            ++group.c;
-            return true;
         }
-        // A state, resource or peek change separates the draws. This command also
-        // delivers the current world matrix and colour masked out of SendState.
-        Cmd group{Op::Billboards};
-        group.data = Put(indices, index_bytes);
-        group.a = uint32_t(instances.size());
-        group.c = 1;
-        instances.push_back(current);
-        commands.push_back(group);
-        if (commands.size() >= kBatchCommands) Submit();
-        return true;
+        SendState(s, count, changes, DrawState::Particles, captured_inputs);
+        auto& commands = cur_->cmds;
+        auto& strips = cur_->strips;
+        if (commands.empty() || commands.back().op != Op::Billboards || cur_->HasHeaderBoundary()) {
+            Cmd batch{Op::Billboards};
+            batch.state = DrawState::Particles;
+            batch.a = uint32_t(strips.size());
+            commands.push_back(batch);
+        }
+        auto& batch = commands.back();
+        const auto stream = s.streams[0];
+        const size_t bytes = count * sizeof(uint16_t);
+        // Reuse the immutable indices and their fetch bounds even when a line
+        // or another animation frame came between two uses of the mesh.
+        auto& mesh = cur_->particle_indices[count % cur_->particle_indices.size()];
+        if (mesh.count != count || std::memcmp(cur_->bytes.data() + mesh.offset, indices, bytes))
+            mesh = {Put(indices, bytes), count, IndexRange(indices, count)};
+        if (!batch.c || strips.back().count == kBillboardsPerDraw ||
+            strips.back().texture != s.textures[0] || strips.back().stream.vb != stream.vb ||
+            strips.back().stream.stride != stream.stride || strips.back().indices.offset != mesh.offset) {
+            strips.push_back({stream, s.textures[0], uint32_t(cur_->billboards.size()), 0, mesh});
+            ++batch.c;
+        }
+        cur_->billboards.push_back(instance);
+        ++strips.back().count;
+        if (cur_->CommandCount() >= kBatchCommands || cur_->billboards.size() >= kBatchCommands) Submit();
     }
 #endif
 
@@ -699,63 +900,186 @@ private:
         }
         return id;
     }
+    struct SentHeader {
+        HeaderCopy copy{};
+#ifdef NGB_DIRECT3D
+        uint64_t batch = 0;
+        uint32_t data = 0, parent = 0;
+        // Entries in the lifetime maps are never erased. Their addresses
+        // stay valid across rehash, including for resources that share data.
+        uint64_t *header_use = nullptr, *data_use = nullptr, *parent_use = nullptr;
+#endif
+    };
+    struct Recent {
+        uint32_t key = 0;
+        SentHeader* entry = nullptr;
+    };
+    std::array<Recent, 512> recent_{};
+    Recent& RecentHeader(uint32_t header) {
+        auto& slot = recent_[((header >> 4) ^ (header >> 13) ^ (header >> 21)) & (recent_.size() - 1)];
+        if (slot.key != header) slot = {header, &sent_headers_[header]};
+        return slot;
+    }
+#ifdef NGB_DIRECT3D
+    Recent texture_headers_[4]{}, palette_headers_[4]{}, stream_headers_[16]{}, target_headers_[2]{};
+    bool primary_headers_only_ = false;
+
+    bool HeaderStillCurrent(uint32_t header, const SentHeader& sent) const {
+        if (sent.batch != cur_->id) return false;
+        const uint32_t type = sent.copy.w[0] & 0x70000;
+        const size_t bytes = type < 0x20000 || type == 0x30000 ? 12 : sizeof(sent.copy.w);
+        // A surface's parent is a lifetime alias after the five render words.
+        // Re-read live bytes, since the title can edit a header between draws.
+        auto* words = static_cast<const uint8_t*>(kernel::ReadPage(header, bytes + (type == 0x50000 ? 4 : 0)));
+        if (!words) {
+            if (std::memcmp(kernel::ReadPtr(header, 12), sent.copy.w, 12)) return false;
+            if (bytes > 12 && std::memcmp(kernel::ReadPtr(header + 12, 8), sent.copy.w + 3, 8)) return false;
+            return type != 0x50000 || kernel::R32(header + 20) == sent.parent;
+        }
+        if (std::memcmp(words, sent.copy.w, 12)) return false;
+        if (bytes > 12 && std::memcmp(words + 12, sent.copy.w + 3, 8)) return false;
+        if (type != 0x50000) return true;
+        uint32_t parent;
+        std::memcpy(&parent, words + bytes, sizeof parent);
+        return parent == sent.parent;
+    }
+#endif
     void SendHeader(uint32_t header) {
-        if (!header) return;
+        if (header) SendHeader(header, RecentHeader(header));
+    }
+    void SendHeader(uint32_t header, Recent& r) {
+        if (r.key != header) r = RecentHeader(header);
+        auto& sent = *r.entry;
+#ifdef NGB_DIRECT3D
+        if (HeaderStillCurrent(header, sent)) return;
+#endif
+        HeaderCopy now{};
+        // VB, IB and palette headers end after the third word.
+        std::memcpy(now.w, kernel::ReadPtr(header, 12), 12);
+        const uint32_t type = now.w[0] & 0x70000;
+        if (type >= 0x20000 && type != 0x30000)
+            std::memcpy(now.w + 3, kernel::ReadPtr(header + 12, 8), 8);
 #ifdef NGB_DIRECT3D
         if (ngb_d3d_native_enabled()) {
-            resource_batches_[header] = cur_->id;
-            data_batches_[kernel::R32(header + 4) & 0x0fffffffu] = cur_->id;
-            if ((kernel::R32(header) & 0x70000) == 0x50000) {
-                uint32_t parent = kernel::R32(header + 20);
-                if (parent) resource_batches_[parent] = cur_->id;
+            const uint32_t data = now.w[1] & 0x0fffffffu;
+            const uint32_t parent = type == 0x50000 ? kernel::R32(header + 20) : 0;
+            // The maps retain the last batch using each alias. A model can
+            // bind the same backing store many times inside one batch.
+            if (sent.batch != cur_->id || sent.data != data || sent.parent != parent) {
+                if (!sent.header_use) sent.header_use = &resource_batches_[header];
+                if (!sent.data_use || sent.data != data) sent.data_use = &data_batches_[data];
+                if (sent.parent != parent) sent.parent_use = parent ? &resource_batches_[parent] : nullptr;
+                *sent.header_use = *sent.data_use = cur_->id;
+                if (sent.parent_use) *sent.parent_use = cur_->id;
+                sent.batch = cur_->id;
+                sent.data = data;
+                sent.parent = parent;
             }
         }
 #endif
-        HeaderCopy now{};
-        // vertex buffer, index buffer and palette headers are 12 bytes: reading 20 can run off the end of the heap
-        uint32_t type = kernel::R32(header) & 0x70000;   // 0 vertex, 0x10000 index, 0x30000 palette
-        std::memcpy(now.w, kernel::HostPtr(header), type < 0x20000 || type == 0x30000 ? 12 : 20);
-        Recent& r = recent_[(header >> 4) & 63];   // the last few, in front of the map (its elements stay put)
-        if (r.key != header) r = {header, &sent_headers_[header]};
-        if (!std::memcmp(r.copy->w, now.w, sizeof now.w)) return;
-        *r.copy = now;
+        if (!std::memcmp(sent.copy.w, now.w, sizeof now.w)) return;
+        sent.copy = now;
         HeaderSend h{header, {}};
         std::memcpy(h.w, now.w, sizeof h.w);
-        pending_headers_.push_back(h);
+        cur_->headers.push_back(h);
     }
-    struct Recent {
-        uint32_t key = 0;
-        HeaderCopy* copy = nullptr;
-    };
-    Recent recent_[64];
     // a vertex buffer of the renderer's own, its data in the title's memory (DrawVerticesUP: Common bit 31): the
     // vertices copied, the copy's header pointing at them
     void SendUpHeader(uint32_t header, uint32_t bytes) {
         HeaderSend h{header, {}};
         std::memcpy(h.w, kernel::HostPtr(header), 12);
         h.data = int32_t(Put(kernel::HostPtr(h.w[1]), bytes));
-        std::memset(sent_headers_[header].w, 0, sizeof h.w);   // (always sent: its vertices are new)
-        recent_[(header >> 4) & 63] = {};
-        pending_headers_.push_back(h);
+        *RecentHeader(header).entry = {};   // always sent: its vertices are new
+        cur_->headers.push_back(h);
     }
+    // Header payloads live in their batch. The boundary keeps repeated binds
+    // and inline vertex copies ordered without a second copy through bytes.
     void FlushHeaders() {
-        if (pending_headers_.empty()) return;
-        Cmd c{Op::Headers};
-        c.data = Put(pending_headers_.data(), pending_headers_.size() * sizeof(pending_headers_[0]));
-        c.size = uint32_t(pending_headers_.size());
-        cur_->cmds.push_back(c);
-        pending_headers_.clear();
+        const auto end = uint32_t(cur_->headers.size());
+        auto& groups = cur_->header_groups;
+        if (end != (groups.empty() ? 0u : groups.back().header_end))
+            groups.push_back({uint32_t(cur_->cmds.size()), end});
     }
 #ifdef NGB_DIRECT3D
-    void VerifyPreparedHeader(uint32_t header) {
+    void VerifyPreparedHeader(uint32_t header) const {
         if (!header) return;
         auto it = sent_headers_.find(header);
-        uint32_t type = kernel::R32(header) & 0x70000;
-        size_t bytes = type < 0x20000 || type == 0x30000 ? 12 : 20;
-        if (it == sent_headers_.end() ||
-            std::memcmp(it->second.w, kernel::HostPtr(header), bytes))
+        if (it == sent_headers_.end() || !HeaderStillCurrent(header, it->second))
             ngb_stop("native mesh recorder missed resource change", header);
     }
+
+    void VerifyDrawHeaders(const State& s, bool lines) const {
+        for (auto h : s.textures) VerifyPreparedHeader(h);
+        for (auto h : s.palettes) VerifyPreparedHeader(h);
+        for (unsigned i = lines ? 1 : 0; i < s.streams.size(); ++i)
+            VerifyPreparedHeader(s.streams[i].vb);
+        VerifyPreparedHeader(s.rt.header);
+        VerifyPreparedHeader(s.zs.header);
+    }
+
+    void SendDrawHeaders(const State& s, uint32_t vertices, DrawState kind, uint32_t changed, bool verify) {
+        const bool lines = kind == DrawState::Lines;
+        const bool full = header_batch_ != cur_->id || (changed & PreparedState::ResourceHeaders);
+        if (!full && !header_has_up_ && lines == header_inline_lines_ &&
+            !(changed & (PreparedState::HeaderBindings | header_mask_))) {
+            if (verify) VerifyDrawHeaders(s, lines);
+            return;
+        }
+        header_batch_ = cur_->id;
+        header_inline_lines_ = lines;
+        header_has_up_ = false;
+        header_mask_ = 0;
+        auto capture = [&](uint32_t h, Recent& recent) {
+            if (!h) { recent = {}; return; }
+            const uint32_t bit = PreparedState::HeaderWrite(h);
+            header_mask_ |= bit;
+            if (full || (changed & bit) || recent.key != h || recent.entry->batch != cur_->id)
+                SendHeader(h, recent);
+            else if (verify) VerifyPreparedHeader(h);
+        };
+        // Most models bind only stage and stream zero. Recheck the extent on
+        // every binding change. Dropping old slots must invalidate their last
+        // snapshot, even if the game reuses the very same header afterwards.
+        if (full || (changed & PreparedState::HeaderBindings)) {
+            static constexpr std::array<State::Stream, 15> empty_streams{};
+            static_assert(empty_streams.size() + 1 == std::tuple_size_v<decltype(s.streams)>);
+            const bool primary = !(s.textures[1] | s.textures[2] | s.textures[3] |
+                                   s.palettes[1] | s.palettes[2] | s.palettes[3]) &&
+                !std::memcmp(s.streams.data() + 1, empty_streams.data(), sizeof empty_streams);
+            if (primary && !primary_headers_only_) {
+                std::fill(std::begin(texture_headers_) + 1, std::end(texture_headers_), Recent{});
+                std::fill(std::begin(palette_headers_) + 1, std::end(palette_headers_), Recent{});
+                std::fill(std::begin(stream_headers_) + 1, std::end(stream_headers_), Recent{});
+            }
+            primary_headers_only_ = primary;
+        }
+        const size_t texture_count = primary_headers_only_ ? 1 : s.textures.size();
+        const size_t stream_count = primary_headers_only_ ? 1 : s.streams.size();
+        for (size_t i = 0; i < texture_count; ++i) {
+            capture(s.textures[i], texture_headers_[i]);
+            capture(s.palettes[i], palette_headers_[i]);
+        }
+        for (size_t i = 0; i < stream_count; ++i) {
+            const auto& stream = s.streams[i];
+            if (stream.vb && (kernel::R32(stream.vb) & 0x80000000u)) {
+                stream_headers_[i] = {};
+                // The line command owns this draw's endpoints, even on the direct append path.
+                if (lines && !i) continue;
+                header_has_up_ = true;
+                SendUpHeader(stream.vb, vertices * stream.stride);
+            } else capture(stream.vb, stream_headers_[i]);
+        }
+        capture(s.rt.header, target_headers_[0]);
+        capture(s.zs.header, target_headers_[1]);
+        FlushHeaders();
+        if (verify && primary_headers_only_) {
+            for (size_t i = 1; i < s.textures.size(); ++i)
+                if (s.textures[i] || s.palettes[i]) ngb_stop("unrecorded secondary texture or palette", uint32_t(i));
+            for (size_t i = 1; i < s.streams.size(); ++i)
+                if (s.streams[i].vb) ngb_stop("unrecorded secondary stream", uint32_t(i));
+        }
+    }
+
 #endif
 
     // the game's side of the call, when it changed
@@ -772,8 +1096,8 @@ private:
     }
 
     // a field of the state as the renderer has it, when it differs from what was sent
-    void WriteDelta(size_t off, const uint8_t* now, size_t bytes) {
-        std::memcpy(reinterpret_cast<uint8_t*>(&sent_) + off, now + off, bytes);
+    void WriteDelta(uint8_t* sent, size_t off, const uint8_t* now, size_t bytes) {
+        std::memcpy(sent + off, now + off, bytes);
         const uint32_t head[] = {uint32_t(off), uint32_t(bytes)};
         size_t at = cur_->bytes.size();
         cur_->bytes.resize(at + sizeof(head) + bytes);
@@ -781,8 +1105,7 @@ private:
         std::memcpy(cur_->bytes.data() + at + sizeof(head), now + off, bytes);
     }
 
-    void SendRange(const uint8_t* now, Range range) {
-        const auto* sent = reinterpret_cast<const uint8_t*>(&sent_);
+    void SendRange(uint8_t* sent, const uint8_t* now, Range range) {
         size_t off = range.off, end = off + range.len;
         while (off < end) {
             size_t group = std::min(end - off, 4 * kPiece);
@@ -794,42 +1117,60 @@ private:
             while (off < limit) {
                 size_t n = std::min(limit - off, kPiece);
                 if (!std::memcmp(sent + off, now + off, n)) {
-                    if (first < off) WriteDelta(first, now, off - first);
+                    if (first < off) WriteDelta(sent, first, now, off - first);
                     first = off + n;
                 }
                 off += n;
             }
-            if (first < off) WriteDelta(first, now, off - first);
+            if (first < off) WriteDelta(sent, first, now, off - first);
         }
     }
 
 #ifdef NGB_DIRECT3D
     template<size_t I>
-    void SendFixedRange(const uint8_t* now, uint32_t changed) {
+    void SendFixedRange(uint8_t* sent, const uint8_t* now, uint32_t changed) {
         constexpr Range r = kStateRanges[I];
-        const auto* previous = reinterpret_cast<const uint8_t*>(&sent_) + r.off;
-        if (!(changed & (1u << I))) {
-            static const bool verify = std::getenv("NGB_NATIVE_MESH_VERIFY") != nullptr;
-            if (verify && std::memcmp(previous, now + r.off, r.len))
-                ngb_stop("native mesh recorder missed state change", I);
-            return;
-        }
+        const auto* previous = sent + r.off;
+        if (!(changed & (1u << I))) return;
         // These fixed-size comparisons fold to direct loads for small fields.
         // Keep the original delta layout on changes, including its group boundaries.
         if (!std::memcmp(previous, now + r.off, r.len)) return;
-        if constexpr (r.len <= kPiece) WriteDelta(r.off, now, r.len);
-        else SendRange(now, r);
+        if constexpr (r.len <= kPiece) WriteDelta(sent, r.off, now, r.len);
+        else SendRange(sent, now, r);
+    }
+    void VerifyFixedRanges(const uint8_t* sent, const uint8_t* now, uint32_t changed) const {
+        for (size_t i = 0; i < kStateRanges.size(); ++i) {
+            const auto& r = kStateRanges[i];
+            if (changed & (1u << i)) continue;
+            if ((changed & PreparedState::InstanceValues) && (i == 6 || i == 11)) {
+                const auto field = i == 6 ? kInstanceFactor : kInstanceWorld;
+                const size_t end = field.off + field.len;
+                if (!std::memcmp(sent + r.off, now + r.off, field.off - r.off) &&
+                    !std::memcmp(sent + end, now + end, r.off + r.len - end)) continue;
+            }
+            if (std::memcmp(sent + r.off, now + r.off, r.len))
+                ngb_stop("native mesh recorder missed state change", uint32_t(i));
+        }
+    }
+    template<size_t Offset, size_t Bytes>
+    void SendInstanceField(uint8_t* sent, const uint8_t* now) {
+        if (std::memcmp(sent + Offset, now + Offset, Bytes))
+            WriteDelta(sent, Offset, now, Bytes);
     }
     template<size_t... I>
-    void SendFixedRanges(const uint8_t* now, std::index_sequence<I...>, uint32_t changed) {
-        (SendFixedRange<I>(now, changed), ...);
+    void SendFixedRanges(uint8_t* sent, const uint8_t* now, std::index_sequence<I...>, uint32_t changed) {
+        (SendFixedRange<I>(sent, now, changed), ...);
     }
 #endif
 
-    // what changed since the last command, in 64 byte pieces; the headers the call names; the game's side.
+    // Record changed state in 64-byte pieces and the live resources named by this call.
     // vertices: how many a non-indexed draw reads (a DrawVerticesUP's to copy)
-    void SendState(const State& s, uint32_t vertices, PreparedState changes = {0, ~0u}) {
+    void SendState(const State& s, uint32_t vertices, PreparedState changes = {0, ~0u},
+                   DrawState kind = DrawState::Scene, bool captured_inputs = false) {
         title_ = std::this_thread::get_id();
+        last_state_ = kind;
+        auto& record = recorded_[size_t(kind)];
+        auto* sent = reinterpret_cast<uint8_t*>(&record.value);
         const uint8_t* now = reinterpret_cast<const uint8_t*>(&s);
 #ifdef NGB_DIRECT3D
         uint32_t changed = ~0u;
@@ -837,80 +1178,75 @@ private:
             changed = changes.changed;
         fixed_source_ = changes.revision ? &s : nullptr;
         fixed_revision_ = changes.revision;
-        // Reusing headers is confined to this batch: resource lifetime maps
-        // must be refreshed for every new batch, and UP bytes on every draw.
-        bool reuse_headers = !(changed & PreparedState::ResourceHeaders) &&
-            header_batch_ == cur_->id && !header_has_up_;
-        static const bool verify_headers = std::getenv("NGB_NATIVE_MESH_VERIFY") != nullptr;
-        if (reuse_headers && verify_headers) {
-            for (uint32_t h : s.textures) VerifyPreparedHeader(h);
-            for (uint32_t h : s.palettes) VerifyPreparedHeader(h);
-            for (const auto& st : s.streams) VerifyPreparedHeader(st.vb);
-            VerifyPreparedHeader(s.rt.header); VerifyPreparedHeader(s.zs.header);
+        // Producer revisions describe successive game draws. Remember their
+        // union until each state is used again. Resource lifetimes and Peek
+        // follow the global stream, including changes made by other kinds.
+        for (auto& pending : pending_changes_) pending |= changed;
+        const uint32_t fixed_changes = std::exchange(pending_changes_[size_t(kind)], 0u);
+        static const bool verify = std::getenv("NGB_NATIVE_MESH_VERIFY") != nullptr;
+        if (verify) VerifyFixedRanges(sent, now, fixed_changes);
+        if (!captured_inputs) SendDrawHeaders(s, vertices, kind, changed, verify);
+#else
+        for (size_t i = 0; i < s.textures.size(); ++i) {
+            SendHeader(s.textures[i]);
+            SendHeader(s.palettes[i]);
         }
-        if (!reuse_headers) {
-            header_batch_ = cur_->id;
-            header_has_up_ = false;
-#endif
-        for (int i = 0; i < 4; i++) {
-            SendHeader(s.textures[size_t(i)]);
-            SendHeader(s.palettes[size_t(i)]);
-        }
-        for (const auto& st : s.streams) {
-            if (!st.vb) continue;
-            if (kernel::R32(st.vb) & 0x80000000u) {
-#ifdef NGB_DIRECT3D
-                header_has_up_ = true;
-#endif
-                SendUpHeader(st.vb, vertices * st.stride);
-            } else
-                SendHeader(st.vb);
+        for (const auto& stream : s.streams) {
+            if (!stream.vb) continue;
+            if (kernel::R32(stream.vb) & 0x80000000u) SendUpHeader(stream.vb, vertices * stream.stride);
+            else SendHeader(stream.vb);
         }
         SendHeader(s.rt.header);
         SendHeader(s.zs.header);
         FlushHeaders();
-#ifdef NGB_DIRECT3D
-        }
 #endif
-        SendPeek(s);
+        if (!captured_inputs) SendPeek(s);
         Cmd c{Op::State};
+        c.state = kind;
         size_t first = cur_->bytes.size();
 #ifdef NGB_DIRECT3D
-        SendFixedRanges(now, std::make_index_sequence<kStateRanges.size()>{}, changed);
+        if (fixed_changes & ((1u << kStateRanges.size()) - 1))
+            SendFixedRanges(sent, now, std::make_index_sequence<kStateRanges.size()>{}, fixed_changes);
+        if ((fixed_changes & PreparedState::InstanceValues) && kind != DrawState::Particles) {
+            if (!(fixed_changes & PreparedState::RenderStates))
+                SendInstanceField<kInstanceFactor.off, kInstanceFactor.len>(sent, now);
+            if (!(fixed_changes & PreparedState::WorldMatrices))
+                SendInstanceField<kInstanceWorld.off, kInstanceWorld.len>(sent, now);
+        }
 #else
-        for (const Range& r : kStateRanges) SendRange(now, r);
+        for (const Range& r : kStateRanges) SendRange(sent, now, r);
 #endif
 #ifdef NGB_DIRECT3D
         const size_t constant_offset = At(s, &s.vsc);
-        if (!s.constants_revision || &s != constants_source_ ||
-            (s.constants_revision != constants_revision_ && s.constants_revision - constants_revision_ != 1)) {
-            SendRange(now, {constant_offset, sizeof(s.vsc)});
-        } else if (s.constants_revision != constants_revision_) {
-            // SyncDeferred already compared these blocks against the previous draw.
+        if (!s.constants_revision || &s != record.constants_source ||
+            (s.constants_revision != record.constants_revision && s.constants_revision - record.constants_revision != 1)) {
+            SendRange(sent, now, {constant_offset, sizeof(s.vsc)});
+        } else if (s.constants_revision != record.constants_revision) {
+            // The producer already compared these blocks against the previous draw.
             uint32_t mask = s.changed_constant_blocks;
             while (mask) {
                 unsigned first = __builtin_ctz(mask);
                 unsigned count = __builtin_ctz(~(mask >> first));
-                WriteDelta(constant_offset + first * State::constant_block_bytes, now,
+                WriteDelta(sent, constant_offset + first * State::constant_block_bytes, now,
                            count * State::constant_block_bytes);
                 mask &= ~(((1u << count) - 1) << first);
             }
         }
-        constants_source_ = &s;
-        constants_revision_ = s.constants_revision;
-        if (!s.lights_revision || &s != light_source_ || s.lights_revision != sent_.lights_revision) {
-            SendRange(now, {At(s, &s.lights), sizeof(s.lights)});
-            sent_.lights_revision = s.lights_revision;
-            light_source_ = &s;
+        record.constants_source = &s;
+        record.constants_revision = s.constants_revision;
+        if (!s.lights_revision || &s != record.light_source || s.lights_revision != record.value.lights_revision) {
+            SendRange(sent, now, {At(s, &s.lights), sizeof(s.lights)});
+            record.value.lights_revision = s.lights_revision;
+            record.light_source = &s;
         }
 #endif
-        if (s.vs.get() != sent_.vs.get()) {
-            sent_.vs = s.vs;
+        if (s.vs.get() != record.value.vs.get()) {
+            record.value.vs = s.vs;
             c.vs = int32_t(cur_->vs.size());
             cur_->vs.push_back(s.vs);
         }
-        if (s.ps.get() != sent_.ps.get()) {
-            sent_.ps = s.ps;
+        if (s.ps.get() != record.value.ps.get()) {
+            record.value.ps = s.ps;
             c.ps = int32_t(cur_->ps.size());
             cur_->ps.push_back(s.ps);
         }
@@ -925,7 +1261,7 @@ private:
     // is recorded before its Direct3D code writes them)
     uint64_t Submit() {
         uint64_t id = cur_->id;
-        if (cur_->cmds.empty() && thread_) return id - 1;
+        if (cur_->Empty() && thread_) return id - 1;
         if (!thread_) {
             const auto* was = g_header_view;
             g_header_view = &headers_;
@@ -951,7 +1287,7 @@ private:
     // still to draw, the push buffer read as far as the title has put -- every call is recorded before its Direct3D
     // code writes its commands, so whatever is there now belongs to calls already drawn, or to none.
     void Release() {
-        if (!cur_->cmds.empty()) {
+        if (!cur_->Empty()) {
             Submit();
         } else if (done_.load() >= submitted_) {
             Gate(1, nv2a_pfifo_put());
@@ -1004,7 +1340,11 @@ private:
 #ifdef NGB_DIRECT3D
         b->index_snapshots.clear();
         b->billboards.clear();
+        b->strips.clear();
+        b->particle_indices.fill({});
 #endif
+        b->headers.clear();
+        b->header_groups.clear();
         b->cmds.clear();
         b->bytes.clear();
         b->vs.clear();
@@ -1035,9 +1375,9 @@ private:
                     lock.unlock();
                     if (g_pace_on) g_pace.idle++;
                     if (cap_.try_lock()) {
-                        if (g_pace_on && !cur_->cmds.empty()) g_pace.idle_submit++;
+                        if (g_pace_on && !cur_->Empty()) g_pace.idle_submit++;
 #ifdef NGB_TEXTURE_PRELOAD
-                        bool empty=cur_->cmds.empty();
+                        bool empty=cur_->Empty();
 #endif
                         Release();
                         cap_.unlock();
@@ -1113,35 +1453,36 @@ private:
     }
 
     void ExecuteBatch(Batch& b) {
-        for (const Cmd& c : b.cmds) Execute(b, c);
+        size_t command = 0, header = 0;
+        for (const auto& group : b.header_groups) {
+            while (command < group.before_command) Execute(b, b.cmds[command++]);
+            while (header < group.header_end) {
+                const HeaderSend& h = b.headers[header++];
+                HeaderCopy& to = headers_[h.addr];
+                std::memcpy(to.w, h.w, sizeof to.w);
+                to.host = h.data >= 0 ? b.bytes.data() + h.data : nullptr;
+                if (to.host) hosted_.push_back(h.addr);
+            }
+        }
+        while (command < b.cmds.size()) Execute(b, b.cmds[command++]);
         for (uint32_t a : hosted_) headers_[a].host = nullptr;   // (its bytes go with the batch)
         hosted_.clear();
     }
 
     void Execute(Batch& b, const Cmd& c) {
         const uint8_t* data = b.bytes.data() + c.data;
+        State& state = replay_[size_t(c.state)];
         switch (c.op) {
             case Op::State: {
-                uint8_t* s = reinterpret_cast<uint8_t*>(&state_);
+                uint8_t* s = reinterpret_cast<uint8_t*>(&state);
                 for (const uint8_t* p = data; p < data + c.size;) {
                     uint32_t head[2];
                     std::memcpy(head, p, 8);
                     std::memcpy(s + head[0], p + 8, head[1]);
                     p += 8 + head[1];
                 }
-                if (c.vs >= 0) state_.vs = b.vs[size_t(c.vs)];
-                if (c.ps >= 0) state_.ps = b.ps[size_t(c.ps)];
-                break;
-            }
-            case Op::Headers: {
-                for (uint32_t i = 0; i < c.size; i++) {
-                    HeaderSend h;
-                    std::memcpy(&h, data + i * sizeof h, sizeof h);
-                    HeaderCopy& to = headers_[h.addr];
-                    std::memcpy(to.w, h.w, sizeof to.w);
-                    to.host = h.data >= 0 ? b.bytes.data() + h.data : nullptr;
-                    if (to.host) hosted_.push_back(h.addr);
-                }
+                if (c.vs >= 0) state.vs = b.vs[size_t(c.vs)];
+                if (c.ps >= 0) state.ps = b.ps[size_t(c.ps)];
                 break;
             }
             case Op::Peek: {
@@ -1152,20 +1493,41 @@ private:
             }
             case Op::Billboards:
 #ifdef NGB_DIRECT3D
-                inner_->DrawBillboards(state_, data, std::span(b.billboards).subspan(c.a, c.c));
+                for (const auto& strip : std::span(b.strips).subspan(c.a, c.c)) {
+                    state.streams[0] = strip.stream;
+                    state.textures[0] = strip.texture;
+                    std::span<const uint8_t> indices(b.bytes.data() + strip.indices.offset, strip.indices.count * sizeof(uint16_t));
+                    auto particles = std::span(b.billboards).subspan(strip.first, strip.count);
+                    if (strip.count == 1) {
+                        particles.front().Apply(state);
+                        inner_->Draw(state, 6, 0, strip.indices.count, indices.data(), &strip.indices.bounds);
+                    } else {
+                        inner_->DrawBillboards(state, indices, strip.indices.bounds, particles);
+                    }
+                }
 #endif
                 break;
             case Op::Draw:
 #ifdef NGB_DIRECT3D
                 if (c.d == 2) {
-                    const auto& snapshot = *b.index_snapshots[c.size];
-                    inner_->Draw(state_, c.a, c.b, c.c, snapshot.bytes.data(), &snapshot.bounds, c.effect);
+                    inner_->DrawSnapshot(state, c.a, c.b, b.index_snapshots[c.size], {}, c.effect);
                     break;
                 }
 #endif
-                inner_->Draw(state_, c.a, c.b, c.c, c.d ? data : nullptr, nullptr, c.effect);
+                inner_->Draw(state, c.a, c.b, c.c, c.d ? data : nullptr, nullptr, c.effect);
                 break;
-            case Op::Clear: inner_->Clear(state_, c.a, c.size ? data : nullptr, c.b, c.c, c.f, c.d); break;
+            case Op::Lines:
+#ifdef NGB_DIRECT3D
+            {
+                auto& header = headers_[state.streams[0].vb];
+                auto saved = header;
+                header = {{0x80000001u, c.b, 0, 0, 0}, data};
+                inner_->Draw(state, c.c == 2 ? c.a : 2, 0, c.c, nullptr, nullptr, c.effect);
+                header = saved;
+            }
+#endif
+                break;
+            case Op::Clear: inner_->Clear(state, c.a, c.size ? data : nullptr, c.b, c.c, c.f, c.d); break;
             case Op::Copy:
                 inner_->Copy(c.s1, c.s2, c.a, c.b ? b.bytes.data() + c.b - 1 : nullptr,
                              c.c ? b.bytes.data() + c.c - 1 : nullptr);
@@ -1207,32 +1569,43 @@ private:
     Batch* cur_ = nullptr;
     std::thread::id title_, render_;
 #ifdef NGB_DIRECT3D
-    const State* constants_source_ = nullptr;
     const State* fixed_source_ = nullptr;
     uint64_t fixed_revision_ = 0;
-    uint64_t constants_revision_ = 0;
     unsigned same_state_pairs_ = 0, list_pairs_ = 0, merged_strips_ = 0;
-    IndexSlot index_slots_[2048]{};
+    // Two recurring meshes can share a set without evicting each other.
+    // The total number of retained snapshots stays bounded at 2,048.
+    static constexpr size_t kIndexSets = 1024;
+    IndexSlot index_slots_[kIndexSets][2]{};
+    uint8_t index_victim_[kIndexSets]{};
     unsigned index_hits_ = 0;
     bool recording_visibility_ = false;
-    const State* light_source_ = nullptr;
+    std::array<uint32_t, kDrawStates> pending_changes_{};
 #endif
-    State sent_;   // the state as the renderer will have it
-    std::unordered_map<uint32_t, HeaderCopy> sent_headers_;
+    struct RecordingState {
+        State value;   // the state as the renderer will have it
+#ifdef NGB_DIRECT3D
+        const State* constants_source = nullptr;
+        uint64_t constants_revision = 0;
+        const State* light_source = nullptr;
+#endif
+    };
+    std::array<RecordingState, kDrawStates> recorded_;
+    DrawState last_state_ = DrawState::Scene;
+    std::unordered_map<uint32_t, SentHeader> sent_headers_;
 #ifdef NGB_DIRECT3D
     uint64_t header_batch_ = 0;
-    bool header_has_up_ = false;
+    uint32_t header_mask_ = 0;
+    bool header_has_up_ = false, header_inline_lines_ = false;
 #endif
     std::unordered_map<uint32_t, uint64_t> resource_batches_;
     std::unordered_map<uint32_t, uint64_t> data_batches_;
-    std::vector<HeaderSend> pending_headers_;
     Peek sent_peek_;
     bool peek_sent_ = false;
     uint64_t next_id_ = 0, last_present_ = 0, frame_wait_ = 0;
     std::atomic<uint64_t> submitted_{0};   // the last batch handed over
 
     // the renderer's side
-    State state_;
+    std::array<State, kDrawStates> replay_;
     std::unordered_map<uint32_t, HeaderCopy> headers_;
     std::vector<uint32_t> hosted_;   // headers whose data is in the batch being drawn: let go with it
 

@@ -6,6 +6,54 @@ extern "C" unsigned ngb_native_test_callback_hits;
 #include "native_submission_contract.inc"
 #include "native_shader_contract.inc"
 
+static void NativeDrawStateContract() {
+    auto saved = g_state;
+    uint32_t pending = native_mesh_changed;
+    SyncDeferred();
+    // With native meshes disabled, SyncDeferred also hydrates the simple method table.
+    constexpr uint32_t deferred_groups = ~(Groups::Simple | Groups::DepthClip);
+    for (unsigned stage = 0; stage < 4; ++stage) {
+        const uint32_t addr = kTextureState + stage * 128 + 4 * gpu::kTssColorOp;
+        uint32_t previous = R32(addr);
+        native_mesh_changed = 0;
+        W32(addr, previous ^ 1u);
+        SyncDeferred();
+        if (g_state.tss[stage][gpu::kTssColorOp] != (previous ^ 1u) ||
+            (native_mesh_changed & deferred_groups) != (Groups::TextureStage(stage) | Groups::ResourceHeaders))
+            ngb_stop("inline texture stage was not isolated", stage);
+        W32(addr, previous);
+        SyncDeferred();
+    }
+    const uint32_t addr = kRenderState + 4 * gpu::kRsFogColor;
+    uint32_t previous = R32(addr);
+    native_mesh_changed = 0;
+    W32(addr, previous ^ 1u);
+    SyncDeferred();
+    if (g_state.rs[gpu::kRsFogColor] != (previous ^ 1u) ||
+        (native_mesh_changed & deferred_groups) != (Groups::RenderStates | Groups::ResourceHeaders))
+        ngb_stop("inline render state was not isolated", addr);
+    W32(addr, previous);
+    SyncDeferred();
+    auto old_stream = g_state.streams[0];
+    native_mesh_changed = 0;
+    SetDrawStream(0, old_stream.vb, old_stream.stride ^ 4u);
+    if (native_mesh_changed != Groups::Streams)
+        ngb_stop("temporary stream change was not recorded", 0);
+    native_mesh_changed = 0;
+    SetDrawStream(0, old_stream.vb, old_stream.stride ^ 4u);
+    if (native_mesh_changed) ngb_stop("identical stream marked dirty", 0);
+    SetDrawStream(0, old_stream.vb, old_stream.stride);
+    if (native_mesh_changed != Groups::Streams)
+        ngb_stop("stream restoration was not recorded", 0);
+    native_mesh_changed = 0;
+    uint32_t other = old_stream.vb ? 0 : kNativeDevice;
+    SetDrawStream(0, other, old_stream.stride);
+    if (native_mesh_changed != (Groups::Streams | Groups::HeaderBindings | Groups::HeaderWrite(other)))
+        ngb_stop("stream rebinding was not recorded", other);
+    g_state = std::move(saved);
+    native_mesh_changed = pending;
+}
+
 extern "C" void ngb_d3d_native_test(void) {
     auto require = [](bool okay, uint32_t detail) {
         if (!okay) ngb_stop("native graphics contract failed", detail);
@@ -34,6 +82,8 @@ extern "C" void ngb_d3d_native_test(void) {
     std::memcpy(HostPtr(kRenderState,sizeof saved_states),saved_states.data(),sizeof saved_states);
     g_state.simple=saved_simple;
     NativeShaderContract();
+    NativeVertexConstantContract();
+    NativeDrawStateContract();
     NativeEffectContract();
     NativeBillboardContract();
     NativeCombatContract();
@@ -91,6 +141,12 @@ extern "C" void ngb_d3d_native_test(void) {
     g_backend->Clear(s, 0, nullptr, gpu::kClearZ | gpu::kClearStencil, 0, .25f, 0x53);
     g_backend->Sync(R32(depth + 4), 256);
     require(R32(R32(depth + 4) | 0x80000000u) == 0x40000053, 8);
+    g_backend->Clear(s, 0, nullptr, gpu::kClearStencil, 0, 0, 0x67);
+    g_backend->Sync(R32(depth + 4), 256);
+    require(R32(R32(depth + 4) | 0x80000000u) == 0x40000067, 0x501);
+    g_backend->Clear(s, 0, nullptr, gpu::kClearZ, 0, .5f, 0);
+    g_backend->Sync(R32(depth + 4), 256);
+    require(R32(R32(depth + 4) | 0x80000000u) == 0x80000067, 0x502);
     uint32_t fence = g_backend->Fence(); g_backend->WaitFence(fence);
     require(!g_backend->FencePending(fence) && !g_backend->Busy(depth), 9);
 
@@ -128,7 +184,45 @@ extern "C" void ngb_d3d_native_test(void) {
     call(D3DF_D3DDevice_SetShaderConstantMode, 0x11, 0, {});
     require(R32(kNativeDevice + 0x1928) == 1 && (R32(kNativeDevice + 8) & 0x200), 16);
     NativeLightEnable(300, true); require(R32(kNativeDevice + 0x7a8) == 512, 17);
+    uint32_t light = NativeLight(300), slot = R32(light + 0x8c), desc = scratch + 2048;
+    W32(light + 0x68, 0);
+    auto revision = g_state.lights_revision;
+    W32(stack + 4, 1);
+    uint32_t cursor = R32(kNativeDevice);
+    W32(kNativeDevice, cursor + 4);
+    require(!ngb_d3d_light_enable_ready(300, stack) && R32(light + 0x68) == 0, 23);
+    W32(kNativeDevice, cursor);
+    require(!ngb_d3d_light_enable_ready(512, stack) && ngb_d3d_light_enable_ready(300, stack), 24);
+    require(R32(light + 0x68) == 4 && g_state.lights_revision == revision, 19);
+    std::memcpy(HostPtr(desc, 104), HostPtr(light, 104), 104);
+    NativeSetLight(300, desc);
+    require(g_state.lights_revision == revision && R32(light + 0x68) == 7, 20);
+    W32(desc + 64, 0x80000000u);
+    W32(desc + 8, 0x3e800000);
+    NativeSetLight(300, desc);
+    require(g_state.lights_revision != revision && R32(light + 0x6c) == 0 &&
+            !std::memcmp(g_state.lights[slot].data(), HostPtr(desc, 104), 104), 21);
     NativeLightEnable(300, false);
+    revision = g_state.lights_revision;
+    W32(light + 0x68, 0);
+    NativeLightEnable(300, false);
+    require(g_state.lights_revision == revision && R32(light + 0x68) == 4 &&
+            (g_state.light_enable & (1u << slot)) == 0, 22);
+    W32(stack + 4, 300); W32(stack + 8, desc);
+    W32(kNativeDevice, cursor + 4);
+    require(!ngb_d3d_set_light_ready(stack) && !ngb_d3d_lights_already_disabled(6), 0x7101);
+    W32(kNativeDevice, cursor);
+    W32(stack + 4, 512);
+    require(!ngb_d3d_set_light_ready(stack), 0x7102);
+    W32(stack + 4, 300);
+    require(ngb_d3d_set_light_ready(stack) && !std::memcmp(HostPtr(light, 104), HostPtr(desc, 104), 104) &&
+            R32(light + 0x68) == 7 && !R32(light + 0x6c), 0x7103);
+    NativeLightEnable(6, false); NativeLightEnable(7, false);
+    require(ngb_d3d_lights_already_disabled(6), 0x7104);
+    W32(NativeLight(7) + 0x68, 0);
+    require(!ngb_d3d_lights_already_disabled(6) && !R32(NativeLight(7) + 0x68), 0x7105);
+    NativeLightEnable(7, true);
+    require(!ngb_d3d_lights_already_disabled(6), 0x7106);
 
     W32(scratch, 640); W32(scratch + 4, 480); W32(scratch + 8, 0x12);
     W32(scratch + 32, 1); W32(scratch + 36, 0x2e);

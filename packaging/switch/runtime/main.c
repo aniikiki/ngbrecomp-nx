@@ -113,6 +113,30 @@ static uint32_t module_offset(uint64_t address)
     return address >= base && address - base < UINT32_MAX ? (uint32_t)(address - base) : UINT32_MAX;
 }
 
+/* Unwind AAPCS64 frame records only within the paused thread's actual
+ * stack. Cooperative Xbox threads and XAPI fibers have separate stacks. */
+static unsigned capture_callers(uint32_t *callers, unsigned capacity, const ThreadContext *ctx,
+                                Thread *worker, bool guest)
+{
+    uintptr_t base = (uintptr_t)worker->stack_mirror;
+    uintptr_t end = base && ctx->sp >= base && ctx->sp - base < worker->stack_sz ?
+                    base + worker->stack_sz : 0;
+    if (!end && guest) end = ngb_profile_fiber_stack_end(ctx->sp);
+    unsigned depth = 0;
+    uintptr_t fp = ctx->fp, floor = ctx->sp;
+    while (depth < capacity && fp >= floor && fp < end && end - fp >= 16 && !(fp & 15)) {
+        uintptr_t pair[2];
+        memcpy(pair, (const void *)fp, sizeof(pair));
+        if (pair[1] < 4 || (pair[1] & 3)) break;
+        uint32_t caller = module_offset(pair[1] - 4);
+        if (caller == UINT32_MAX) break;
+        callers[depth++] = caller;
+        floor = fp + 16;
+        fp = pair[0];
+    }
+    return depth;
+}
+
 #ifdef NGB_PLAYER_BUILD
 // UI-owned buffer; the guest never takes a lock or writes this trace.
 static int mp_pc_enabled;
@@ -120,16 +144,30 @@ static struct { unsigned id,pc,lr,cost_us,rc; } mp_pc[1024];
 static unsigned mp_pc_count,mp_pc_saved;
 #ifdef NGB_COMBAT_PERF
 /* UI sampler: only query context while paused; release before recording. */
-static void combat_pc(Thread *th,unsigned renderer){
-    ThreadContext ctx;uint64_t now=ngb_elapsed_ns();uint32_t pc=UINT32_MAX,lr=UINT32_MAX;
-    Result rc=threadPause(th);
-    if(R_SUCCEEDED(rc)){
-        rc=threadDumpContext(&ctx,th);
-        if(R_SUCCEEDED(rc)){pc=module_offset(ctx.pc.x);lr=module_offset(ctx.lr);}
-        Result resumed=threadResume(th);if(R_FAILED(resumed))rc=resumed;
+static void combat_pc(Thread *thread, unsigned renderer)
+{
+    enum { CALLERS = 12 };
+    ThreadContext ctx;
+    uint64_t start = ngb_elapsed_ns();
+    uint64_t row[7 + CALLERS] = {start / 1000, renderer, UINT32_MAX, UINT32_MAX};
+    uint32_t callers[CALLERS];
+    unsigned depth = 0;
+    Result rc = threadPause(thread);
+    if (R_SUCCEEDED(rc)) {
+        rc = threadDumpContext(&ctx, thread);
+        if (R_SUCCEEDED(rc)) {
+            row[2] = module_offset(ctx.pc.x);
+            row[3] = module_offset(ctx.lr);
+            depth = capture_callers(callers, CALLERS, &ctx, thread, renderer == 0);
+        }
+        Result resumed = threadResume(thread);
+        if (R_FAILED(resumed)) rc = resumed;
     }
-    uint64_t v[]={now/1000,renderer,pc,lr,(ngb_elapsed_ns()-now)/1000,rc};
-    ngb_combat_row('P',v,6);
+    row[4] = (ngb_elapsed_ns() - start) / 1000;
+    row[5] = rc;
+    row[6] = depth;
+    for (unsigned i = 0; i < depth; ++i) row[7 + i] = callers[i];
+    ngb_combat_row('P', row, sizeof row / sizeof row[0]);
 }
 static void combat_render_pc(void *th){combat_pc(th,1);}
 static void combat_sample(Thread *guest){
@@ -191,27 +229,6 @@ static void mission_pc_save(void){
 }
 #endif
 
-/* Unwind AAPCS64 frame records only within the paused thread's actual
- * stack. Cooperative Xbox threads and XAPI fibers have separate stacks. */
-static void capture_callers(StackSample *sample, const ThreadContext *ctx, Thread *worker, bool guest)
-{
-    uintptr_t base = (uintptr_t)worker->stack_mirror;
-    uintptr_t end = base && ctx->sp >= base && ctx->sp - base < worker->stack_sz ?
-                    base + worker->stack_sz : 0;
-    if (!end && guest) end = ngb_profile_fiber_stack_end(ctx->sp);
-    uintptr_t fp = ctx->fp, floor = ctx->sp;
-    while (end && fp >= floor && fp <= end - 16 && !(fp & 15) && sample->depth < STACK_DEPTH) {
-        uintptr_t pair[2];
-        memcpy(pair, (const void *)fp, sizeof(pair));
-        if (pair[1] < 4 || (pair[1] & 3)) break;
-        uint32_t caller = module_offset(pair[1] - 4);
-        if (caller == UINT32_MAX) break;
-        sample->callers[sample->depth++] = caller;
-        floor = fp + 16;
-        fp = pair[0];
-    }
-}
-
 static void sample_thread(CpuProfile *profile, Thread *worker, bool guest)
 {
     if (R_FAILED(profile->error) || profile->count >= sizeof(profile->samples)/sizeof(profile->samples[0])) return;
@@ -228,10 +245,9 @@ static void sample_thread(CpuProfile *profile, Thread *worker, bool guest)
         sample->worker_id = guest ? ngb_profile_worker_id() : 0;
         sample->pc = module_offset(ctx.pc.x);
         sample->lr = module_offset(ctx.lr);
-        sample->depth = 0;
         if (R_SUCCEEDED(profile->clock_error))
             profile->clock_error = thread_ticks(worker->handle, &sample->cpu_tick);
-        capture_callers(sample, &ctx, worker, guest);
+        sample->depth = capture_callers(sample->callers, STACK_DEPTH, &ctx, worker, guest);
     }
     Result resumed = threadResume(worker);
     profile->ticks += armGetSystemTick() - now;

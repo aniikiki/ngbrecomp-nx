@@ -6,7 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
-enum { CP_CAP=512, CP_COLS=32 };
+enum { CP_CAP=512, CP_COLS=37 };
 typedef struct {unsigned kind,n;uint64_t v[CP_COLS];} CombatRow;
 static struct {atomic_uint head,tail,lost;CombatRow rows[CP_CAP];} cp_ring[3];
 int ngb_game_diagnostics_requested, ngb_combat_enabled;
@@ -30,7 +30,7 @@ uint64_t ngb_combat_cpu_us(void){
 #endif
 }
 void ngb_combat_row(int kind,const uint64_t *v,unsigned n){
- unsigned i=(kind=='G'||kind=='I'||kind=='J'||kind=='M'||kind=='U'||kind=='N'||kind=='V'||kind=='T')?0:(kind=='R'||kind=='Q'||kind=='B'||kind=='W'||kind=='A'||kind=='L'?1:2),h=atomic_load_explicit(&cp_ring[i].head,memory_order_relaxed);
+ unsigned i=(kind=='G'||kind=='I'||kind=='J'||kind=='M'||kind=='U'||kind=='N'||kind=='V'||kind=='T')?0:(kind=='R'||kind=='Q'||kind=='B'||kind=='W'||kind=='A'||kind=='E'||kind=='L'?1:2),h=atomic_load_explicit(&cp_ring[i].head,memory_order_relaxed);
  if(n>CP_COLS || h-atomic_load_explicit(&cp_ring[i].tail,memory_order_acquire)>=CP_CAP){
   atomic_fetch_add(&cp_ring[i].lost,1);return;}
  CombatRow *r=&cp_ring[i].rows[h%CP_CAP];r->kind=kind;r->n=n;memcpy(r->v,v,n*sizeof(*v));
@@ -151,7 +151,8 @@ static int combat_open(const char *path){
 #endif
  "\n"
  "#D,generation,time_us,acquire_us,blit_overlay_us,submit_us\n"
- "#P,time_us,renderer,pc_offset,lr_offset,pause_cost_us,rc\n"
+ "#P,time_us,renderer,pc_offset,lr_offset,pause_cost_us,rc,depth"
+ ",caller0,caller1,caller2,caller3,caller4,caller5,caller6,caller7,caller8,caller9,caller10,caller11\n"
  "#C,time_us,cpu_hz,gpu_hz,emc_hz,cpu_rc,gpu_rc,emc_rc\n"
  "#F,time_us,write_us,rows\n"
 #ifdef NGB_NATIVE_DIAG
@@ -170,8 +171,10 @@ static int combat_open(const char *path){
  "#W,submit_frame,strip_draws,sprite_draws,strip_sampled,sprite_sampled,strip_gpu_ns,sprite_gpu_ns,unavailable\n"
  "#A,submit_frame,material_detail,spans,omitted_calls,valid,opaque_calls,alpha_calls,additive_calls,offscreen_calls,composite_calls,history_calls,scanout_calls,opaque_ns,alpha_ns,additive_ns,offscreen_ns,composite_ns,history_ns,scanout_ns,feedback_calls,surface_copy_calls,feedback_ns,surface_copy_ns,feedback_pixels,surface_copy_pixels,screen_mix_calls,screen_mix_ns,add128_calls,add128_ns,ring_target_calls,ring_target_ns\n"
  "#L,submit_frame,phase,texture_sig,width,height,format,src,dst,calls,spans,gpu_ns,pixel_shader,texture1_sig,target_stages\n"
+ "#E,submit_frame,material_detail,spans,omitted_calls,valid,unused_texture_bindings,alpha_cull_draws,native_alpha_calls,native_alpha_ns,native_add_calls,native_add_ns,alpha_greater_calls,alpha_greater_ns,masked_calls,masked_ns,mask_control_calls,mask_control_ns\n"
  "#U,guest_flip,action_field_0,action_kind,melee_item,pad_state,pad_edges,charge_level,charge_ticks,et_mark,ut_mark,charge_fx_flag,event_id,player_x_f32bits,player_y_f32bits,player_z_f32bits,ryu_fx_e2,ryu_fx_b0,fx_types_0,fx_types_64,fx_types_128,fx_types_192\n"
- "#N,native_frame,time_us,cpu_us,frame_wall_us,frame_cpu_us,profiled,draws,state_calls,shader_calls,resource_calls,draw_calls,helper_calls,other_calls,flush_calls,inline_words,frame_wait_us,fence_wait_us,resource_wait_us,readback_wait_us,vblank_active_us,pace_active_us,present_us,callback_us,frame_wait_calls,resource_wait_calls,readback_calls\n"
+ "#N,native_frame,time_us,cpu_us,frame_wall_us,frame_cpu_us,profiled,draws,state_calls,shader_calls,resource_calls,draw_calls,helper_calls,other_calls,flush_calls,inline_words,frame_wait_us,fence_wait_us,resource_wait_us,readback_wait_us,vblank_active_us,pace_active_us,present_us,callback_us,frame_wait_calls,resource_wait_calls,readback_calls,particle_update_cpu_us,particle_prepare_cpu_us,particle_update_calls,particle_prepare_calls,"
+ "ordered_list_cpu_us,effect_model_prepare_cpu_us,draw_task_other_cpu_us,player_update_cpu_us,scene_actor_update_cpu_us,interrupt_cpu_us,ordered_list_calls\n"
  "#V,native_frame,entry_us,entry_cpu_us,interval,periods,previous_blank,entry_blank,target_blank,retargeted,deadline_us,wait_start_us,wait_wall_us,wait_cpu_us,present_start_us,present_wall_us,swap_wall_us,swap_cpu_us,exit_blank,draws\n"
  "#T,native_frame,time_us,state_ns,shader_ns,resource_ns,draw_ns,helper_ns,other_ns,inline_ns,deferred_ns,record_ns,poll_ns,present_ns,callback_ns,frame_wait_ns,fence_wait_ns,resource_wait_ns,readback_wait_ns,vblank_wait_ns,pace_ns\n"
  "#B,present,time_us,requests,targets,staging_bytes,wall_us,cpu_us,submit_us,max_us\n"

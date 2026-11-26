@@ -59,17 +59,19 @@ void WaveRead(int slot) {
 // of each eight. Frames with the existing wave probes never overlap these.
 enum Phase : unsigned { Opaque, Alpha, Additive, Offscreen, Composite, History, Scanout, Feedback, SurfaceCopy, PhaseCount };
 static constexpr unsigned kPhaseBase = kWaveBase + 2 * kWavePairs;
-static constexpr unsigned kPhasePairs = 384;
+static constexpr unsigned kPhasePairs = 768;
 enum EffectPass : unsigned { OtherPass, HistoryMix512, AddFrom128, RingWithTarget, EffectPassCount };
+enum BlendMethod : unsigned { OtherBlend, NativeAlpha, NativeAdd, NativeGreater, NativeMask, MaskControl, BlendMethodCount };
 struct PhaseKey {
     Phase kind;
     uint64_t sig{}, shader{}, second{};
     unsigned w{}, h{}, fmt{}, src{}, dst{}, targets{};
     EffectPass pass{};
+    BlendMethod method{};
     bool operator==(const PhaseKey& b) const {
         return kind == b.kind && sig == b.sig && w == b.w && h == b.h &&
                fmt == b.fmt && src == b.src && dst == b.dst &&
-               shader == b.shader && second == b.second && targets == b.targets && pass == b.pass;
+               shader == b.shader && second == b.second && targets == b.targets && pass == b.pass && method == b.method;
     }
 };
 struct PhaseSpan { PhaseKey key; unsigned calls; };
@@ -77,8 +79,9 @@ struct PhaseFrame {
     unsigned frame{}, count{}, omitted{}, calls[PhaseCount]{};
     uint64_t feedback_pixels{}, copy_pixels{};
     unsigned pass_calls[EffectPassCount]{};
+    unsigned unused_bindings{}, cull_draws{}, method_calls[BlendMethodCount]{};
     bool open{};
-    PhaseSpan spans[kPhasePairs];
+    std::vector<PhaseSpan> spans;
 } phase_[2]{};
 unsigned phase_reset_[2]{2 * kPhasePairs, 2 * kPhasePairs};
 bool phase_probe_{};
@@ -95,6 +98,7 @@ void PhaseBegin(PhaseKey key) {
     p.frame = frame_ + 1;
     ++p.calls[key.kind];
     ++p.pass_calls[key.pass];
+    ++p.method_calls[key.method];
     if (p.open && p.spans[p.count - 1].key == key) {
         ++p.spans[p.count - 1].calls;
         return;
@@ -103,12 +107,15 @@ void PhaseBegin(PhaseKey key) {
     if (!ts_pool_[slot_] || p.count == kPhasePairs) { ++p.omitted; return; }
     d_.vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ts_pool_[slot_],
                            kPhaseBase + 2 * p.count);
+    if (p.spans.empty()) p.spans.resize(kPhasePairs);
     p.spans[p.count++] = {key, 1};
     p.open = true;
 }
-void PhaseDraw(Phase kind, const PipeKey& pipe, const State& s, const VkImageView* views, const bool* from_target, EffectPass pass) {
+void PhaseDraw(Phase kind, const PipeKey& pipe, const State& s, const VkImageView* views, const bool* from_target,
+               EffectPass pass, BlendMethod method) {
     PhaseKey key{kind};
     key.pass = pass;
+    key.method = method;
     if (((frame_ + 1) & 7) == 6) {
         key.src = pipe.src;
         key.dst = pipe.dst;
@@ -134,7 +141,7 @@ void PhaseRead(int slot) {
     const bool valid = p.count && d_.vkGetQueryPoolResults(dev_, ts_pool_[slot], kPhaseBase,
         2 * p.count, sizeof(ticks), ticks.data(), sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS;
     const bool detail = (p.frame & 7) == 6;
-    uint64_t ns[PhaseCount]{}, pass_ns[EffectPassCount]{};
+    uint64_t ns[PhaseCount]{}, pass_ns[EffectPassCount]{}, method_ns[BlendMethodCount]{};
     struct Material { PhaseKey key; unsigned calls, spans; uint64_t ns; };
     std::array<Material, kPhasePairs> materials;
     unsigned used = 0;
@@ -144,6 +151,7 @@ void PhaseRead(int slot) {
         const uint64_t cost = uint64_t(double((ticks[2*i+1] - ticks[2*i]) & ts_mask_) * ts_period_ns_);
         ns[kind] += cost;
         pass_ns[span.key.pass] += cost;
+        method_ns[span.key.method] += cost;
         if (!detail || kind >= Scanout) continue;
         unsigned j = 0;
         while (j < used && !(materials[j].key == span.key)) ++j;
@@ -168,13 +176,20 @@ void PhaseRead(int slot) {
         a[pos++] = pass_ns[pass];
     }
     ngb_combat_row('A', a, pos);
+    uint64_t e[7 + 2 * (BlendMethodCount - 1)]{p.frame, detail, p.count, p.omitted, valid, p.unused_bindings, p.cull_draws};
+    unsigned col = 7;
+    for (unsigned i = NativeAlpha; i < BlendMethodCount; ++i) {
+        e[col++] = p.method_calls[i];
+        e[col++] = method_ns[i];
+    }
+    ngb_combat_row('E', e, col);
     std::sort(materials.begin(), materials.begin()+used,
                       [](const Material& x, const Material& y) { return x.ns > y.ns; });
-    unsigned blends = 0, seen = 0;
+    unsigned blends[2]{}, seen = 0;
     for (unsigned i = 0; i < used; ++i) {
         const auto& m = materials[i]; const auto& k = m.key;
         if (k.kind == Alpha || k.kind == Additive) {
-            if (++blends > 3) continue;
+            if (++blends[k.kind == Additive] > 3) continue;
         } else {
             const unsigned bit = 1u << (k.pass == HistoryMix512 ? PhaseCount : k.kind);
             if (seen & bit) continue;
@@ -188,5 +203,7 @@ void PhaseRead(int slot) {
     p.frame = p.count = p.omitted = 0;
     p.feedback_pixels = p.copy_pixels = 0;
     std::fill_n(p.pass_calls, EffectPassCount, 0u);
+    std::fill_n(p.method_calls, BlendMethodCount, 0u);
+    p.unused_bindings = p.cull_draws = 0;
     std::fill_n(p.calls, PhaseCount, 0u);
 }

@@ -88,6 +88,11 @@ static void test_story_charge(void) {
     g=&cp_ring[0].rows[(start+5)%CP_CAP];
     assert(ngb_combat_active() && atomic_load(&cp_ring[0].head)==start+6);
     assert(g->kind=='G' && g->v[0]==105 && g->v[22]==77);
+    uint64_t native[37] = {[0]=105, [36]=2};
+    unsigned head=atomic_load(&cp_ring[0].head);
+    ngb_combat_row('N',native,37);
+    CombatRow *n=&cp_ring[0].rows[head%CP_CAP];
+    assert(atomic_load(&cp_ring[0].head)==head+1 && n->kind=='N' && n->n==37 && n->v[36]==2);
     free(ram);
 }
 static void* produce(void* argument) {
@@ -95,7 +100,8 @@ static void* produce(void* argument) {
     const unsigned kinds[]={'G','R','D'},columns[]={23,31,5};
     for(unsigned i=0;i<600;++i) {
         uint64_t values[32];for(unsigned j=0;j<32;++j)values[j]=1000000*ring+100*i+j;
-        ngb_combat_row(kinds[ring],values,columns[ring]);
+        if (ring==1 && (i&1)) ngb_combat_row('E',values,17);
+        else ngb_combat_row(kinds[ring],values,columns[ring]);
     }
     atomic_fetch_add(&completed,1);return NULL;
 }
@@ -118,7 +124,7 @@ int main(int argc,char** argv) {
         unsigned index,n;
         if(sscanf(line,"#LOST,%u,%u",&index,&n)==2){assert(index<3);lost[index]+=n;continue;}
         if(line[0]=='F'){++flushes;continue;}
-        int r=line[0]=='G'?0:line[0]=='R'?1:line[0]=='D'?2:-1;if(r<0)continue;
+        int r=line[0]=='G'?0:(line[0]=='R'||line[0]=='E')?1:line[0]=='D'?2:-1;if(r<0)continue;
         uint64_t first;assert(sscanf(line+2,"%" SCNu64,&first)==1);
         assert(first==1000000u*(unsigned)r+100u*rows[r]);++rows[r];
     }
